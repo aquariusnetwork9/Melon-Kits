@@ -1,0 +1,26 @@
+# Corpus and runtime artefacts. Several of these contain raw 2b2t chat, which routinely
+# carries coordinates -- none of it may ever reach a commit.
+corpus/
+
+# Chat-bearing data files, including the .gz.tmp a crash or a full disk leaves behind
+# mid-compression (*.jsonl.gz does NOT match *.jsonl.gz.tmp).
+*.jsonl
+*.jsonl.gz
+*.gz.tmp
+
+# Logs, including RotatingFileHandler backups collector.log.1 .. .5 (*.log does not match).
+*.log
+*.log.*
+*.log.gz
+
+# Collector runtime state. The trailing-glob forms also cover the .tmp and .bak
+# generations written during an atomic replace.
+state.json*
+status.json*
+collector.json
+*.lock
+
+# Python
+*.pyc
+__pycache__/
+.venv/
