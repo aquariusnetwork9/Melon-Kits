@@ -17,13 +17,14 @@ gets here) so the ledger never becomes the coordinate leak the display path avoi
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 STATUS_OPEN = "open"
 STATUS_APPROVED = "approved"
@@ -97,6 +98,18 @@ CREATE TABLE IF NOT EXISTS flags (
 );
 CREATE INDEX IF NOT EXISTS ix_flags_uuid ON flags(mc_uuid, kind);
 CREATE INDEX IF NOT EXISTS ix_flags_name ON flags(mc_name, kind);
+
+-- Per-guild settings. This is what makes the bot installable rather than deployed: channel
+-- and role ids, and any policy a server overrides, live here instead of in melonkit.json.
+-- Key/value with JSON values rather than a wide table, so adding a setting needs no
+-- migration -- the alternative is an ALTER for every knob anyone ever wants per server.
+CREATE TABLE IF NOT EXISTS guild_config (
+    guild_id INTEGER NOT NULL,
+    key      TEXT    NOT NULL,
+    value    TEXT    NOT NULL,          -- JSON
+    set_at   INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, key)
+);
 
 -- Instrumentation. Impossible to backfill; see the module docstring.
 CREATE TABLE IF NOT EXISTS shown_chats (
@@ -186,6 +199,33 @@ class Store(object):
         self._db.execute(
             "CREATE INDEX IF NOT EXISTS ix_tickets_queue ON tickets(queue_thread_id)")
 
+        # v3: multi-guild. Only the three tables that are queried directly need the column --
+        # decisions and shown_chats are child rows reached through ticket_id, and scoping them
+        # too would just be a second place for the two to disagree.
+        for table in ("tickets", "kits", "flags"):
+            cols = {r["name"] for r in self._db.execute("PRAGMA table_info(%s)" % table)}
+            if "guild_id" not in cols:
+                self._db.execute("ALTER TABLE %s ADD COLUMN guild_id INTEGER" % table)
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_tickets_guild ON tickets(guild_id, discord_user_id, status)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS ix_kits_guild ON kits(guild_id, discord_user_id)")
+        self._db.execute("CREATE INDEX IF NOT EXISTS ix_flags_guild ON flags(guild_id, kind)")
+
+    def adopt_legacy_rows(self, guild_id: int) -> int:
+        """Stamp pre-multi-guild rows with the guild they must have belonged to.
+
+        A single-guild deployment upgrading in place has rows with guild_id NULL, and every
+        scoped query would silently skip them -- cooldowns would reset and flags would vanish,
+        which looks exactly like the ledger having been wiped. Called once at startup with the
+        guild adopted from melonkit.json.
+        """
+        total = 0
+        for table in ("tickets", "kits", "flags"):
+            cur = self._db.execute(
+                "UPDATE %s SET guild_id=? WHERE guild_id IS NULL" % table, (int(guild_id),))
+            total += cur.rowcount
+        return total
+
     def close(self) -> None:
         with self._conns_lock:
             conns, self._conns = self._conns, []
@@ -196,26 +236,71 @@ class Store(object):
                 pass
         self._local = threading.local()
 
+    # ------------------------------------------------------------- guild config
+
+    def get_guild_config(self, guild_id: int) -> Dict[str, Any]:
+        """Everything this guild has set. ``{}`` for a guild that has never run /setup."""
+        out: Dict[str, Any] = {}
+        for row in self._db.execute(
+                "SELECT key, value FROM guild_config WHERE guild_id=?", (int(guild_id),)):
+            try:
+                out[row["key"]] = json.loads(row["value"])
+            except ValueError:
+                # A hand-edited row should not take the guild down; ignore and carry on.
+                continue
+        return out
+
+    def set_guild_config(self, guild_id: int, values: Dict[str, Any]) -> None:
+        now = _now()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            for key, val in values.items():
+                self._db.execute(
+                    "INSERT INTO guild_config(guild_id, key, value, set_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(guild_id, key) DO UPDATE SET value=excluded.value, "
+                    "set_at=excluded.set_at",
+                    (int(guild_id), str(key), json.dumps(val), now))
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def clear_guild_config(self, guild_id: int) -> int:
+        cur = self._db.execute("DELETE FROM guild_config WHERE guild_id=?", (int(guild_id),))
+        return cur.rowcount
+
+    def configured_guilds(self) -> List[int]:
+        return [int(r["guild_id"]) for r in self._db.execute(
+            "SELECT DISTINCT guild_id FROM guild_config ORDER BY guild_id")]
+
     # ------------------------------------------------------------------ tickets
+    #
+    # Everything below takes guild_id FIRST, deliberately. Row ids are globally unique, so a
+    # lookup by id alone succeeds across guilds -- which would mean `/close 5` in one server
+    # closing another server's ticket #5. Making the scope the first positional argument is
+    # what stops it being the one that gets forgotten.
 
-    def open_ticket_for(self, discord_user_id: int) -> Optional[sqlite3.Row]:
+    def open_ticket_for(self, guild_id: int,
+                        discord_user_id: int) -> Optional[sqlite3.Row]:
         return self._db.execute(
-            "SELECT * FROM tickets WHERE discord_user_id=? AND status=? "
+            "SELECT * FROM tickets WHERE guild_id=? AND discord_user_id=? AND status=? "
             "ORDER BY id DESC LIMIT 1",
-            (int(discord_user_id), STATUS_OPEN)).fetchone()
+            (int(guild_id), int(discord_user_id), STATUS_OPEN)).fetchone()
 
-    def open_ticket_count(self, discord_user_id: int) -> int:
+    def open_ticket_count(self, guild_id: int, discord_user_id: int) -> int:
         return int(self._db.execute(
-            "SELECT COUNT(*) AS n FROM tickets WHERE discord_user_id=? AND status=?",
-            (int(discord_user_id), STATUS_OPEN)).fetchone()["n"])
+            "SELECT COUNT(*) AS n FROM tickets WHERE guild_id=? AND discord_user_id=? "
+            "AND status=?",
+            (int(guild_id), int(discord_user_id), STATUS_OPEN)).fetchone()["n"])
 
-    def create_ticket(self, discord_user_id: int, mc_name: str,
+    def create_ticket(self, guild_id: int, discord_user_id: int, mc_name: str,
                       mc_uuid: Optional[str] = None,
                       note: Optional[str] = None) -> int:
         cur = self._db.execute(
-            "INSERT INTO tickets(discord_user_id, mc_name, mc_uuid, status, note, "
-            "created_at) VALUES(?,?,?,?,?,?)",
-            (int(discord_user_id), mc_name, mc_uuid, STATUS_OPEN, note, _now()))
+            "INSERT INTO tickets(guild_id, discord_user_id, mc_name, mc_uuid, status, note, "
+            "created_at) VALUES(?,?,?,?,?,?,?)",
+            (int(guild_id), int(discord_user_id), mc_name, mc_uuid, STATUS_OPEN, note,
+             _now()))
         return int(cur.lastrowid)
 
     def set_ticket_thread(self, ticket_id: int, thread_id: int) -> None:
@@ -240,9 +325,19 @@ class Store(object):
             self._db.execute("UPDATE tickets SET mc_uuid=? WHERE id=?",
                              (mc_uuid, int(ticket_id)))
 
-    def get_ticket(self, ticket_id: int) -> Optional[sqlite3.Row]:
-        return self._db.execute("SELECT * FROM tickets WHERE id=?",
-                                (int(ticket_id),)).fetchone()
+    def get_ticket(self, ticket_id: int,
+                   guild_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+        """Pass `guild_id` from anything a user can name a ticket number to.
+
+        Without it this is a cross-tenant hole: ids are globally unique, so `/close 5` run in
+        one server would happily close a different server's ticket #5. It stays optional only
+        for internal callers that already hold a row they trust.
+        """
+        if guild_id is None:
+            return self._db.execute("SELECT * FROM tickets WHERE id=?",
+                                    (int(ticket_id),)).fetchone()
+        return self._db.execute("SELECT * FROM tickets WHERE id=? AND guild_id=?",
+                                (int(ticket_id), int(guild_id))).fetchone()
 
     def ticket_for_thread(self, thread_id: int) -> Optional[sqlite3.Row]:
         return self._db.execute(
@@ -298,12 +393,12 @@ class Store(object):
 
     # -------------------------------------------------------------------- kits
 
-    def record_kit(self, ticket_id: Optional[int], discord_user_id: int, mc_name: str,
-                   mc_uuid: Optional[str]) -> int:
+    def record_kit(self, guild_id: int, ticket_id: Optional[int], discord_user_id: int,
+                   mc_name: str, mc_uuid: Optional[str]) -> int:
         cur = self._db.execute(
-            "INSERT INTO kits(ticket_id, discord_user_id, mc_uuid, mc_name, created_at) "
-            "VALUES(?,?,?,?,?)",
-            (ticket_id, int(discord_user_id), mc_uuid, mc_name, _now()))
+            "INSERT INTO kits(guild_id, ticket_id, discord_user_id, mc_uuid, mc_name, "
+            "created_at) VALUES(?,?,?,?,?,?)",
+            (int(guild_id), ticket_id, int(discord_user_id), mc_uuid, mc_name, _now()))
         return int(cur.lastrowid)
 
     def claim_kit(self, kit_id: int, claimed_by: int) -> bool:
@@ -344,15 +439,27 @@ class Store(object):
             (_now(), int(kit_id)))
         return cur.rowcount > 0
 
-    def get_kit(self, kit_id: int) -> Optional[sqlite3.Row]:
-        return self._db.execute("SELECT * FROM kits WHERE id=?", (int(kit_id),)).fetchone()
+    def get_kit(self, kit_id: int,
+                guild_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+        """Pass `guild_id` from anything a user can name a dispatch number to -- see
+        `get_ticket` for why."""
+        if guild_id is None:
+            return self._db.execute("SELECT * FROM kits WHERE id=?",
+                                    (int(kit_id),)).fetchone()
+        return self._db.execute("SELECT * FROM kits WHERE id=? AND guild_id=?",
+                                (int(kit_id), int(guild_id))).fetchone()
 
     # ---------------------------------------------------------------- cooldown
 
-    def last_kit(self, discord_user_id: Optional[int] = None,
+    def last_kit(self, guild_id: int, discord_user_id: Optional[int] = None,
                  mc_uuid: Optional[str] = None) -> Optional[sqlite3.Row]:
-        """Most recent kit matching either identifier. Either alone is easy to sidestep."""
-        clauses, args = [], []
+        """Most recent kit in THIS guild matching either identifier.
+
+        Either identifier alone is easy to sidestep -- a second Discord account with the same
+        MC account, or the reverse -- so both are checked. Scoped per guild: each server's kit
+        history is its own, so a kit from one does not start a cooldown in another.
+        """
+        clauses, args = [], [int(guild_id)]
         if discord_user_id is not None:
             clauses.append("discord_user_id=?")
             args.append(int(discord_user_id))
@@ -362,13 +469,14 @@ class Store(object):
         if not clauses:
             return None
         return self._db.execute(
-            "SELECT * FROM kits WHERE %s ORDER BY created_at DESC LIMIT 1"
+            "SELECT * FROM kits WHERE guild_id=? AND (%s) ORDER BY created_at DESC LIMIT 1"
             % (" OR ".join(clauses),), args).fetchone()
 
-    def cooldown(self, cooldown_days: int, discord_user_id: Optional[int] = None,
+    def cooldown(self, guild_id: int, cooldown_days: int,
+                 discord_user_id: Optional[int] = None,
                  mc_uuid: Optional[str] = None, now: Optional[int] = None) -> Dict[str, Any]:
         """``{'blocked': bool, 'days_left': int, 'last_at': int|None, 'matched': str|None}``"""
-        row = self.last_kit(discord_user_id, mc_uuid)
+        row = self.last_kit(guild_id, discord_user_id, mc_uuid)
         if row is None or cooldown_days <= 0:
             return {"blocked": False, "days_left": 0, "last_at": None, "matched": None}
         now = _now() if now is None else int(now)
@@ -383,9 +491,9 @@ class Store(object):
         return {"blocked": True, "days_left": int(days_left),
                 "last_at": int(row["created_at"]), "matched": matched}
 
-    def kit_history(self, discord_user_id: Optional[int] = None,
+    def kit_history(self, guild_id: int, discord_user_id: Optional[int] = None,
                     mc_uuid: Optional[str] = None, limit: int = 10) -> List[sqlite3.Row]:
-        clauses, args = [], []
+        clauses, args = [], [int(guild_id)]
         if discord_user_id is not None:
             clauses.append("discord_user_id=?")
             args.append(int(discord_user_id))
@@ -396,48 +504,53 @@ class Store(object):
             return []
         args.append(int(limit))
         return list(self._db.execute(
-            "SELECT * FROM kits WHERE %s ORDER BY created_at DESC LIMIT ?"
+            "SELECT * FROM kits WHERE guild_id=? AND (%s) ORDER BY created_at DESC LIMIT ?"
             % (" OR ".join(clauses),), args))
 
-    def linked_accounts(self, discord_user_id: Optional[int] = None,
+    def linked_accounts(self, guild_id: int, discord_user_id: Optional[int] = None,
                         mc_uuid: Optional[str] = None) -> List[sqlite3.Row]:
         """Other identities that have shared a ticket with these -- the ledger fan-out.
 
         Evidence for a reviewer, not a verdict: sharing a Discord account with another MC
         name is what an alt looks like *and* what a sibling, a rename, or a borrowed account
-        looks like.
+        looks like. Scoped per guild, so one server's reviewers never see who another server
+        has helped.
         """
         if discord_user_id is None and not mc_uuid:
             return []
         return list(self._db.execute(
             "SELECT DISTINCT discord_user_id, mc_uuid, mc_name FROM tickets "
-            "WHERE (discord_user_id=? OR mc_uuid=?) ORDER BY id DESC LIMIT 25",
-            (int(discord_user_id) if discord_user_id is not None else -1, mc_uuid or "")))
+            "WHERE guild_id=? AND (discord_user_id=? OR mc_uuid=?) ORDER BY id DESC LIMIT 25",
+            (int(guild_id),
+             int(discord_user_id) if discord_user_id is not None else -1, mc_uuid or "")))
 
     # ------------------------------------------------------------------- flags
 
-    def set_flag(self, kind: str, set_by: int, mc_uuid: Optional[str] = None,
-                 mc_name: Optional[str] = None, note: Optional[str] = None) -> int:
+    def set_flag(self, guild_id: int, kind: str, set_by: int,
+                 mc_uuid: Optional[str] = None, mc_name: Optional[str] = None,
+                 note: Optional[str] = None) -> int:
         if not mc_uuid and not mc_name:
             raise ValueError("a flag needs a uuid or a name")
         cur = self._db.execute(
-            "INSERT INTO flags(kind, mc_uuid, mc_name, note, set_by, set_at) "
-            "VALUES(?,?,?,?,?,?)", (kind, mc_uuid, mc_name, note, int(set_by), _now()))
+            "INSERT INTO flags(guild_id, kind, mc_uuid, mc_name, note, set_by, set_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (int(guild_id), kind, mc_uuid, mc_name, note, int(set_by), _now()))
         return int(cur.lastrowid)
 
-    def clear_flag(self, flag_id: int) -> bool:
+    def clear_flag(self, guild_id: int, flag_id: int) -> bool:
+        """Guild-scoped: a flag id is user-supplied, so one server must not clear another's."""
         cur = self._db.execute(
-            "UPDATE flags SET cleared_at=? WHERE id=? AND cleared_at IS NULL",
-            (_now(), int(flag_id)))
+            "UPDATE flags SET cleared_at=? WHERE id=? AND guild_id=? AND cleared_at IS NULL",
+            (_now(), int(flag_id), int(guild_id)))
         return cur.rowcount > 0
 
-    def flags_for(self, mc_uuid: Optional[str] = None,
+    def flags_for(self, guild_id: int, mc_uuid: Optional[str] = None,
                   mc_name: Optional[str] = None) -> List[sqlite3.Row]:
         return list(self._db.execute(
-            "SELECT * FROM flags WHERE cleared_at IS NULL AND "
+            "SELECT * FROM flags WHERE guild_id=? AND cleared_at IS NULL AND "
             "(mc_uuid IS NOT NULL AND mc_uuid=? OR mc_name IS NOT NULL AND "
             "LOWER(mc_name)=LOWER(?)) ORDER BY id DESC",
-            (mc_uuid or "", mc_name or "")))
+            (int(guild_id), mc_uuid or "", mc_name or "")))
 
     # --------------------------------------------------------- instrumentation
 
@@ -470,13 +583,29 @@ class Store(object):
 
     # ------------------------------------------------------------------- stats
 
-    def counts(self) -> Dict[str, int]:
+    def counts(self, guild_id: Optional[int] = None) -> Dict[str, int]:
+        """Row counts. With `guild_id`, only that guild's -- decisions and shown_chats are
+        reached through their ticket, since they carry no guild column of their own."""
         out = {}
-        for table in ("tickets", "decisions", "kits", "flags", "shown_chats"):
+        if guild_id is None:
+            for table in ("tickets", "decisions", "kits", "flags", "shown_chats"):
+                out[table] = int(self._db.execute(
+                    "SELECT COUNT(*) AS n FROM %s" % table).fetchone()["n"])
+            out["flagged_chats"] = int(self._db.execute(
+                "SELECT COUNT(*) AS n FROM shown_chats WHERE flagged=1").fetchone()["n"])
+            return out
+
+        g = (int(guild_id),)
+        for table in ("tickets", "kits", "flags"):
             out[table] = int(self._db.execute(
-                "SELECT COUNT(*) AS n FROM %s" % table).fetchone()["n"])
+                "SELECT COUNT(*) AS n FROM %s WHERE guild_id=?" % table, g).fetchone()["n"])
+        for table in ("decisions", "shown_chats"):
+            out[table] = int(self._db.execute(
+                "SELECT COUNT(*) AS n FROM %s WHERE ticket_id IN "
+                "(SELECT id FROM tickets WHERE guild_id=?)" % table, g).fetchone()["n"])
         out["flagged_chats"] = int(self._db.execute(
-            "SELECT COUNT(*) AS n FROM shown_chats WHERE flagged=1").fetchone()["n"])
+            "SELECT COUNT(*) AS n FROM shown_chats WHERE flagged=1 AND ticket_id IN "
+            "(SELECT id FROM tickets WHERE guild_id=?)", g).fetchone()["n"])
         return out
 
 

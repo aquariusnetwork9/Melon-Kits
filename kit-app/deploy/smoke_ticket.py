@@ -49,14 +49,18 @@ async def drive(cfg, token, mc_name, user_id, cleanup_id):
     @client.event
     async def on_ready():
         try:
-            guild = client.get_guild(int(cfg["discord"]["guild_id"]))
+            guild = client.get_guild(int(cfg["discord"]["home_guild_id"]))
             if cleanup_id:
                 await do_cleanup(client, guild, st, cleanup_id)
                 result["ok"] = True
                 return
 
-            panel = guild.get_channel(int(cfg["discord"]["panel_channel_id"]))
-            queue = guild.get_channel(int(cfg["discord"]["queue_channel_id"]))
+            g = st.get_guild_config(guild.id)
+            if not g.get("panel_channel_id"):
+                log("guild %s has not been set up -- run /setup in Discord first" % guild.id)
+                return
+            panel = guild.get_channel(int(g["panel_channel_id"]))
+            queue = guild.get_channel(int(g["queue_channel_id"]))
             log("panel: #%s (%s)" % (panel.name, type(panel).__name__))
             log("queue: #%s (%s)" % (queue.name, type(queue).__name__))
 
@@ -70,7 +74,8 @@ async def drive(cfg, token, mc_name, user_id, cleanup_id):
             log("resolved %s -> %s" % (canonical, uuid))
 
             # 2. ledger row
-            ticket_id = st.create_ticket(member.id, canonical, uuid, "smoke test")
+            ticket_id = st.create_ticket(guild.id, member.id, canonical, uuid,
+                                         "smoke test")
             log("ticket #%d created in the ledger" % ticket_id)
 
             # 3. THE RISKY ONE: a private thread, with the requester added
@@ -94,7 +99,7 @@ async def drive(cfg, token, mc_name, user_id, cleanup_id):
             lex = screening.Lexicon.load(cfg["screening"]["lexicon_path"])
             loop = asyncio.get_running_loop()
             built = await loop.run_in_executor(None, lambda: card_mod.gather(
-                canonical, uuid, member.id, cfg, vc_mod.Client(cfg), st, lex))
+                guild.id, canonical, uuid, member.id, cfg, vc_mod.Client(cfg), st, lex))
             log("card built: tracked=%s deaths=%d chats=%d coords_redacted=%d errors=%d"
                 % (built["tracked"], len(built["deaths"]), len(built["chat_lines"]),
                    built["coords_redacted"], len(built["errors"])))
@@ -178,6 +183,9 @@ def main(argv=None):
     token = os.environ.get(cfg["discord"]["token_env"])
     if not token:
         sys.stderr.write("no token in %s\n" % cfg["discord"]["token_env"])
+        return 2
+    if not int(cfg["discord"]["home_guild_id"] or 0):
+        sys.stderr.write("set discord.home_guild_id to the guild to smoke-test\n")
         return 2
     if not args.cleanup and not (args.name and args.user):
         sys.stderr.write("need --name and --user (or --cleanup TICKET_ID)\n")

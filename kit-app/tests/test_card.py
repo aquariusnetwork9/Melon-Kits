@@ -29,6 +29,7 @@ import screening
 import store as store_mod
 import vc as vc_mod
 
+GUILD = 4242
 UUID_A = "00000000-1111-2222-3333-4444444444aa"
 HOUR = 3600
 
@@ -82,7 +83,7 @@ class CardCase(unittest.TestCase):
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def build(self, client, lex=None, user=100, name="Alice", uuid=UUID_A):
-        return card_mod.gather(name, uuid, user, self.cfg, client, self.st,
+        return card_mod.gather(GUILD, name, uuid, user, self.cfg, client, self.st,
                                lex or screening.Lexicon({}))
 
     def text_of(self, card, section_name):
@@ -184,7 +185,7 @@ class CardCase(unittest.TestCase):
     # -------------------------------------------------------------------- ledger
 
     def test_cooldown_dominates_the_headline(self):
-        self.st.record_kit(None, 100, "Alice", UUID_A)
+        self.st.record_kit(GUILD, None, 100, "Alice", UUID_A)
         c = FakeClient(stats={"firstSeen": ago_ts(days=1)},
                        deaths=[{"time": ago_ts(minutes=5), "deathMessage": "died"}])
         card = self.build(c)
@@ -192,14 +193,14 @@ class CardCase(unittest.TestCase):
         self.assertIn("COOLDOWN", card_mod.headline(card))
 
     def test_reviewer_flags_appear_as_their_own_section(self):
-        self.st.set_flag("alt", 500, mc_uuid=UUID_A, note="alt of Bob")
+        self.st.set_flag(GUILD, "alt", 500, mc_uuid=UUID_A, note="alt of Bob")
         card = self.build(FakeClient(stats={"firstSeen": ago_ts(days=5)}))
         self.assertIn("Reviewer flags", [s["name"] for s in card_mod.sections(card)])
         self.assertIn("alt of Bob", self.text_of(card, "Reviewer flags"))
 
     def test_shared_discord_account_is_shown_with_its_caveat(self):
-        self.st.create_ticket(100, "Alice", UUID_A)
-        self.st.create_ticket(100, "Alicia", "00000000-1111-2222-3333-4444444444bb")
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
+        self.st.create_ticket(GUILD, 100, "Alicia", "00000000-1111-2222-3333-4444444444bb")
         card = self.build(FakeClient(stats={"firstSeen": ago_ts(days=5)}))
         body = self.text_of(card, "Kit ledger")
         self.assertIn("Alicia", body)

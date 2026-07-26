@@ -21,7 +21,15 @@ DEFAULTS: Dict[str, Any] = {
     "discord": {
         # Name of the environment variable holding the bot token -- never the token itself.
         "token_env": "MELONKIT_DISCORD_TOKEN",
-        "guild_id": 0,
+        # The bot is multi-guild: channels and roles live in the database per server, set by
+        # /setup, not here. The five ids below are ONLY a bootstrap for the original
+        # single-guild deployment -- on first start they are adopted into that guild's stored
+        # config and then ignored forever. Leave them 0 on a fresh install.
+        #
+        # home_guild_id additionally gets a guild-scoped command copy so command edits appear
+        # instantly there rather than waiting on Discord's global propagation. Harmless to set
+        # on any install; it does not make the bot single-guild.
+        "home_guild_id": 0,
         # Read-only TEXT channel holding the pinned request panel. Private ticket threads
         # hang off it. It cannot be a forum: forum posts can only be public threads, so
         # every applicant would be able to read every other applicant's ticket.
@@ -107,11 +115,29 @@ class ConfigError(ValueError):
     """Raised for an unknown key, an untypeable value, or unreadable JSON."""
 
 
+# Renamed keys, old -> new. An unknown key is a hard startup failure by design, so a rename
+# would otherwise stop an existing deployment booting at all -- a rude way to ship an
+# upgrade. Aliases are accepted and mapped.
+_ALIASES = {("discord", "guild_id"): ("discord", "home_guild_id")}
+
+
+def _apply_aliases(doc: Dict[str, Any]) -> None:
+    for (sect, old), (nsect, new) in _ALIASES.items():
+        block = doc.get(sect)
+        if isinstance(block, dict) and old in block:
+            doc.setdefault(nsect, {})
+            if new not in doc[nsect]:
+                doc[nsect][new] = block[old]
+            del block[old]
+
+
 def load_config(path: Optional[str] = None,
                 env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULTS)
     if path:
-        _merge(cfg, _read_json(path), ())
+        doc = _read_json(path)
+        _apply_aliases(doc)
+        _merge(cfg, doc, ())
     _apply_env(cfg, os.environ if env is None else env)
     _validate(cfg)
     return cfg

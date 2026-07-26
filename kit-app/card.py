@@ -102,7 +102,7 @@ def duration(seconds: Optional[int]) -> str:
 
 # --------------------------------------------------------------------- gathering
 
-def gather(mc_name: str, mc_uuid: Optional[str], discord_user_id: int,
+def gather(guild_id: int, mc_name: str, mc_uuid: Optional[str], discord_user_id: int,
            cfg: Dict[str, Any], client: "vc_mod.Client", st: "store_mod.Store",
            lex: Optional[screening.Lexicon] = None,
            log: Optional[logging.Logger] = None) -> Dict[str, Any]:
@@ -116,6 +116,7 @@ def gather(mc_name: str, mc_uuid: Optional[str], discord_user_id: int,
     log = log or _LOG
     pol = cfg["policy"]
     card: Dict[str, Any] = {
+        "guild_id": int(guild_id),
         "mc_name": mc_name,
         "mc_uuid": mc_uuid,
         "discord_user_id": int(discord_user_id),
@@ -188,14 +189,18 @@ def gather(mc_name: str, mc_uuid: Optional[str], discord_user_id: int,
         and playtime < 3600)
 
     # ---- ledger -----------------------------------------------------------
+    # Every ledger read is scoped to this guild: a server's kit history, flags and
+    # linked-account fan-out are its own, and one server's reviewers must never see who
+    # another has helped.
     card["cooldown_days"] = pol["cooldown_days"]
-    card["cooldown"] = st.cooldown(pol["cooldown_days"],
-                                  discord_user_id=discord_user_id, mc_uuid=mc_uuid)
+    card["cooldown"] = st.cooldown(guild_id, pol["cooldown_days"],
+                                   discord_user_id=discord_user_id, mc_uuid=mc_uuid)
     card["kit_history"] = [dict(r) for r in st.kit_history(
-        discord_user_id=discord_user_id, mc_uuid=mc_uuid, limit=5)]
-    card["flags"] = [dict(r) for r in st.flags_for(mc_uuid=mc_uuid, mc_name=mc_name)]
+        guild_id, discord_user_id=discord_user_id, mc_uuid=mc_uuid, limit=5)]
+    card["flags"] = [dict(r) for r in st.flags_for(
+        guild_id, mc_uuid=mc_uuid, mc_name=mc_name)]
     card["linked"] = [dict(r) for r in st.linked_accounts(
-        discord_user_id=discord_user_id, mc_uuid=mc_uuid)]
+        guild_id, discord_user_id=discord_user_id, mc_uuid=mc_uuid)]
 
     # ---- screening --------------------------------------------------------
     if cfg["screening"]["enabled"] and lex:

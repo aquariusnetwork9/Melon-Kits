@@ -18,7 +18,7 @@ cut.
 
 | component | state |
 |---|---|
-| [`kit-app/`](kit-app/) — Discord ticket → review → dispatch | **live and exercised end to end.** 121 tests. Deployed on ovh-2; a full request → review → approve → claim → deliver → archive lifecycle has been run through real Discord component presses |
+| [`kit-app/`](kit-app/) — Discord ticket → review → dispatch | **v1.0.0, live and exercised end to end.** 132 tests. Multi-server: invite it anywhere and run `/setup`. Deployed on ovh-2; a full request → review → approve → claim → deliver → archive lifecycle has been run through real Discord component presses |
 | [`chat-corpus/`](chat-corpus/) — passive 2b2t chat collector | **built and tested, not yet running unattended.** 249 tests, green on Windows/3.9 and Linux/3.13, verified against the live feed, both SPEC §13 crash-safety tests in place |
 | Chat screening lexicon | **scaffolded, empty.** The mechanism works and is tested; the terms need an afternoon of mining against the 2025 bulk dump |
 
@@ -42,7 +42,7 @@ kit-app/              the Discord app: panel, ticket, reviewer card, dispatch, a
   store.py            SQLite ledger: cooldowns, flags, decisions, instrumentation
   vc.py identity.py   api.2b2t.vc client; Mojang + laby.net name resolution
   deploy/             systemd unit, channel setup, ticket reset, smoke test, runbook
-  tests/              121 tests, no network, and no discord.py needed
+  tests/              132 tests, no network, and no discord.py needed
 chat-corpus/          the collector: SSE feed → append-only JSONL, stdlib only, crash-safe
   docs/SPEC.md        full behavioural spec
   docs/INTERFACES.md  binding module API
