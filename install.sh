@@ -35,6 +35,9 @@ ETC_DIR="${MELONKIT_ETC_DIR:-/etc/melonkit}"
 UNIT_NAME="${MELONKIT_UNIT_NAME:-melonkit-bot}"
 UNIT="/etc/systemd/system/${UNIT_NAME}.service"
 TOKEN="${MELONKIT_DISCORD_TOKEN:-}"
+# api.2b2t.vc is run by a volunteer and Cloudflare 403s a default user agent, so this wants to
+# be a real way to reach whoever runs the bot.
+CONTACT="${MELONKIT_CONTACT:-set-me@example.com}"
 ASSUME_YES=0
 DO_UNINSTALL=0
 
@@ -59,6 +62,7 @@ Options:
   --user <NAME>     service user to create and run as   (default: $SERVICE_USER)
   --dir <PATH>      where to put the checkout           (default: $INSTALL_DIR)
   --branch <NAME>   branch to track                     (default: $BRANCH)
+  --contact <TEXT>  contact address sent to api.2b2t.vc in the user agent
   --yes             never prompt; requires --token on a first install
   --uninstall       stop and remove the service, KEEPING the ledger and token
   --help            this
@@ -72,6 +76,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --token) TOKEN="${2:-}"; shift 2 ;;
+        --contact) CONTACT="${2:-}"; shift 2 ;;
         --user)  SERVICE_USER="${2:-}"; shift 2 ;;
         --dir)   INSTALL_DIR="${2:-}"; shift 2 ;;
         --branch) BRANCH="${2:-}"; shift 2 ;;
@@ -244,21 +249,33 @@ if [ -f "$CONFIG" ]; then
     say "Keeping the existing $CONFIG"
 else
     say "Writing $CONFIG"
+    # No comment keys in here. config.py treats ANY unknown key as a hard startup error --
+    # deliberately, so a typo cannot silently do nothing -- and that includes a "_comment" one.
+    # The notes that would have gone here are in DEPLOY.md and in the summary this prints at the
+    # end, where they will actually be read.
     cat >"$CONFIG" <<EOF
 {
-  "_comment": [
-    "Channel and role ids are NOT set here -- /setup writes them to the ledger, per guild.",
-    "Everything omitted falls back to the defaults in config.py, which are documented there.",
-    "Change vc.user_agent to something with a real contact address: api.2b2t.vc is run by a",
-    "volunteer and a default user agent is both rude and liable to be blocked."
-  ],
   "store": { "path": "$DATA_DIR/melonkit.sqlite3" },
   "screening": { "lexicon_path": "$DATA_DIR/lexicon.json" },
-  "vc": { "user_agent": "melon-kits/1.0 (+contact: set-me@example.com)" }
+  "vc": { "user_agent": "melon-kits/1.0 (+contact: $CONTACT)" }
 }
 EOF
     chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG"
     chmod 640 "$CONFIG"
+fi
+
+# Validated before systemd ever sees it, because an invalid config makes the unit flap five
+# times and stop, and the reason is then buried in a journal the installer has already told you
+# to go and read. Importing config touches neither the ledger nor the token.
+if ! sudo -u "$SERVICE_USER" "$VENV/bin/python" -c "
+import sys
+sys.path.insert(0, '$APP_DIR')
+import config
+config.load_config('$CONFIG')
+" 2>/tmp/melonkit-config.err; then
+    warn "$CONFIG is not valid:"
+    sed 's/^/    /' /tmp/melonkit-config.err >&2
+    die "fix or delete $CONFIG and re-run"
 fi
 
 if [ -f "$DATA_DIR/lexicon.json" ]; then
@@ -311,8 +328,17 @@ elif journalctl -u "$UNIT_NAME" --since "-2 min" --no-pager 2>/dev/null | grep -
     echo "    then:  sudo $0 --token <NEW_TOKEN>"
     exit 3
 else
-    warn "The bot is $STATUS but did not report a successful connection within 8 seconds."
-    echo "    Look at:  sudo journalctl -u $UNIT_NAME -n 50 --no-pager"
+    warn "The bot is $STATUS and did not report a successful connection within 8 seconds."
+    echo
+    echo "  What it actually said:"
+    # Printed rather than pointed at. Somebody following a one-command install should not have
+    # to learn journalctl to find out why that one command did not work, and the reason is
+    # usually the single line above the first "Main process exited".
+    journalctl -u "$UNIT_NAME" --since "-2 min" --no-pager -o cat 2>/dev/null \
+        | grep -v -e '^$' -e 'Scheduled restart' -e 'Stopped ' -e 'Started ' \
+        | tail -12 | sed 's/^/    /'
+    echo
+    echo "  Full log:  sudo journalctl -u $UNIT_NAME -n 50 --no-pager"
     [ "$STATUS" = "running" ] || exit 4
 fi
 
