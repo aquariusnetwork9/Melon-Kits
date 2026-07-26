@@ -46,19 +46,23 @@ LOG = logging.getLogger("melonkit")
 
 PANEL_CUSTOM_ID = "melonkit:request:v1"
 
-PANEL_TITLE = "\U0001F348 Melon Men - Kit Requests"
+PANEL_TITLE = "\U0001F198 Need Help on 2b2t?"
 PANEL_BODY = (
-    "We hand out barebones diamond kits to players just getting started on 2b2t, and to "
-    "anyone who's just lost everything.\n"
+    "Stuck in spawn? Bedtrapped? Base griefed? Need funding for a small project? "
+    "**The Melon Men** may be able to help!\n"
     "\n"
-    "- A kit is never guaranteed.\n"
-    "- We can't promise a waiting time.\n"
-    "- We check a few things first. Requests usually get declined for one of these:\n"
-    "  - the account looks like an alt of someone we've already helped\n"
-    "  - public chat history we aren't willing to overlook\n"
-    "  - you've had a kit from us in the last {cooldown} days\n"
+    "⚠️ **If you die with your escape kit due to your own actions, you will NOT "
+    "receive another.** Be careful and follow our advice.\n"
     "\n"
-    "Helping is voluntary and best-effort. Press the button below and we'll take a look."
+    "Submitting a ticket does not guarantee help, but we try to assist as many folks as we "
+    "can. Most tickets are fulfilled within {response_time}.\n"
+    "\n"
+    "We do check a couple of things first: your **public** 2b2t history — when you were "
+    "first seen, recent deaths, public chat — and whether we've already helped you in "
+    "the last {cooldown} days. Nothing private, and nothing you haven't already said in "
+    "open chat.\n"
+    "\n"
+    "⛑️ Players rescued: **{rescued_count}** as of {rescued_as_of}"
 )
 
 
@@ -114,8 +118,33 @@ def panel_embed(cfg: Dict[str, Any]) -> discord.Embed:
     """The pinned panel. Shared by /panel and --post-panel so the copy cannot drift."""
     return discord.Embed(
         title=PANEL_TITLE,
-        description=PANEL_BODY.format(cooldown=cfg["policy"]["cooldown_days"]),
+        description=PANEL_BODY.format(
+            cooldown=cfg["policy"]["cooldown_days"],
+            response_time=cfg["panel"]["response_time"],
+            rescued_count=cfg["panel"]["rescued_count"],
+            rescued_as_of=cfg["panel"]["rescued_as_of"]),
         colour=discord.Colour.from_str("#2E6B3F"))
+
+
+async def find_existing_panel(channel: Any) -> Optional[discord.Message]:
+    """The panel message already in this channel, if there is one.
+
+    Matched on the button's custom_id rather than on content, so the copy can change freely
+    without orphaning the message. This is what lets the panel be *edited* in place: a pinned
+    message that has to be deleted and re-posted every time the wording changes loses its pin
+    and its position, and anyone who bookmarked it.
+    """
+    try:
+        async for msg in channel.history(limit=100):
+            if not msg.author.bot or msg.author.id != channel.guild.me.id:
+                continue
+            for row in msg.components:
+                for item in getattr(row, "children", []) or []:
+                    if getattr(item, "custom_id", None) == PANEL_CUSTOM_ID:
+                        return msg
+    except discord.HTTPException:
+        return None
+    return None
 
 
 def _embed_for(card: Dict[str, Any], cfg: Dict[str, Any]) -> discord.Embed:
@@ -376,13 +405,22 @@ class KitBot(discord.Client):
                           "every applicant's reviewer card readable by everyone. Use a text "
                           "channel.", self._post_panel_to)
                 return
+            # Edit in place when a panel is already there. Re-posting on every copy change
+            # would lose the pin and the position and leave stale panels with live buttons.
+            existing = await find_existing_panel(channel)
+            if existing is not None:
+                await existing.edit(embed=panel_embed(self.cfg), view=PanelView())
+                LOG.info("existing panel updated channel=%d message=%d",
+                         channel.id, existing.id)
+                return
             msg = await channel.send(embed=panel_embed(self.cfg), view=PanelView())
             LOG.info("panel posted channel=%d message=%d", channel.id, msg.id)
             try:
                 await msg.pin()
                 LOG.info("panel pinned")
             except discord.HTTPException as exc:
-                LOG.warning("panel posted but not pinned (needs Manage Messages): status=%s",
+                LOG.warning("panel posted but not pinned (needs the Pin Messages "
+                            "permission, which is separate from Manage Messages): status=%s",
                             getattr(exc, "status", "?"))
         finally:
             await self.close()
@@ -690,9 +728,11 @@ class KitBot(discord.Client):
             # the thread.
             await self._notify_thread(
                 ticket,
-                "Request #%d wasn't approved this time. We don't go into specifics, but the "
-                "usual reasons are on the request panel. This isn't permanent - you're "
-                "welcome to ask again later." % ticket_id)
+                # Self-contained on purpose: it used to point at a list of reasons on the
+                # panel, and that list is no longer there to point at.
+                "Request #%d wasn't approved this time. We don't go into specifics on "
+                "individual decisions, and it isn't permanent - you're welcome to ask again "
+                "later." % ticket_id)
             # Archive before the thread gets cleaned up, not after.
             await self._post_transcript(ticket_id)
             return
@@ -1022,10 +1062,20 @@ def register_commands(app: KitBot) -> None:
             await interaction.response.send_message(
                 "Only reviewers can post the panel.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        existing = await find_existing_panel(interaction.channel)
+        if existing is not None:
+            await existing.edit(embed=panel_embed(app.cfg), view=PanelView())
+            await interaction.followup.send(
+                "Updated the panel that was already here, so it keeps its pin and its place. "
+                "Run this again after editing any `panel` value in the config.",
+                ephemeral=True)
+            return
         await interaction.channel.send(embed=panel_embed(app.cfg), view=PanelView())
-        await interaction.response.send_message(
-            "Panel posted. Pin it - the button keeps working indefinitely, so it only needs "
-            "posting once.", ephemeral=True)
+        await interaction.followup.send(
+            "Panel posted - pin it. The button keeps working indefinitely, so it only needs "
+            "posting once; running /panel again edits it in place rather than adding another.",
+            ephemeral=True)
 
     @tree.command(name="flag", description="Flag an account for future reviewers.")
     @app_commands.describe(mc_name="Minecraft username",

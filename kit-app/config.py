@@ -48,6 +48,14 @@ DEFAULTS: Dict[str, Any] = {
         # May claim a dispatch. 0 means "anyone in the dispatch channel".
         "runner_role_id": 0,
     },
+    # Panel copy that changes over time. Kept in config so updating it is an edit plus one
+    # command -- no code change, no redeploy, and `--post-panel` edits the pinned message in
+    # place rather than posting a second one.
+    "panel": {
+        "rescued_count": "15.1k",
+        "rescued_as_of": "7/20/25",
+        "response_time": "24-48 hours",
+    },
     "policy": {
         "cooldown_days": 21,
         "max_open_tickets_per_user": 1,
