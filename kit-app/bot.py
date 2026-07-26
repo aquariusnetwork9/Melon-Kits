@@ -38,6 +38,7 @@ from discord import app_commands
 import card as card_mod
 import config as config_mod
 import identity
+import redact
 import screening
 import store as store_mod
 import vc as vc_mod
@@ -45,6 +46,10 @@ import vc as vc_mod
 LOG = logging.getLogger("melonkit")
 
 PANEL_CUSTOM_ID = "melonkit:request:v1"
+# The rescue button's id above never changes value: `find_existing_panel` matches on it, and
+# that match is what lets an already-pinned panel be EDITED to gain this second button rather
+# than deleted and re-posted, which would lose its pin, its place and anyone's bookmark.
+PANEL_FUNDING_CUSTOM_ID = "melonkit:request:funding:v1"
 
 PANEL_TITLE = "\U0001F198 Need Help on 2b2t?"
 PANEL_BODY = (
@@ -63,6 +68,17 @@ PANEL_BODY = (
     "open chat.\n"
     "\n"
     "⛑️ Players rescued: **{rescued_count}** as of {rescued_as_of}"
+)
+
+# Which button to press. Kept out of PANEL_BODY so a server rewording the panel cannot
+# accidentally delete the only explanation of the difference between the two.
+PANEL_CHOICE = (
+    "**\U0001F198 Rescue kit** - you're stuck, trapped or just lost everything and need gear "
+    "to get going again.\n"
+    "**\U0001F9F1 Project funding** - you're building something and need materials for it.\n"
+    "\n"
+    "One request at a time either way. They're judged on different things, so pick the one "
+    "that fits - a reviewer can't turn one into the other."
 )
 
 
@@ -108,12 +124,29 @@ def _state_tags(forum: "discord.ForumChannel", state: str) -> list:
 
 async def _set_queue_state(channel: Any, state: str, *,
                            archive: bool = False) -> None:
-    """Move a queue post's tags to `state`. No-op when the queue is a plain text channel."""
+    """Move a queue post's lifecycle tag to `state`, keeping any other tag it has.
+
+    No-op when the queue is a plain text channel.
+
+    `applied_tags` is replace-not-merge, so the obvious version of this -- edit with just the
+    new state tag -- silently strips every other tag a post has. That was harmless while the
+    lifecycle was the only thing tagged; now the request type is a tag too, and the first
+    Approve would have deleted it. QUEUE_TAGS is what draws the line: anything in it is
+    lifecycle and gets replaced, anything else is somebody's and gets kept.
+    """
     if not isinstance(channel, discord.Thread):
         return
     if not isinstance(channel.parent, discord.ForumChannel):
         return
     tags = _state_tags(channel.parent, state)
+    if tags:
+        lifecycle = {n.casefold() for n in QUEUE_TAGS}
+        keep = [t for t in channel.applied_tags
+                if t.name.casefold() not in lifecycle]
+        # A forum post takes at most 5 tags. The lifecycle tag goes first so that it is never
+        # the one truncated: it is the one value this function is responsible for, and a
+        # moderator's fifth topical label losing its slot is the right thing to sacrifice.
+        tags = (tags + keep)[:5]
     try:
         if tags:
             await channel.edit(applied_tags=tags, archived=archive or False)
@@ -130,7 +163,7 @@ def panel_embed(g: Dict[str, Any]) -> discord.Embed:
     """The pinned panel. `g` is a merged per-guild config, so a server that overrides its
     cooldown or its rescued counter gets its own copy. Shared by /setup, /panel and
     --post-panel so the wording cannot drift between them."""
-    return discord.Embed(
+    embed = discord.Embed(
         title=PANEL_TITLE,
         description=PANEL_BODY.format(
             cooldown=g["cooldown_days"],
@@ -138,6 +171,8 @@ def panel_embed(g: Dict[str, Any]) -> discord.Embed:
             rescued_count=g["rescued_count"],
             rescued_as_of=g["rescued_as_of"]),
         colour=discord.Colour.from_str("#2E6B3F"))
+    embed.add_field(name="Which one do I want?", value=PANEL_CHOICE, inline=False)
+    return embed
 
 
 async def find_existing_panel(channel: Any) -> Optional[discord.Message]:
@@ -165,8 +200,12 @@ def _embed_for(card: Dict[str, Any], cfg: Dict[str, Any]) -> discord.Embed:
     colour = discord.Colour.from_str("#2E6B3F")
     if card["cooldown"]["blocked"] or card["flags"]:
         colour = discord.Colour.from_str("#8A6D1F")
+    # "Lookup" when there is no request behind the card: /lookup builds one to vet a name, and
+    # titling that "Rescue kit - Alice" would invent a request nobody made.
+    what = (store_mod.KIND_LABEL[card_mod.kind_of(card)].capitalize()
+            if card.get("request_type") else "Lookup")
     embed = discord.Embed(
-        title="Kit request - %s" % card["mc_name"],
+        title="%s - %s" % (what, card["mc_name"]),
         description=card_mod.headline(card),
         colour=colour)
     for section in card_mod.sections(card):
@@ -181,7 +220,9 @@ def _embed_for(card: Dict[str, Any], cfg: Dict[str, Any]) -> discord.Embed:
 
 # --------------------------------------------------------------------------- views
 
-class RequestModal(discord.ui.Modal, title="Request a kit"):
+class RequestModal(discord.ui.Modal, title="Request a rescue kit"):
+    """The rescue form. One free-text note, because the case is usually one sentence."""
+
     mc_name = discord.ui.TextInput(
         label="Your Minecraft username",
         placeholder="exactly as it appears in game",
@@ -193,14 +234,21 @@ class RequestModal(discord.ui.Modal, title="Request a kit"):
         max_length=500, required=False)
 
     def __init__(self, app: "KitBot") -> None:
-        super().__init__(timeout=600)
+        # No timeout. Discord puts no deadline on submitting a modal -- the dialog stays
+        # open as long as the applicant keeps typing -- but discord.py's own view timeout
+        # does, and when it expires the submission dispatches to nothing: "This
+        # interaction failed", and everything they wrote is gone. Someone assembling a
+        # materials list is checking their stock in game while the form sits open, so ten
+        # minutes is a normal answer rather than an abandoned one.
+        super().__init__(timeout=None)
         self.app = app
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         # The five API calls take a few seconds, well past the 3s deadline, so acknowledge
         # first and keep working behind the 15-minute follow-up token.
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.app.handle_request(interaction, str(self.mc_name), str(self.note or ""))
+        await self.app.handle_request(interaction, str(self.mc_name), str(self.note or ""),
+                                      kind=store_mod.KIND_RESCUE)
 
     async def on_error(self, interaction: discord.Interaction,
                        error: Exception) -> None:      # pragma: no cover - Discord runtime
@@ -211,18 +259,84 @@ class RequestModal(discord.ui.Modal, title="Request a kit"):
                              "try again in a minute.")
 
 
+class FundingModal(discord.ui.Modal, title="Request project funding"):
+    """The funding form.
+
+    Separate from the rescue form rather than one form with a type selector, and the reason is
+    a platform constraint rather than a preference: a modal is submitted whole, so it cannot
+    change its own questions after someone picks a type inside it. Asking a builder "anything
+    we should know?" and a rescue applicant "how big is this?" in the same box would make both
+    answers unusable, so the choice happens on the panel, one button per form.
+
+    Four fields against Discord's limit of five, leaving one spare.
+    """
+
+    mc_name = discord.ui.TextInput(
+        label="Your Minecraft username",
+        placeholder="exactly as it appears in game",
+        min_length=3, max_length=16, required=True)
+    project = discord.ui.TextInput(
+        label="What's the project?",
+        placeholder="e.g. rebuilding the nether hub after it got griefed",
+        max_length=200, required=True)
+    needs = discord.ui.TextInput(
+        label="What do you need?",
+        style=discord.TextStyle.paragraph,
+        placeholder="e.g. 4 stacks of obsidian and a shulker of glass",
+        max_length=500, required=True)
+    scale = discord.ui.TextInput(
+        label="Roughly how big is this?",
+        placeholder="a weekend / a few weeks / ongoing",
+        max_length=100, required=False)
+
+    def __init__(self, app: "KitBot") -> None:
+        # No timeout. Discord puts no deadline on submitting a modal -- the dialog stays
+        # open as long as the applicant keeps typing -- but discord.py's own view timeout
+        # does, and when it expires the submission dispatches to nothing: "This
+        # interaction failed", and everything they wrote is gone. Someone assembling a
+        # materials list is checking their stock in game while the form sits open, so ten
+        # minutes is a normal answer rather than an abandoned one.
+        super().__init__(timeout=None)
+        self.app = app
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.app.handle_request(
+            interaction, str(self.mc_name), "",
+            kind=store_mod.KIND_FUNDING,
+            details={"project": str(self.project or ""),
+                     "needs": str(self.needs or ""),
+                     "scale": str(self.scale or "")})
+
+    async def on_error(self, interaction: discord.Interaction,
+                       error: Exception) -> None:      # pragma: no cover - Discord runtime
+        LOG.error("funding modal failed user=%s err=%s", interaction.user.id,
+                  type(error).__name__)
+        await _safe_followup(interaction,
+                             "Something broke on our side. Nothing was recorded - please "
+                             "try again in a minute.")
+
+
 class PanelView(discord.ui.View):
-    """The pinned panel. Static custom_id, never times out, survives restarts."""
+    """The pinned panel. Static custom_ids, never times out, survives restarts."""
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Request a kit", emoji="\U0001F348",
+    @discord.ui.button(label="Request a rescue kit", emoji="\U0001F198",
                        style=discord.ButtonStyle.success, custom_id=PANEL_CUSTOM_ID)
     async def request(self, interaction: discord.Interaction,
                       button: discord.ui.Button) -> None:
         app: KitBot = interaction.client            # type: ignore[assignment]
-        await app.handle_panel_click(interaction)
+        await app.handle_panel_click(interaction, store_mod.KIND_RESCUE)
+
+    @discord.ui.button(label="Request project funding", emoji="\U0001F9F1",
+                       style=discord.ButtonStyle.primary,
+                       custom_id=PANEL_FUNDING_CUSTOM_ID)
+    async def funding(self, interaction: discord.Interaction,
+                      button: discord.ui.Button) -> None:
+        app: KitBot = interaction.client            # type: ignore[assignment]
+        await app.handle_panel_click(interaction, store_mod.KIND_FUNDING)
 
 
 class ApproveButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -267,6 +381,177 @@ class DeclineButton(discord.ui.DynamicItem[discord.ui.Button],
         await interaction.response.send_modal(DeclineModal(app, self.ticket_id))
 
 
+def _normalise_dimension(text: str) -> Optional[str]:
+    """Map whatever they typed onto overworld/nether/end, or keep it as written.
+
+    Tolerant rather than validating: a runner can act on "the nether roof" perfectly well, and
+    refusing a form because a free-text hint was not one of three words would strand somebody
+    who is waiting to be found.
+    """
+    low = (text or "").strip().casefold()
+    if not low:
+        return None
+    for known in card_mod.DIMENSIONS:
+        if known in low:
+            return known
+    if "over" in low or low in ("ow", "owo"):
+        return "overworld"
+    return text.strip()[:40]
+
+
+class CoordsButton(discord.ui.DynamicItem[discord.ui.Button],
+                   template=r"melonkit:coords:(?P<ticket>\d+)"):
+    """Lets the applicant say where to meet, once their request is approved.
+
+    Posted into their own private thread rather than offered on the panel: before a decision
+    there is nothing to deliver, and asking up front would collect a location from everyone who
+    gets declined. Persistent like every other button here, because the gap between approval and
+    somebody actually reading their thread can be hours.
+    """
+
+    def __init__(self, ticket_id: int) -> None:
+        super().__init__(discord.ui.Button(
+            label="Set meeting coordinates", emoji="\U0001F4CD",
+            style=discord.ButtonStyle.primary,
+            custom_id="melonkit:coords:%d" % ticket_id))
+        self.ticket_id = ticket_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction,
+                             item: discord.ui.Button,
+                             match: "re.Match[str]") -> "CoordsButton":
+        return cls(int(match["ticket"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        app: KitBot = interaction.client            # type: ignore[assignment]
+        await app.handle_coords_open(interaction, self.ticket_id)
+
+
+class CoordsModal(discord.ui.Modal, title="Where should we meet you?"):
+    coords = discord.ui.TextInput(
+        label="Coordinates (X Y Z)",
+        placeholder="e.g. 1200 64 -840",
+        max_length=120, required=True)
+    dimension = discord.ui.TextInput(
+        label="Which dimension? (optional)",
+        placeholder="overworld / nether / end",
+        max_length=40, required=False)
+
+    def __init__(self, app: "KitBot", ticket_id: int) -> None:
+        # No timeout. Discord puts no deadline on submitting a modal -- the dialog stays
+        # open as long as the applicant keeps typing -- but discord.py's own view timeout
+        # does, and when it expires the submission dispatches to nothing: "This
+        # interaction failed", and everything they wrote is gone. Someone assembling a
+        # materials list is checking their stock in game while the form sits open, so ten
+        # minutes is a normal answer rather than an abandoned one.
+        super().__init__(timeout=None)
+        self.app = app
+        self.ticket_id = ticket_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.app.handle_coords_submit(
+            interaction, self.ticket_id, str(self.coords), str(self.dimension or ""))
+
+    async def on_error(self, interaction: discord.Interaction,
+                       error: Exception) -> None:      # pragma: no cover - Discord runtime
+        LOG.error("coords modal failed ticket=%d err=%s", self.ticket_id,
+                  type(error).__name__)
+        await _safe_followup(interaction,
+                             "Something broke saving that. Press the button and try again.")
+
+
+class ChatHistoryButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r"melonkit:chat:(?P<ticket>\d+)"):
+    """Opens the reviewer-only chat pager for a ticket.
+
+    This is the durable entry point, and it has to be: the pager itself is an ephemeral message,
+    which Discord discards when the reviewer's client restarts. Coming back to a ticket means
+    pressing this again, so it lives on the queue post and is re-added to every view that
+    replaces the original one.
+    """
+
+    def __init__(self, ticket_id: int) -> None:
+        super().__init__(discord.ui.Button(
+            label="Chat history", emoji="\U0001F4DC",
+            style=discord.ButtonStyle.secondary,
+            custom_id="melonkit:chat:%d" % ticket_id))
+        self.ticket_id = ticket_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction,
+                             item: discord.ui.Button,
+                             match: "re.Match[str]") -> "ChatHistoryButton":
+        return cls(int(match["ticket"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        app: KitBot = interaction.client            # type: ignore[assignment]
+        await app.handle_chat_page(interaction, self.ticket_id, 0, edit=False)
+
+
+class ChatPageButton(discord.ui.DynamicItem[discord.ui.Button],
+                     template=r"melonkit:chatpage:(?P<ticket>\d+):(?P<page>\d+)"):
+    """Prev/Next. The TARGET page is in the custom_id, so no page state is held anywhere.
+
+    The alternative -- an ordinary View holding `self.page` in memory -- looks simpler and is
+    broken: discord.py *overrides* the timeout of any view sent on an ephemeral message to 15
+    minutes and there is no way to opt out, after which a press dispatches to nothing at all.
+    No exception, no log line, just "This interaction failed" on a button that still looks
+    live. A reviewer who opens the chat, goes to check the applicant's other tickets and comes
+    back is well past 15 minutes, and that is the normal reviewing rhythm rather than an edge
+    case. Deriving the page from the custom_id has no expiry and survives a redeploy.
+
+    Every child of the pager view MUST be a DynamicItem for a related reason. When a view
+    holding dynamic items times out, discord.py unregisters their templates process-wide -- but
+    only if the view also has a *non*-dynamic dispatchable child. So adding an innocent disabled
+    "Page 3/5" button here would, fifteen minutes later, break Prev/Next for every reviewer in
+    every guild until the next restart. The page counter goes in the embed footer.
+    """
+
+    def __init__(self, ticket_id: int, page: int, label: str) -> None:
+        super().__init__(discord.ui.Button(
+            label=label, style=discord.ButtonStyle.secondary,
+            custom_id="melonkit:chatpage:%d:%d" % (ticket_id, page)))
+        self.ticket_id = ticket_id
+        self.page = page
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction,
+                             item: discord.ui.Button,
+                             match: "re.Match[str]") -> "ChatPageButton":
+        # Label read off the live component, so a rebuild after a restart does not guess it.
+        return cls(int(match["ticket"]), int(match["page"]), item.label or "Page")
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        app: KitBot = interaction.client            # type: ignore[assignment]
+        await app.handle_chat_page(interaction, self.ticket_id, self.page, edit=True)
+
+
+class ChatFileButton(discord.ui.DynamicItem[discord.ui.Button],
+                     template=r"melonkit:chatfile:(?P<ticket>\d+)"):
+    """The escape hatch: the same lines as a .txt, regenerated on demand.
+
+    The queue card no longer carries an attachment, so this is what keeps the old workflow
+    available for the reviewer who wants to search the whole log at once instead of paging it.
+    """
+
+    def __init__(self, ticket_id: int) -> None:
+        super().__init__(discord.ui.Button(
+            label="Download .txt", emoji="\U0001F4C4",
+            style=discord.ButtonStyle.secondary,
+            custom_id="melonkit:chatfile:%d" % ticket_id))
+        self.ticket_id = ticket_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction,
+                             item: discord.ui.Button,
+                             match: "re.Match[str]") -> "ChatFileButton":
+        return cls(int(match["ticket"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        app: KitBot = interaction.client            # type: ignore[assignment]
+        await app.handle_chat_file(interaction, self.ticket_id)
+
+
 class DeclineModal(discord.ui.Modal, title="Decline this request"):
     reason = discord.ui.TextInput(
         label="Reason (required)",
@@ -276,7 +561,13 @@ class DeclineModal(discord.ui.Modal, title="Decline this request"):
         min_length=3, max_length=400, required=True)
 
     def __init__(self, app: "KitBot", ticket_id: int) -> None:
-        super().__init__(timeout=600)
+        # No timeout. Discord puts no deadline on submitting a modal -- the dialog stays
+        # open as long as the applicant keeps typing -- but discord.py's own view timeout
+        # does, and when it expires the submission dispatches to nothing: "This
+        # interaction failed", and everything they wrote is gone. Someone assembling a
+        # materials list is checking their stock in game while the form sits open, so ten
+        # minutes is a normal answer rather than an abandoned one.
+        super().__init__(timeout=None)
         self.app = app
         self.ticket_id = ticket_id
 
@@ -454,7 +745,8 @@ class KitBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.add_view(PanelView())
-        for item in (ApproveButton, DeclineButton, ClaimButton, DeliveredButton):
+        for item in (ApproveButton, DeclineButton, ClaimButton, DeliveredButton,
+                     ChatHistoryButton, ChatPageButton, ChatFileButton, CoordsButton):
             self.add_dynamic_items(item)
         self.tree.on_error = self._on_app_command_error
         register_commands(self)
@@ -567,9 +859,15 @@ class KitBot(discord.Client):
                                    "auto-closed: applicant thread was deleted")
         LOG.info("auto-closed orphaned ticket ticket=%s user=%s thread=%s gone",
                  row["id"], user_id, tid)
-        await self._post_transcript(int(row["id"]))
+        # Fire-and-forget, because this runs from the panel pre-check -- BEFORE the button
+        # press has been answered, on a 3-second clock. Archiving means building a file and
+        # uploading it to another channel, which is multipart and can take a rate-limit sleep;
+        # awaiting it here is what would make the button read as broken. The ledger write above
+        # has already happened, and it is the part the next line depends on.
+        asyncio.create_task(self._post_transcript(int(row["id"])))
 
-    async def handle_panel_click(self, interaction: discord.Interaction) -> None:
+    async def handle_panel_click(self, interaction: discord.Interaction,
+                                 kind: str = store_mod.KIND_RESCUE) -> None:
         """Pre-check, THEN show the form. Never the other way round."""
         gid = interaction.guild_id
         if gid is None or not self.is_configured(gid):
@@ -593,20 +891,31 @@ class KitBot(discord.Client):
                 % where, ephemeral=True)
             return
 
-        cd = self.store.cooldown(gid, g["cooldown_days"], discord_user_id=user_id)
+        # Per kind, so a funded build does not block a rescue and a rescue does not block a
+        # build. The one-open-ticket rule above is deliberately NOT per kind: two open tickets
+        # is two threads and two cards for one person, and being stuck open is the most
+        # expensive failure this app has.
+        cd = self.store.cooldown(gid, g["cooldown_days"], discord_user_id=user_id, kind=kind)
         if cd["blocked"]:
             await interaction.response.send_message(
-                "You had a kit from us recently, so you're inside the %d-day cooldown - "
-                "about %d day(s) to go. This is to spread kits around rather than anything "
-                "against you." % (g["cooldown_days"], cd["days_left"]), ephemeral=True)
+                "You had %s from us recently, so you're inside the %d-day cooldown for that - "
+                "about %d day(s) to go. This is to spread help around rather than anything "
+                "against you.%s" % (
+                    "a rescue kit" if kind == store_mod.KIND_RESCUE else "project funding",
+                    g["cooldown_days"], cd["days_left"],
+                    "\n\nThe other kind of request has its own cooldown, so that one may "
+                    "still be open to you."), ephemeral=True)
             return
 
-        await interaction.response.send_modal(RequestModal(self))
+        await interaction.response.send_modal(
+            FundingModal(self) if kind == store_mod.KIND_FUNDING else RequestModal(self))
 
     # ---------------------------------------------------------------- the ticket
 
     async def handle_request(self, interaction: discord.Interaction,
-                             mc_name: str, note: str) -> None:
+                             mc_name: str, note: str,
+                             kind: str = store_mod.KIND_RESCUE,
+                             details: Optional[Dict[str, Any]] = None) -> None:
         user = interaction.user
         mc_name = mc_name.strip()
 
@@ -642,16 +951,24 @@ class KitBot(discord.Client):
 
         gid = interaction.guild_id
         g = self.gcfg(gid)
-        ticket_id = self.store.create_ticket(gid, user.id, canonical, mc_uuid, note or None)
-        LOG.info("ticket opened guild=%s ticket=%d user=%s uuid=%s", gid, ticket_id, user.id,
-                 mc_uuid or "unresolved")
+
+        # Note: what the applicant types here is stored as written. Chat pulled from
+        # api.2b2t.vc is coordinate-redacted (see card.gather) because that is third-party
+        # public chat being repurposed as evidence; a form field somebody chose to fill in
+        # about their own project is not, and stripping "the hub at 500 60 500" out of a
+        # project description would leave the reviewer unable to tell what was being asked for.
+        ticket_id = self.store.create_ticket(gid, user.id, canonical, mc_uuid, note or None,
+                                             request_type=kind, details=details)
+        LOG.info("ticket opened guild=%s ticket=%d kind=%s user=%s uuid=%s", gid, ticket_id,
+                 kind, user.id, mc_uuid or "unresolved")
 
         thread = await self._open_thread(interaction, g, ticket_id, canonical)
         if thread is not None:
             self.store.set_ticket_thread(ticket_id, thread.id)
 
         built = await loop.run_in_executor(None, lambda: card_mod.gather(
-            gid, canonical, mc_uuid, user.id, self.cfg, self.vc, self.store, self.lex, LOG))
+            gid, canonical, mc_uuid, user.id, self.cfg, self.vc, self.store, self.lex, LOG,
+            request_type=kind, details=details))
 
         # Instrumentation: the lines shown, stored redacted. Impossible to backfill.
         try:
@@ -666,12 +983,13 @@ class KitBot(discord.Client):
         if thread is not None:
             try:
                 await thread.send(
-                    "Thanks %s - this is request **#%d** for `%s`.\n\n"
+                    "Thanks %s - this is request **#%d**, for **%s**, on `%s`.\n\n"
                     "A reviewer will look at it when someone's around. Help here is "
-                    "voluntary, so there's no queue position to give you, and a kit isn't "
+                    "voluntary, so there's no queue position to give you, and it isn't "
                     "guaranteed. You don't need to do anything else - if it's approved, "
                     "whoever is delivering will message you in this thread to sort out "
-                    "where to meet." % (user.mention, ticket_id, canonical))
+                    "where to meet." % (user.mention, ticket_id,
+                                        store_mod.KIND_LABEL[kind], canonical))
             except discord.HTTPException:
                 LOG.warning("could not post receipt to applicant thread ticket=%d", ticket_id)
 
@@ -708,42 +1026,162 @@ class KitBot(discord.Client):
                       channel_id, ticket_id)
             return False
 
+        kind = card_mod.kind_of(built)
         view = discord.ui.View(timeout=None)
         view.add_item(ApproveButton(ticket_id))
         view.add_item(DeclineButton(ticket_id))
-
-        files = []
+        # No .txt attachment any more: the same lines are paged in Discord, and the pager
+        # offers the file on demand for anyone who wants the whole log at once. Only added when
+        # there is something to page -- an empty pager could not say whether the applicant was
+        # silent or the lookup failed, and the card's chat field already distinguishes those.
         if built["chat_lines"]:
-            files.append(discord.File(
-                io.BytesIO(card_mod.chat_dump(built).encode("utf-8")),
-                filename="chat-%s-ticket%d.txt" % (mc_name, ticket_id)))
+            view.add_item(ChatHistoryButton(ticket_id))
 
         role_id = int(g.get("reviewer_role_id") or 0)
-        header = "%sTicket #%d - requested by %s%s" % (
-            "<@&%d> " % role_id if role_id else "", ticket_id, user.mention,
+        header = "%sTicket #%d - **%s** requested by %s%s" % (
+            "<@&%d> " % role_id if role_id else "", ticket_id,
+            store_mod.KIND_LABEL[kind], user.mention,
             "\nApplicant thread: <#%d>" % thread.id if thread is not None else "")
         mentions = discord.AllowedMentions(roles=True, users=True)
 
         try:
             if isinstance(channel, discord.ForumChannel):
                 created = await channel.create_thread(
-                    name="#%d %s" % (ticket_id, mc_name),
+                    # The type is in the title so the forum index shows it without relying on
+                    # the tag, which a server set up before the tags existed will not have.
+                    name="#%d %s - %s" % (ticket_id, mc_name, store_mod.KIND_LABEL[kind]),
                     content=header, embed=_embed_for(built, self.cfg), view=view,
-                    files=files, allowed_mentions=mentions,
-                    applied_tags=_state_tags(channel, "awaiting review"))
+                    allowed_mentions=mentions,
+                    applied_tags=(_state_tags(channel, store_mod.KIND_LABEL[kind])
+                                  + _state_tags(channel, "awaiting review")))
                 # A forum post's starter message shares the thread's id, so storing the
                 # thread id is enough to find and edit the card later.
                 self.store.set_queue_thread(ticket_id, created.thread.id)
             else:
                 msg = await channel.send(content=header,
                                          embed=_embed_for(built, self.cfg), view=view,
-                                         files=files, allowed_mentions=mentions)
+                                         allowed_mentions=mentions)
                 self.store.set_queue_thread(ticket_id, msg.id)
             return True
         except discord.HTTPException as exc:
             LOG.error("could not post queue card ticket=%d status=%s",
                       ticket_id, getattr(exc, "status", "?"))
             return False
+
+    # ------------------------------------------------------------- the chat pager
+
+    def _chat_rows(self, guild_id: int, ticket_id: int):
+        """Guild-scoped, because the ticket number arrived in a custom_id a user pressed."""
+        return self.store.shown_chats_for_guild(int(guild_id), int(ticket_id))
+
+    def _with_chat(self, view: Optional[discord.ui.View], guild_id: Optional[int],
+                   ticket_id: int) -> Optional[discord.ui.View]:
+        """Keep the chat-history button on a view that is replacing a queue card's.
+
+        Every lifecycle step swaps the card's whole view for a new one, and components do not
+        merge: anything the replacement lacks is gone. While the chat log was an attachment it
+        survived those edits for free, because an edit that omits `attachments` leaves them
+        alone. A button gets no such treatment, so each replacement has to re-add it -- or a
+        ticket loses its chat the moment it is decided, which is exactly when a reviewer goes
+        back to check something.
+
+        Returns `view` untouched when the ticket has no chat, so a `None` stays `None` and the
+        no-chat case behaves exactly as it did before.
+        """
+        if guild_id is None or not self._chat_rows(guild_id, ticket_id):
+            return view
+        view = view or discord.ui.View(timeout=None)
+        view.add_item(ChatHistoryButton(ticket_id))
+        return view
+
+    async def handle_chat_page(self, interaction: discord.Interaction, ticket_id: int,
+                               page: int, edit: bool = False) -> None:
+        """Show one page of a ticket's chat, ephemerally, to a reviewer.
+
+        Not deferred, on purpose. The work is one indexed read of at most a hundred rows plus
+        string formatting, comfortably inside the 3-second window -- and `edit_message` raises
+        InteractionResponded after a deferral, so deferring would force the paging path onto
+        `followup` for no gain.
+        """
+        gid = interaction.guild_id
+        # Role first, before the ticket is looked up: #kit-queue is visible to the delivery
+        # role too, so a runner pressing this is the ordinary case being refused rather than a
+        # hypothetical, and answering before the lookup keeps the refusal from doubling as a
+        # way to probe which ticket numbers exist.
+        if gid is None or not is_reviewer(interaction.user, self.gcfg(gid)):
+            await interaction.response.send_message(
+                "Only reviewers can read an applicant's chat history.", ephemeral=True)
+            return
+        if self.store.get_ticket(ticket_id, gid) is None:
+            await interaction.response.send_message(
+                "There's no ticket #%d in this server." % ticket_id, ephemeral=True)
+            return
+
+        rows = self._chat_rows(gid, ticket_id)
+        pages = card_mod.chat_pages(rows)
+        # Clamp rather than error. A reviewer can be holding a pager from before the rows were
+        # reset, naming a page that no longer exists.
+        index = max(0, min(int(page), len(pages) - 1))
+
+        embed = discord.Embed(
+            title="Chat · ticket #%d" % ticket_id,
+            description=card_mod.chat_page_body(pages[index]),
+            colour=discord.Colour.from_str(
+                "#8A6D1F" if pages[index]["flagged"] else "#2E6B3F"))
+        if pages[index]["flagged"]:
+            embed.add_field(
+                name="Flagged on this page",
+                value="%s - marked `!` in the left column"
+                      % ", ".join(str(p) for p in pages[index]["flagged"]),
+                inline=False)
+        embed.set_footer(text=card_mod.chat_page_footer(pages, index, len(rows), ticket_id))
+
+        view = discord.ui.View(timeout=None)
+        # Every child here must be a DynamicItem -- see ChatPageButton's docstring for the
+        # global-unregistration footgun that a plain disabled button would trigger.
+        if index > 0:
+            view.add_item(ChatPageButton(ticket_id, index - 1, "◀ Previous"))
+        if index < len(pages) - 1:
+            view.add_item(ChatPageButton(ticket_id, index + 1, "Next ▶"))
+        if rows:
+            view.add_item(ChatFileButton(ticket_id))
+
+        try:
+            if edit:
+                await interaction.response.edit_message(
+                    embed=embed, view=view,
+                    allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await interaction.response.send_message(
+                    embed=embed, view=view, ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as exc:
+            LOG.warning("could not show chat page ticket=%d page=%d status=%s",
+                        ticket_id, index, getattr(exc, "status", "?"))
+
+    async def handle_chat_file(self, interaction: discord.Interaction,
+                              ticket_id: int) -> None:
+        """The same lines as a .txt, rebuilt from the ledger on demand."""
+        gid = interaction.guild_id
+        if gid is None or not is_reviewer(interaction.user, self.gcfg(gid)):
+            await interaction.response.send_message(
+                "Only reviewers can read an applicant's chat history.", ephemeral=True)
+            return
+        ticket = self.store.get_ticket(ticket_id, gid)
+        if ticket is None:
+            await interaction.response.send_message(
+                "There's no ticket #%d in this server." % ticket_id, ephemeral=True)
+            return
+        rows = self._chat_rows(gid, ticket_id)
+        if not rows:
+            await interaction.response.send_message(
+                "No chat lines are recorded for ticket #%d." % ticket_id, ephemeral=True)
+            return
+        body = card_mod.chat_file(rows, ticket_id, str(ticket["mc_name"]))
+        await interaction.response.send_message(
+            file=discord.File(io.BytesIO(body.encode("utf-8")),
+                              filename="chat-ticket%d.txt" % ticket_id),
+            ephemeral=True)
 
     async def _queue_post(self, ticket: Any):
         """(thread_or_None, partial_message_or_None) for a ticket's queue post."""
@@ -842,7 +1280,8 @@ class KitBot(discord.Client):
                     await qmsg.edit(
                         content="Ticket #%d - **declined** by %s\n> %s"
                                 % (ticket_id, interaction.user.mention, reason or ""),
-                        view=None, allowed_mentions=discord.AllowedMentions.none())
+                        view=self._with_chat(None, gid, ticket_id),
+                        allowed_mentions=discord.AllowedMentions.none())
                 except discord.HTTPException:
                     LOG.warning("could not update declined queue post ticket=%d", ticket_id)
             await _set_queue_state(qthread, "declined", archive=True)
@@ -861,8 +1300,12 @@ class KitBot(discord.Client):
             await self._post_transcript(ticket_id)
             return
 
+        # The kind is copied from the ticket at the point of granting, so the two can never
+        # disagree: this is what the cooldown reads, and it has to work for a grant recorded
+        # with no ticket behind it too, where there would be nothing to join to.
         kit_id = self.store.record_kit(gid, ticket_id, int(ticket["discord_user_id"]),
-                                       str(ticket["mc_name"]), ticket["mc_uuid"])
+                                       str(ticket["mc_name"]), ticket["mc_uuid"],
+                                       kind=store_mod.ticket_kind(ticket))
 
         # The same post becomes the dispatch: one post is the entire record of a ticket.
         if qmsg is not None:
@@ -872,7 +1315,8 @@ class KitBot(discord.Client):
                 await qmsg.edit(
                     content="Ticket #%d - **approved** by %s\nDispatch #%d, unclaimed."
                             % (ticket_id, interaction.user.mention, kit_id),
-                    view=claim_view, allowed_mentions=discord.AllowedMentions.none())
+                    view=self._with_chat(claim_view, gid, ticket_id),
+                    allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 LOG.warning("could not attach claim button ticket=%d kit=%d",
                             ticket_id, kit_id)
@@ -881,11 +1325,19 @@ class KitBot(discord.Client):
         await _safe_followup(
             interaction,
             "Ticket #%d approved. Dispatch #%d is claimable on this post." % (ticket_id, kit_id))
+        # Approval is the first moment there is anything to deliver, so it is also the first
+        # moment it is worth asking where. The button goes with the message rather than being a
+        # separate post, so the ask and the reason for it stay together.
+        coords_view = discord.ui.View(timeout=None)
+        coords_view.add_item(CoordsButton(ticket_id))
         await self._notify_thread(
             ticket,
-            "Request #%d is **approved**. Someone will claim the delivery and message you "
-            "here to sort out where to meet. Times aren't guaranteed - everyone here is a "
-            "volunteer." % ticket_id)
+            "Request #%d is **approved**. Times aren't guaranteed - everyone here is a "
+            "volunteer.\n\n"
+            "**Press the button and tell us where to meet you** (X Y Z, and which dimension). "
+            "Whoever claims the delivery sees it straight away, and you can update it here if "
+            "you move." % ticket_id,
+            view=coords_view)
 
     # ------------------------------------------------------------- transcripts
 
@@ -907,8 +1359,12 @@ class KitBot(discord.Client):
         qthread, qmsg = await self._queue_post(fresh)
         if qmsg is not None:
             try:
-                await qmsg.edit(content="Ticket #%s - **closed**: the applicant thread was "
-                                        "deleted." % row["id"], view=None)
+                # `_with_chat`, not view=None: this is the one lifecycle path with no
+                # interaction to take a guild id from, so it comes off the ledger row.
+                await qmsg.edit(
+                    content="Ticket #%s - **closed**: the applicant thread was deleted."
+                            % row["id"],
+                    view=self._with_chat(None, fresh["guild_id"], int(row["id"])))
             except discord.HTTPException:
                 pass
         await _set_queue_state(qthread, "closed", archive=True)
@@ -1004,9 +1460,11 @@ class KitBot(discord.Client):
         delivered_label = status.upper()
         if kits and kits[0]["delivered_at"]:
             delivered_label = "DELIVERED"
-        lines = ["<@%d> → **%s**  ·  `%s`"
+        kind = store_mod.ticket_kind(t)
+        details = store_mod.ticket_details(t)
+        lines = ["<@%d> → **%s**  ·  `%s`  ·  %s"
                  % (int(t["discord_user_id"]), t["mc_name"],
-                    (t["mc_uuid"] or "unresolved")[:8])]
+                    (t["mc_uuid"] or "unresolved")[:8], store_mod.KIND_LABEL[kind])]
 
         span = []
         if opened:
@@ -1031,10 +1489,20 @@ class KitBot(discord.Client):
             third.append("never claimed")
         third.append("%d lines%s" % (len(shown),
                                      ", %d flagged" % len(flagged) if flagged else ""))
+        if t["meet_coords"]:
+            third.append("met at %s" % t["meet_coords"].split("  (")[0])
         lines.append(" · ".join(third))
 
         if t["note"]:
             lines.append("> %s" % str(t["note"]).replace("\n", " ")[:160])
+        # A funding ticket's whole case is what it asked for, so the one-line summary has to
+        # carry it -- a transcript reading only "project funding, declined" records nothing
+        # anybody could learn from later.
+        if kind == store_mod.KIND_FUNDING:
+            ask = " · ".join(
+                "%s: %s" % (label, str(details.get(key) or "-").replace("\n", " "))
+                for key, label in card_mod.FUNDING_FIELDS)
+            lines.append("> %s" % ask[:400])
 
         embed = discord.Embed(
             title="Ticket #%d · %s" % (ticket_id, delivered_label),
@@ -1045,12 +1513,19 @@ class KitBot(discord.Client):
         parts = ["MELON KITS - TICKET #%d TRANSCRIPT" % ticket_id,
                  "=" * 72,
                  "status      : %s" % t["status"],
+                 "request for : %s" % store_mod.KIND_LABEL[kind],
                  "applicant   : discord %s" % t["discord_user_id"],
                  "minecraft   : %s (%s)" % (t["mc_name"], t["mc_uuid"] or "unresolved"),
                  "opened      : %s" % (opened.isoformat() if opened else "?"),
                  "closed      : %s" % (closed.isoformat() if closed else "-"),
                  "request note: %s" % (t["note"] or "-"),
-                 ""]
+                 "meeting     : %s%s" % (
+                     t["meet_coords"] or "not given",
+                     " (%s)" % t["meet_dimension"] if t["meet_dimension"] else "")]
+        for key, label in card_mod.FUNDING_FIELDS:
+            if kind == store_mod.KIND_FUNDING:
+                parts.append("%-12s: %s" % (label.lower(), details.get(key) or "-"))
+        parts.append("")
         parts.append("DECISIONS")
         for d in decisions:
             parts.append("  %s  %s by %s: %s"
@@ -1089,7 +1564,8 @@ class KitBot(discord.Client):
             LOG.error("could not post transcript ticket=%d status=%s",
                       ticket_id, getattr(exc, "status", "?"))
 
-    async def _notify_thread(self, ticket: Any, text: str) -> None:
+    async def _notify_thread(self, ticket: Any, text: str,
+                             view: Optional[discord.ui.View] = None) -> None:
         thread_id = ticket["thread_id"]
         if not thread_id:
             return
@@ -1097,9 +1573,95 @@ class KitBot(discord.Client):
         if channel is None:
             return
         try:
-            await channel.send(text)
+            await channel.send(text, view=view) if view else await channel.send(text)
         except discord.HTTPException:
             LOG.warning("could not post to thread=%s", thread_id)
+
+    # -------------------------------------------------------- the meeting point
+
+    async def handle_coords_open(self, interaction: discord.Interaction,
+                                 ticket_id: int) -> None:
+        """Open the coordinates form. The applicant's own button, in their own thread."""
+        gid = interaction.guild_id
+        ticket = self.store.get_ticket(ticket_id, gid) if gid else None
+        if ticket is None:
+            await interaction.response.send_message(
+                "There's no ticket #%d in this server." % ticket_id, ephemeral=True)
+            return
+        # The applicant, or a reviewer relaying coordinates somebody gave them in chat. Anyone
+        # else in the thread -- and the runner is in the thread -- gets nothing: a delivery
+        # turning up somewhere the applicant did not choose is worse than no delivery.
+        if int(ticket["discord_user_id"]) != interaction.user.id \
+                and not is_reviewer(interaction.user, self.gcfg(gid)):
+            await interaction.response.send_message(
+                "Only the person who opened this request can set the meeting point.",
+                ephemeral=True)
+            return
+        await interaction.response.send_modal(CoordsModal(self, ticket_id))
+
+    async def handle_coords_submit(self, interaction: discord.Interaction, ticket_id: int,
+                                   raw: str, dimension: str) -> None:
+        gid = interaction.guild_id
+        ticket = self.store.get_ticket(ticket_id, gid) if gid else None
+        if ticket is None:
+            await interaction.response.send_message(
+                "There's no ticket #%d in this server." % ticket_id, ephemeral=True)
+            return
+
+        coords = card_mod.parse_coords(raw)
+        if coords is None:
+            # Ephemeral and specific, and nothing is stored: the applicant is mid-conversation
+            # with somebody about to fly out to them, so "that didn't work" without saying what
+            # would work is the one unhelpful answer available.
+            await interaction.response.send_message(
+                "I couldn't read three numbers out of that. Send it as **X Y Z** - for "
+                "example `1200 64 -840`. Press the button again and nothing is lost.",
+                ephemeral=True)
+            return
+
+        dim = _normalise_dimension(dimension)
+        pretty = "%d %d %d" % coords
+        # Store the parsed form plus anything else they wrote. A landmark ("by the big cobble
+        # tower") is genuinely useful to whoever is flying out and would be thrown away by
+        # keeping only the three numbers.
+        extra = raw.strip()
+        stored = pretty if card_mod.parse_coords(extra) == coords and extra == pretty \
+            else "%s  (as given: %s)" % (pretty, extra[:200])
+        if not self.store.set_meet_coords(gid, ticket_id, stored, dim):
+            await interaction.response.send_message(
+                "Couldn't save that against ticket #%d." % ticket_id, ephemeral=True)
+            return
+        # Note what happened, never the coordinates themselves -- the journal is not the place
+        # for someone's location, and the ledger already has it.
+        LOG.info("meeting point set ticket=%d by=%s dimension=%s",
+                 ticket_id, interaction.user.id, dim or "unspecified")
+
+        await interaction.response.send_message(
+            "Got it - **%s**%s. Whoever is delivering will see this. If you move, press the "
+            "button again and it'll be updated." % (pretty, " in the %s" % dim if dim else ""),
+            ephemeral=True)
+
+        # The thread gets it too, so the runner reading the conversation sees it in place.
+        await self._notify_thread(
+            ticket, "\U0001F4CD Meeting point set: **%s**%s"
+                    % (pretty, " in the %s" % dim if dim else ""))
+        await self._show_coords_on_queue_post(ticket, pretty, dim)
+
+    async def _show_coords_on_queue_post(self, ticket: Any, pretty: str,
+                                         dim: Optional[str]) -> None:
+        """Put the meeting point where the runner is actually looking: the queue post."""
+        qthread, qmsg = await self._queue_post(ticket)
+        text = "\U0001F4CD Meeting point: **%s**%s" % (pretty,
+                                                       " in the %s" % dim if dim else "")
+        try:
+            if qthread is not None:
+                await qthread.send(text, allowed_mentions=discord.AllowedMentions.none())
+            elif qmsg is not None:
+                # Text-channel queue: a reply keeps it attached to the card rather than
+                # floating loose in the channel.
+                await qmsg.reply(text, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            LOG.warning("could not post meeting point to the queue ticket=%s", ticket["id"])
 
     # -------------------------------------------------------------- the dispatch
 
@@ -1129,20 +1691,33 @@ class KitBot(discord.Client):
         LOG.info("dispatch claimed kit=%d by=%s", kit_id, interaction.user.id)
         view = discord.ui.View(timeout=None)
         view.add_item(DeliveredButton(kit_id))
+        if kit["ticket_id"]:
+            view = self._with_chat(view, gid, int(kit["ticket_id"]))
         # The interaction response has to land first -- it is on a 3-second clock. Retagging
         # is a separate call and is allowed to be slow or to fail. Only the content changes:
         # the reviewer card embed stays put, because the post is the record of the ticket.
+        # Whether the applicant has said where to meet is the first thing the runner needs to
+        # know, so it goes in the content rather than leaving them to scroll the post for it.
+        ticket = (self.store.get_ticket(int(kit["ticket_id"]), gid)
+                  if kit["ticket_id"] else None)
+        where = ""
+        if ticket is not None and ticket["meet_coords"]:
+            where = "\n\U0001F4CD Meeting point: **%s**%s" % (
+                ticket["meet_coords"],
+                " in the %s" % ticket["meet_dimension"] if ticket["meet_dimension"] else "")
+        elif ticket is not None:
+            where = "\n\U0001F4CD No meeting point yet - they've been asked for one in their " \
+                    "thread."
         await interaction.response.edit_message(
-            content="Dispatch #%d - claimed by %s." % (kit_id, interaction.user.mention),
+            content="Dispatch #%d - claimed by %s.%s"
+                    % (kit_id, interaction.user.mention, where),
             view=view, allowed_mentions=discord.AllowedMentions.none())
         await _set_queue_state(interaction.channel, "claimed")
         # Tell the applicant who is coming, in their own thread.
-        if kit["ticket_id"]:
-            ticket = self.store.get_ticket(int(kit["ticket_id"]))
-            if ticket is not None:
-                await self._notify_thread(
-                    ticket, "%s has picked up this delivery and will sort out a meeting "
-                            "point with you here." % interaction.user.mention)
+        if ticket is not None:
+            await self._notify_thread(
+                ticket, "%s has picked up this delivery and will sort out a meeting "
+                        "point with you here." % interaction.user.mention)
 
     async def handle_delivered(self, interaction: discord.Interaction,
                                kit_id: int) -> None:
@@ -1168,7 +1743,9 @@ class KitBot(discord.Client):
         await interaction.response.edit_message(
             content="Dispatch #%d - delivered by %s. \U0001F348"
                     % (kit_id, interaction.user.mention),
-            view=None, allowed_mentions=discord.AllowedMentions.none())
+            view=(self._with_chat(None, gid, int(kit["ticket_id"]))
+                  if kit["ticket_id"] else None),
+            allowed_mentions=discord.AllowedMentions.none())
         # Archived, not locked: the forum's default view stays on live work without losing
         # the record, and a delivery that falls through after being marked done can be
         # reopened.
@@ -1188,6 +1765,12 @@ class KitBot(discord.Client):
 SETUP_TAGS = [
     ("awaiting review", "\U0001F552"), ("approved", "✅"), ("declined", "\U0001F6AB"),
     ("claimed", "\U0001F91D"), ("delivered", "\U0001F348"), ("closed", "\U0001F5C3"),
+    # The request type, so the forum's tag filter can separate the two queues. A convenience
+    # only: the type is also in every post's title and at the top of every card, because a
+    # server that ran /setup before these tags existed will not have them -- adding a tag
+    # needs another /setup, which needs Manage Channels back, which /setup itself tells
+    # admins to remove. A display that depends on this tag would silently show nothing there.
+    ("rescue kit", "\U0001F198"), ("project funding", "\U0001F9F1"),
 ]
 
 
@@ -1503,7 +2086,7 @@ def register_commands(app: KitBot) -> None:
     @tree.command(name="flagline",
                   description="Label chat lines a reviewer objected to (trains the lexicon).")
     @app_commands.describe(ticket="Ticket number",
-                           lines="Line numbers from the attached chat log, e.g. 3,7,12")
+                           lines="Line numbers from the Chat history panel, e.g. 3,7,12")
     async def flagline(interaction: discord.Interaction, ticket: int, lines: str) -> None:
         if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
             await interaction.response.send_message(
@@ -1515,7 +2098,8 @@ def register_commands(app: KitBot) -> None:
                 positions.append(int(chunk))
         if not positions:
             await interaction.response.send_message(
-                "Give me line numbers from the attached log, e.g. `3,7,12`.", ephemeral=True)
+                "Give me line numbers from the **Chat history** panel on the queue post, "
+                "e.g. `3,7,12`.", ephemeral=True)
             return
         if app.store.get_ticket(ticket, interaction.guild_id) is None:
             await interaction.response.send_message(
@@ -1573,7 +2157,8 @@ def register_commands(app: KitBot) -> None:
                 await qmsg.edit(
                     content="Ticket #%d - **closed** by %s (no decision)\n> %s"
                             % (ticket, interaction.user.mention, reason),
-                    view=None, allowed_mentions=discord.AllowedMentions.none())
+                    view=app._with_chat(None, interaction.guild_id, ticket),
+                    allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 LOG.warning("could not update closed queue post ticket=%d", ticket)
         await _set_queue_state(qthread, "closed", archive=True)
@@ -1646,6 +2231,7 @@ def register_commands(app: KitBot) -> None:
             if qmsg is not None:
                 view = discord.ui.View(timeout=None)
                 view.add_item(ClaimButton(kit))
+                view = app._with_chat(view, interaction.guild_id, int(ticket["id"]))
                 try:
                     await qmsg.edit(
                         content="Dispatch #%d - back in the pool, unclaimed." % kit,

@@ -272,6 +272,101 @@ class StoreCase(unittest.TestCase):
         tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
         self.assertFalse(self.st.flag_chat(tid, 42))
 
+    def test_the_scoped_chat_reader_will_not_cross_guilds(self):
+        """The pager takes its ticket number from a custom_id somebody pressed, and row ids are
+        globally unique -- so the unscoped reader would serve one server's reviewers another
+        server's chat history for the price of guessing a number."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
+        self.st.record_shown_chats(tid, [{"ts": None, "chat": "gg"}])
+        self.assertEqual(len(self.st.shown_chats_for_guild(GUILD, tid)), 1)
+        self.assertEqual(self.st.shown_chats_for_guild(GUILD_B, tid), [])
+        # The unscoped one still answers, which is why it must only ever be called with a
+        # ticket row the caller already holds and trusts.
+        self.assertEqual(len(self.st.shown_chats(tid)), 1)
+
+    # --------------------------------------------------- the two request kinds
+
+    def test_the_two_cooldowns_run_independently(self):
+        """Being funded for a build must not stop you asking for a rescue kit when you die,
+        and being rescued must not stop you asking for materials."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A,
+                                    request_type=store_mod.KIND_FUNDING)
+        self.st.record_kit(GUILD, tid, 100, "Alice", UUID_A,
+                           kind=store_mod.KIND_FUNDING)
+
+        funding = self.st.cooldown(GUILD, 21, discord_user_id=100,
+                                   kind=store_mod.KIND_FUNDING)
+        rescue = self.st.cooldown(GUILD, 21, discord_user_id=100,
+                                  kind=store_mod.KIND_RESCUE)
+        self.assertTrue(funding["blocked"])
+        self.assertFalse(rescue["blocked"])
+
+        # Asking with no kind is the pre-split meaning, "anything at all", and still works --
+        # that is what keeps every caller written before the split honest.
+        self.assertTrue(self.st.cooldown(GUILD, 21, discord_user_id=100)["blocked"])
+
+    def test_a_funding_ticket_keeps_its_answers(self):
+        tid = self.st.create_ticket(
+            GUILD, 100, "Alice", UUID_A, request_type=store_mod.KIND_FUNDING,
+            details={"project": "nether hub", "needs": "4 stacks obsidian",
+                     "scale": "a weekend"})
+        row = self.st.get_ticket(tid, GUILD)
+        self.assertEqual(store_mod.ticket_kind(row), store_mod.KIND_FUNDING)
+        self.assertEqual(store_mod.ticket_details(row)["project"], "nether hub")
+
+    def test_a_rescue_ticket_is_the_default_and_carries_no_details(self):
+        """Every caller written before the split -- including the tests above -- still means
+        what it meant, which is why `request_type` was appended rather than inserted."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, "lost everything")
+        row = self.st.get_ticket(tid, GUILD)
+        self.assertEqual(store_mod.ticket_kind(row), store_mod.KIND_RESCUE)
+        self.assertEqual(store_mod.ticket_details(row), {})
+        self.assertEqual(row["note"], "lost everything")
+
+    def test_an_unknown_kind_is_refused_rather_than_stored(self):
+        with self.assertRaises(ValueError):
+            self.st.create_ticket(GUILD, 100, "Alice", UUID_A, request_type="whatever")
+        with self.assertRaises(ValueError):
+            self.st.record_kit(GUILD, None, 100, "Alice", UUID_A, kind="whatever")
+
+    def test_details_that_cannot_be_parsed_do_not_break_a_ticket(self):
+        """A ticket with unreadable JSON is still a ticket someone is waiting on."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
+        self.st._db.execute("UPDATE tickets SET details='{not json' WHERE id=?", (tid,))
+        self.assertEqual(store_mod.ticket_details(self.st.get_ticket(tid, GUILD)), {})
+
+    # ------------------------------------------------------------ meeting point
+
+    def test_the_applicant_can_set_and_then_change_where_to_meet(self):
+        """Somebody who has moved since being approved has to be able to say so, or the runner
+        flies to a place they have left."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
+        self.assertIsNone(self.st.get_ticket(tid, GUILD)["meet_coords"])
+        self.assertTrue(self.st.set_meet_coords(GUILD, tid, "1200 64 -840", "nether"))
+        row = self.st.get_ticket(tid, GUILD)
+        self.assertEqual(row["meet_coords"], "1200 64 -840")
+        self.assertEqual(row["meet_dimension"], "nether")
+        self.assertTrue(self.st.set_meet_coords(GUILD, tid, "0 70 0", None))
+        row = self.st.get_ticket(tid, GUILD)
+        self.assertEqual(row["meet_coords"], "0 70 0")
+        self.assertIsNone(row["meet_dimension"])
+
+    def test_a_meeting_point_cannot_be_set_across_guilds(self):
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
+        self.assertFalse(self.st.set_meet_coords(GUILD_B, tid, "0 64 0"))
+        self.assertIsNone(self.st.get_ticket(tid, GUILD)["meet_coords"])
+
+    def test_history_shows_both_kinds_even_though_only_one_cooldown_applies(self):
+        rescue = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
+        funding = self.st.create_ticket(GUILD, 100, "Alice", UUID_A,
+                                        request_type=store_mod.KIND_FUNDING)
+        self.st.record_kit(GUILD, rescue, 100, "Alice", UUID_A)
+        self.st.record_kit(GUILD, funding, 100, "Alice", UUID_A,
+                           kind=store_mod.KIND_FUNDING)
+        self.assertEqual(len(self.st.kit_history(GUILD, discord_user_id=100)), 2)
+        self.assertEqual(len(self.st.kit_history(GUILD, discord_user_id=100,
+                                                 kind=store_mod.KIND_FUNDING)), 1)
+
     def test_counts_covers_every_table(self):
         tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
         self.st.record_decision(tid, 500, store_mod.STATUS_APPROVED)
@@ -407,6 +502,10 @@ class StoreCase(unittest.TestCase):
         cols = {r[1] for r in st._db.execute("PRAGMA table_info(tickets)")}
         self.assertIn("queue_thread_id", cols)
         self.assertIn("guild_id", cols)
+        self.assertIn("request_type", cols)
+        self.assertIn("details", cols)
+        self.assertIn("meet_coords", cols)
+        self.assertIn("meet_dimension", cols)
         self.assertEqual(
             st._db.execute("SELECT value FROM meta WHERE key='schema_version'")
             .fetchone()["value"], str(store_mod.SCHEMA_VERSION))
@@ -415,6 +514,14 @@ class StoreCase(unittest.TestCase):
         raw = st._db.execute("SELECT * FROM tickets").fetchall()
         self.assertEqual(len(raw), 1)
         self.assertIsNone(raw[0]["guild_id"])
+
+        # ...and unlike guild_id, the request type needs no adoption pass: a NOT NULL column
+        # added with a DEFAULT is written into every existing row by SQLite, and 'rescue' is
+        # the right answer for all of them rather than a plausible one, because it was the only
+        # kind of request the bot could accept before the column existed.
+        self.assertEqual(raw[0]["request_type"], store_mod.KIND_RESCUE)
+        self.assertEqual(store_mod.ticket_kind(raw[0]), store_mod.KIND_RESCUE)
+        self.assertEqual(store_mod.ticket_details(raw[0]), {})
 
         # ...but it belongs to no guild yet, so every scoped query rightly cannot see it.
         # THIS is the upgrade hazard: on a single-guild deployment it would look exactly
@@ -434,6 +541,85 @@ class StoreCase(unittest.TestCase):
 
         st.set_queue_thread(int(row["id"]), 999)
         self.assertEqual(st.get_ticket(int(row["id"]))["queue_thread_id"], 999)
+
+    def test_a_v3_ledger_gains_the_two_request_kinds_in_place(self):
+        """The migration that will actually run on the live ledger.
+
+        v3 is what is deployed, so this is the upgrade path that matters -- and the ledger is
+        the one thing in this project that cannot be regenerated, so it gets a test rather than
+        a hand-check. The interesting property is that request_type needs no adoption pass: a
+        NOT NULL column added with a DEFAULT is written into every existing row by SQLite
+        itself, and 'rescue' is correct for all of them rather than merely plausible, because it
+        was the only kind of request the bot could accept before this migration.
+        """
+        path = os.path.join(self.dir, "v3.sqlite3")
+        db = sqlite3.connect(path)
+        db.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version','3');
+            CREATE TABLE tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
+                discord_user_id INTEGER NOT NULL, mc_name TEXT NOT NULL, mc_uuid TEXT,
+                thread_id INTEGER, queue_thread_id INTEGER, status TEXT NOT NULL, note TEXT,
+                created_at INTEGER NOT NULL, closed_at INTEGER);
+            CREATE TABLE kits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER,
+                ticket_id INTEGER, discord_user_id INTEGER NOT NULL, mc_uuid TEXT,
+                mc_name TEXT NOT NULL, claimed_by INTEGER, claimed_at INTEGER,
+                delivered_at INTEGER, created_at INTEGER NOT NULL);
+            CREATE TABLE flags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, kind TEXT NOT NULL,
+                mc_uuid TEXT, mc_name TEXT, note TEXT, set_by INTEGER NOT NULL,
+                set_at INTEGER NOT NULL, cleared_at INTEGER);
+            CREATE TABLE shown_chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id INTEGER NOT NULL,
+                position INTEGER NOT NULL, chat_ts TEXT, chat TEXT NOT NULL,
+                flagged INTEGER NOT NULL DEFAULT 0, shown_at INTEGER NOT NULL);
+            INSERT INTO tickets(guild_id, discord_user_id, mc_name, mc_uuid, status,
+                                note, created_at)
+                VALUES (4242, 100, 'Alice', '00000000-1111-2222-3333-4444444444aa',
+                        'approved', 'lost everything', 1750000000);
+            INSERT INTO kits(guild_id, ticket_id, discord_user_id, mc_uuid, mc_name,
+                             created_at)
+                VALUES (4242, 1, 100, '00000000-1111-2222-3333-4444444444aa', 'Alice',
+                        1750000000);
+            INSERT INTO shown_chats(ticket_id, position, chat_ts, chat, flagged, shown_at)
+                VALUES (1, 0, '2026-01-01T00:00:00', 'anyone got spare gear', 1, 1750000000);
+        """)
+        db.commit()
+        db.close()
+
+        st = store_mod.open_store(path)
+        self.addCleanup(st.close)
+        self.assertEqual(
+            st._db.execute("SELECT value FROM meta WHERE key='schema_version'")
+            .fetchone()["value"], str(store_mod.SCHEMA_VERSION))
+
+        # Every pre-existing ticket and grant reads as rescue, with no adoption pass.
+        ticket = st.get_ticket(1, GUILD)
+        self.assertEqual(store_mod.ticket_kind(ticket), store_mod.KIND_RESCUE)
+        self.assertEqual(store_mod.ticket_details(ticket), {})
+        self.assertEqual(ticket["note"], "lost everything")
+        self.assertIsNone(ticket["meet_coords"])
+        self.assertEqual(st.get_kit(1, GUILD)["kind"], store_mod.KIND_RESCUE)
+
+        # The old grant still blocks the rescue cooldown, and does not touch the funding one.
+        self.assertTrue(st.cooldown(GUILD, 21, discord_user_id=100,
+                                    kind=store_mod.KIND_RESCUE,
+                                    now=1750000000 + DAY)["blocked"])
+        self.assertFalse(st.cooldown(GUILD, 21, discord_user_id=100,
+                                     kind=store_mod.KIND_FUNDING,
+                                     now=1750000000 + DAY)["blocked"])
+
+        # The pager reads chat captured before it existed, flag included.
+        rows = st.shown_chats_for_guild(GUILD, 1)
+        self.assertEqual([(r["position"], r["flagged"]) for r in rows], [(0, 1)])
+
+        # And the upgraded ledger takes the new kind of ticket.
+        fid = st.create_ticket(GUILD, 101, "Builder", request_type=store_mod.KIND_FUNDING,
+                               details={"project": "nether hub"})
+        self.assertEqual(store_mod.ticket_kind(st.get_ticket(fid, GUILD)),
+                         store_mod.KIND_FUNDING)
 
     def test_store_is_usable_from_a_worker_thread(self):
         """The bug that broke every button press in production.

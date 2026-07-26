@@ -246,6 +246,205 @@ class CardCase(unittest.TestCase):
         self.assertIsNone(card_mod.parse_ts("not a date"))
         self.assertIsNone(card_mod.parse_ts(None))
 
+    # ------------------------------------------------------------ meeting point
+
+    def test_coords_are_read_out_of_every_shape_people_type(self):
+        for text in ("1200 64 -840", "1200, 64, -840", "x=1200 y=64 z=-840",
+                     "1200/64/-840", "  1200   64   -840  "):
+            self.assertEqual(card_mod.parse_coords(text), (1200, 64, -840), text)
+
+    def test_a_landmark_alongside_the_numbers_still_parses(self):
+        self.assertEqual(card_mod.parse_coords("1200 64 -840 by the big cobble tower"),
+                         (1200, 64, -840))
+
+    def test_a_number_glued_to_letters_is_not_a_coordinate(self):
+        """'2b2t' must not contribute a 2. Without the word-boundary guard this reads as
+        (2, 2, 1200) and sends a runner to entirely the wrong place."""
+        self.assertEqual(card_mod.parse_coords("2b2t spawn 1200 64 -840"),
+                         (1200, 64, -840))
+
+    def test_a_decimal_coordinate_truncates_rather_than_confusing_the_parse(self):
+        self.assertEqual(card_mod.parse_coords("1200.5 64.9 -840.1"), (1200, 64, -840))
+
+    def test_input_that_is_not_three_numbers_is_refused(self):
+        for text in ("somewhere near the hub", "~ ~ ~", "1200 64", "", None):
+            self.assertIsNone(card_mod.parse_coords(text), text)
+
+    def test_out_of_range_values_are_refused(self):
+        self.assertIsNone(card_mod.parse_coords("99999999999 64 0"))
+        # A transposed pair -- "x y z" typed as "x z y" -- shows up as an impossible height.
+        self.assertIsNone(card_mod.parse_coords("1200 -840 64"))
+
+    def test_formatting_says_so_when_there_is_nothing_yet(self):
+        self.assertEqual(card_mod.format_coords(None), "not given yet")
+        self.assertIn("nether", card_mod.format_coords((0, 64, 0), "nether"))
+
+    # -------------------------------------------------------------- the chat pager
+    #
+    # The pager holds no page state anywhere: the page a reviewer is looking at is re-derived
+    # from the ledger rows on every button press. That only works if the packing is a pure,
+    # deterministic function of the rows, which is what most of this section checks.
+
+    def rows(self, *chats):
+        """Ledger-shaped rows. A leading '!' marks the line as flagged."""
+        out = []
+        for i, chat in enumerate(chats):
+            flagged = chat.startswith("!")
+            out.append({"position": i, "chat_ts": "2026-07-24T22:%02d:00" % (i % 60),
+                        "chat": chat[1:] if flagged else chat,
+                        "flagged": 1 if flagged else 0})
+        return out
+
+    def test_the_same_rows_always_page_the_same_way(self):
+        """The pager re-derives page N on every press instead of remembering it, so identical
+        input has to give identical pages or Next would land somewhere else than Previous."""
+        rows = self.rows(*["line %d" % i for i in range(50)])
+        self.assertEqual(card_mod.chat_pages(rows), card_mod.chat_pages(rows))
+
+    def test_no_page_can_exceed_the_embed_description_limit(self):
+        rows = self.rows(*["x" * 300 for _ in range(40)])
+        for page in card_mod.chat_pages(rows):
+            self.assertLessEqual(len(card_mod.chat_page_body(page)), 4096)
+
+    def test_a_line_longer_than_a_whole_page_is_split_not_dropped(self):
+        """A single 9k-character chat line cannot fit any page, and the packing loop would spin
+        forever if it tried to flush an empty page to make room for it."""
+        pages = card_mod.chat_pages(self.rows("y" * 9000))
+        self.assertGreater(len(pages), 1)
+        for page in pages:
+            self.assertLessEqual(len(card_mod.chat_page_body(page)), 4096)
+        recovered = "".join(page_line for page in pages for page_line in page["lines"])
+        self.assertEqual(recovered.count("y"), 9000)
+
+    def test_positions_come_from_the_ledger_not_the_page_offset(self):
+        """/flagline matches on the stored position. Re-numbering per page would offset every
+        label by the page offset and mislabel the only screening data that exists."""
+        rows = self.rows(*["line %d" % i for i in range(45)])
+        pages = card_mod.chat_pages(rows)
+        self.assertGreater(len(pages), 1)
+        last = pages[-1]
+        self.assertGreater(last["first"], 0)
+        self.assertIn("%4d" % last["first"], last["lines"][0])
+
+    def test_markdown_and_mentions_cannot_escape_the_page(self):
+        page = card_mod.chat_pages(self.rows(
+            "__Notch__ *took* it @everyone <@1234>", "```rm -rf```"))[0]
+        body = card_mod.chat_page_body(page)
+        # An even number of fences means nothing closed the block early and spilled the rest
+        # of the page into live markdown.
+        self.assertEqual(body.count("```") % 2, 0)
+        self.assertTrue(body.startswith("```"))
+        self.assertTrue(body.endswith("```"))
+
+    def test_a_newline_in_chat_stays_one_rendered_line(self):
+        """One stored row must render as exactly one line, or the position numbers stop lining
+        up with what a reviewer counts on screen."""
+        page = card_mod.chat_pages(self.rows("first\nsecond\r\nthird"))[0]
+        self.assertEqual(len(page["lines"]), 1)
+
+    def test_flagged_lines_are_marked_and_listed(self):
+        pages = card_mod.chat_pages(self.rows("fine", "!not fine", "fine again"))
+        self.assertEqual(pages[0]["flagged"], [1])
+        self.assertTrue(any(l.startswith("! ") for l in pages[0]["lines"]))
+
+    def test_an_empty_log_never_claims_the_applicant_was_silent(self):
+        """`chat_lines` is empty both when the player said nothing and when the api.2b2t.vc
+        call failed, and the ledger cannot tell them apart -- so asserting silence would be
+        the worse of the two wrong answers."""
+        pages = card_mod.chat_pages([])
+        self.assertEqual(len(pages), 1)
+        body = card_mod.chat_page_body(pages[0])
+        self.assertIn("does not record", body)
+        self.assertIn("Recent public chat", body)
+
+    def test_the_footer_carries_the_page_and_the_flagline_hint(self):
+        rows = self.rows(*["line %d" % i for i in range(45)])
+        pages = card_mod.chat_pages(rows)
+        footer = card_mod.chat_page_footer(pages, 0, len(rows), 42)
+        self.assertIn("Page 1/%d" % len(pages), footer)
+        self.assertIn("/flagline 42", footer)
+
+    def test_the_downloadable_file_is_rebuilt_from_the_ledger(self):
+        text = card_mod.chat_file(self.rows("gg", "!not gg"), 42, "Alice")
+        self.assertIn("ticket #42", text)
+        self.assertIn("gg", text)
+        self.assertIn("!", text)
+
+    # ------------------------------------------------------- the two request kinds
+
+    def test_a_funding_card_leads_with_the_ask_not_with_a_death(self):
+        """A death an hour ago is the entire case for a rescue kit and says nothing about
+        whether to fund a build. Leading a funding card with it would put the wrong fact in the
+        one position a reviewer always reads."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "Alice died"}])
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, c, self.st,
+                               screening.Lexicon({}),
+                               request_type=store_mod.KIND_FUNDING,
+                               details={"project": "nether hub", "needs": "4 stacks obsidian",
+                                        "scale": "a weekend"})
+        self.assertEqual(card_mod.sections(card)[0]["name"], "The ask")
+        self.assertIn("nether hub", self.text_of(card, "The ask"))
+        self.assertNotIn("died", card_mod.headline(card))
+        # And the rescue-only "claim verified" line must not appear on a funding card.
+        self.assertNotIn("verified", self.text_of(card, "Recent deaths"))
+
+    def test_a_rescue_card_still_leads_with_the_death(self):
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "Alice died"}])
+        card = self.build(c)
+        self.assertEqual(card_mod.sections(card)[0]["name"], "Recent deaths")
+        self.assertIn("died", card_mod.headline(card))
+        self.assertIn("verified", self.text_of(card, "Recent deaths"))
+
+    def test_a_missing_funding_answer_says_so_rather_than_rendering_blank(self):
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800)})
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, c, self.st,
+                               screening.Lexicon({}),
+                               request_type=store_mod.KIND_FUNDING,
+                               details={"project": "hub"})
+        self.assertIn("not given", self.text_of(card, "The ask"))
+
+    def test_a_ticketless_lookup_reports_any_grant_not_just_rescue(self):
+        """`/lookup` vets a name with no ticket in front of the reviewer, so there is no one
+        cooldown to report. Scoping it to rescue by default would answer "cooldown clear" for
+        somebody whose only grant was project funding three days ago -- which is precisely the
+        question the lookup exists to answer."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A,
+                                    request_type=store_mod.KIND_FUNDING)
+        self.st.record_kit(GUILD, tid, 100, "Alice", UUID_A, kind=store_mod.KIND_FUNDING)
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800)})
+
+        lookup = self.build(c)                       # no request_type -- what /lookup does
+        self.assertIsNone(lookup["request_type"])
+        self.assertTrue(lookup["cooldown"]["blocked"])
+
+        # A rescue *ticket* still gets the rescue clock, which the funding grant leaves alone.
+        rescue = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, c, self.st,
+                                 screening.Lexicon({}),
+                                 request_type=store_mod.KIND_RESCUE)
+        self.assertFalse(rescue["cooldown"]["blocked"])
+
+    def test_a_card_built_before_request_types_reads_as_rescue(self):
+        self.assertEqual(card_mod.kind_of({}), store_mod.KIND_RESCUE)
+        self.assertEqual(card_mod.kind_of({"request_type": None}), store_mod.KIND_RESCUE)
+        self.assertEqual(card_mod.kind_of({"request_type": "nonsense"}),
+                         store_mod.KIND_RESCUE)
+
+    def test_the_funding_cooldown_is_the_one_a_funding_card_reports(self):
+        """Separate clocks: a rescue kit on record must not show as a block on a funding card."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
+        self.st.record_kit(GUILD, tid, 100, "Alice", UUID_A, kind=store_mod.KIND_RESCUE)
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800)})
+        rescue = self.build(c)
+        funding = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, c, self.st,
+                                  screening.Lexicon({}),
+                                  request_type=store_mod.KIND_FUNDING)
+        self.assertTrue(rescue["cooldown"]["blocked"])
+        self.assertFalse(funding["cooldown"]["blocked"])
+        # The history is not kind-scoped: a reviewer wants to see everything either way.
+        self.assertEqual(len(funding["kit_history"]), 1)
+
     def test_duration_formatting(self):
         self.assertEqual(card_mod.duration(0), "none recorded")
         self.assertEqual(card_mod.duration(None), "none recorded")

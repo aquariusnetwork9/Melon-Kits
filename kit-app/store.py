@@ -24,12 +24,23 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 STATUS_OPEN = "open"
 STATUS_APPROVED = "approved"
 STATUS_DECLINED = "declined"
 STATUS_CANCELLED = "cancelled"
+
+# What was asked for. Two different requests that happen to share a queue: someone who just
+# lost everything wants a kit today, and someone building wants materials for a project. They
+# are judged on almost opposite evidence -- a recent death is the whole case for the first and
+# irrelevant to the second -- so the type travels with the ticket rather than being guessed
+# from its contents.
+KIND_RESCUE = "rescue"
+KIND_FUNDING = "funding"
+KINDS = (KIND_RESCUE, KIND_FUNDING)
+
+KIND_LABEL = {KIND_RESCUE: "rescue kit", KIND_FUNDING: "project funding"}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -48,6 +59,22 @@ CREATE TABLE IF NOT EXISTS tickets (
     queue_thread_id INTEGER,
     status          TEXT    NOT NULL,
     note            TEXT,
+    -- 'rescue' or 'funding'. Defaulted rather than nullable, and the same default is used by
+    -- the migration: every ticket written before this column existed was a rescue request,
+    -- because that was the only thing the bot could take. So the backfill is not a guess.
+    request_type    TEXT    NOT NULL DEFAULT 'rescue',
+    -- Answers to the questions that only one type asks, as JSON. A funding request has a
+    -- project, a materials list and a scale; a rescue request has none of them. Columns per
+    -- field would mean an ALTER for every question anyone ever wants to add, and most rows
+    -- would carry the ones that do not apply to them -- the same reasoning as guild_config.
+    details         TEXT,
+    -- Where to meet, filled in by the applicant after their request is approved. Its own
+    -- column rather than a key in `details` because it is written at a different time, by a
+    -- different person's action, and read by the runner rather than the reviewer.
+    -- Stored as the applicant typed it AND parsed, so a runner sees a canonical "x y z" while
+    -- anything extra they wrote ("by the big cobble tower") is not thrown away.
+    meet_coords     TEXT,
+    meet_dimension  TEXT,
     created_at      INTEGER NOT NULL,
     closed_at       INTEGER
 );
@@ -75,6 +102,11 @@ CREATE TABLE IF NOT EXISTS kits (
     discord_user_id INTEGER NOT NULL,
     mc_uuid         TEXT,
     mc_name         TEXT    NOT NULL,
+    -- Which cooldown this grant starts. The two kinds are tracked separately on purpose:
+    -- being funded for a build should not stop you asking for a rescue kit when you die,
+    -- and being rescued should not stop you asking for materials. Without this column the
+    -- cooldown query cannot tell the two apart and every grant blocks both.
+    kind            TEXT    NOT NULL DEFAULT 'rescue',
     claimed_by      INTEGER,
     claimed_at      INTEGER,
     delivered_at    INTEGER,
@@ -127,6 +159,40 @@ CREATE INDEX IF NOT EXISTS ix_shown_ticket ON shown_chats(ticket_id);
 
 def _now() -> int:
     return int(time.time())
+
+
+def ticket_kind(row: Any) -> str:
+    """The request type of a ticket row, tolerating a row that predates the column.
+
+    Every path that reads a ticket goes through here rather than touching `request_type`
+    directly. The migration fills the column in on every existing row, so in a live database
+    this never falls back -- but a Row handed in by a test fixture or an older tool may not
+    carry the key at all, and a KeyError from sqlite3.Row is not catchable by `.get`.
+    """
+    try:
+        value = row["request_type"]
+    except (IndexError, KeyError, TypeError):
+        return KIND_RESCUE
+    return value if value in KINDS else KIND_RESCUE
+
+
+def ticket_details(row: Any) -> Dict[str, Any]:
+    """The type-specific answers stored on a ticket, or ``{}`` if it has none.
+
+    Never raises. A ticket whose JSON is unreadable is still a ticket someone is waiting on, so
+    a reviewer gets the rest of the card rather than an error.
+    """
+    try:
+        raw = row["details"]
+    except (IndexError, KeyError, TypeError):
+        return {}
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class Store(object):
@@ -210,6 +276,32 @@ class Store(object):
             "CREATE INDEX IF NOT EXISTS ix_tickets_guild ON tickets(guild_id, discord_user_id, status)")
         self._db.execute("CREATE INDEX IF NOT EXISTS ix_kits_guild ON kits(guild_id, discord_user_id)")
         self._db.execute("CREATE INDEX IF NOT EXISTS ix_flags_guild ON flags(guild_id, kind)")
+
+        # v4: rescue kits and project funding. Unlike guild_id, these columns need no
+        # adopt_legacy_rows pass -- a NOT NULL column added with a DEFAULT is written into
+        # every existing row by SQLite itself, and 'rescue' is the correct value for all of
+        # them rather than a plausible one: it was the only kind of request the bot could
+        # accept before this migration.
+        cols = {r["name"] for r in self._db.execute("PRAGMA table_info(tickets)")}
+        if "request_type" not in cols:
+            self._db.execute(
+                "ALTER TABLE tickets ADD COLUMN request_type TEXT NOT NULL DEFAULT 'rescue'")
+        if "details" not in cols:
+            self._db.execute("ALTER TABLE tickets ADD COLUMN details TEXT")
+        # Nullable, unlike request_type: NULL genuinely means "not given yet", which is the
+        # normal state of every ticket until its applicant answers.
+        if "meet_coords" not in cols:
+            self._db.execute("ALTER TABLE tickets ADD COLUMN meet_coords TEXT")
+        if "meet_dimension" not in cols:
+            self._db.execute("ALTER TABLE tickets ADD COLUMN meet_dimension TEXT")
+        cols = {r["name"] for r in self._db.execute("PRAGMA table_info(kits)")}
+        if "kind" not in cols:
+            self._db.execute("ALTER TABLE kits ADD COLUMN kind TEXT NOT NULL DEFAULT 'rescue'")
+        # Unconditional and outside the branches, for the same reason as ix_tickets_queue.
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_kits_kind ON kits(guild_id, kind, created_at)")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_tickets_kind ON tickets(guild_id, request_type)")
 
     def adopt_legacy_rows(self, guild_id: int) -> int:
         """Stamp pre-multi-guild rows with the guild they must have belonged to.
@@ -295,13 +387,35 @@ class Store(object):
 
     def create_ticket(self, guild_id: int, discord_user_id: int, mc_name: str,
                       mc_uuid: Optional[str] = None,
-                      note: Optional[str] = None) -> int:
+                      note: Optional[str] = None,
+                      request_type: str = KIND_RESCUE,
+                      details: Optional[Dict[str, Any]] = None) -> int:
+        """Open a ticket. `details` is the type-specific answers, stored as JSON.
+
+        `request_type` defaults to rescue rather than being required, so that a caller written
+        before the two kinds existed -- including the tests -- keeps meaning what it meant.
+        """
+        if request_type not in KINDS:
+            raise ValueError("unknown request_type %r" % (request_type,))
         cur = self._db.execute(
             "INSERT INTO tickets(guild_id, discord_user_id, mc_name, mc_uuid, status, note, "
-            "created_at) VALUES(?,?,?,?,?,?,?)",
+            "request_type, details, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
             (int(guild_id), int(discord_user_id), mc_name, mc_uuid, STATUS_OPEN, note,
-             _now()))
+             request_type, json.dumps(details) if details else None, _now()))
         return int(cur.lastrowid)
+
+    def set_meet_coords(self, guild_id: int, ticket_id: int, coords: str,
+                        dimension: Optional[str] = None) -> bool:
+        """Record where the applicant wants to meet. Returns False if there's no such ticket.
+
+        Guild-scoped and overwriting on purpose: the applicant supplies this from a button in
+        their own thread, and somebody who has moved since being approved needs to be able to
+        say so rather than being stuck with the first answer.
+        """
+        cur = self._db.execute(
+            "UPDATE tickets SET meet_coords=?, meet_dimension=? WHERE id=? AND guild_id=?",
+            (coords, dimension, int(ticket_id), int(guild_id)))
+        return cur.rowcount > 0
 
     def set_ticket_thread(self, ticket_id: int, thread_id: int) -> None:
         self._db.execute("UPDATE tickets SET thread_id=? WHERE id=?",
@@ -394,11 +508,14 @@ class Store(object):
     # -------------------------------------------------------------------- kits
 
     def record_kit(self, guild_id: int, ticket_id: Optional[int], discord_user_id: int,
-                   mc_name: str, mc_uuid: Optional[str]) -> int:
+                   mc_name: str, mc_uuid: Optional[str],
+                   kind: str = KIND_RESCUE) -> int:
+        if kind not in KINDS:
+            raise ValueError("unknown kit kind %r" % (kind,))
         cur = self._db.execute(
-            "INSERT INTO kits(guild_id, ticket_id, discord_user_id, mc_uuid, mc_name, "
-            "created_at) VALUES(?,?,?,?,?,?)",
-            (int(guild_id), ticket_id, int(discord_user_id), mc_uuid, mc_name, _now()))
+            "INSERT INTO kits(guild_id, ticket_id, discord_user_id, mc_uuid, mc_name, kind, "
+            "created_at) VALUES(?,?,?,?,?,?,?)",
+            (int(guild_id), ticket_id, int(discord_user_id), mc_uuid, mc_name, kind, _now()))
         return int(cur.lastrowid)
 
     def claim_kit(self, kit_id: int, claimed_by: int) -> bool:
@@ -452,12 +569,17 @@ class Store(object):
     # ---------------------------------------------------------------- cooldown
 
     def last_kit(self, guild_id: int, discord_user_id: Optional[int] = None,
-                 mc_uuid: Optional[str] = None) -> Optional[sqlite3.Row]:
+                 mc_uuid: Optional[str] = None,
+                 kind: Optional[str] = None) -> Optional[sqlite3.Row]:
         """Most recent kit in THIS guild matching either identifier.
 
         Either identifier alone is easy to sidestep -- a second Discord account with the same
         MC account, or the reverse -- so both are checked. Scoped per guild: each server's kit
         history is its own, so a kit from one does not start a cooldown in another.
+
+        `kind` narrows to one sort of grant, which is what keeps the two cooldowns independent.
+        Left as None it means "any grant", which is what this method meant before there were
+        two kinds -- so a caller that has no opinion still gets the old behaviour.
         """
         clauses, args = [], [int(guild_id)]
         if discord_user_id is not None:
@@ -468,15 +590,23 @@ class Store(object):
             args.append(mc_uuid)
         if not clauses:
             return None
-        return self._db.execute(
-            "SELECT * FROM kits WHERE guild_id=? AND (%s) ORDER BY created_at DESC LIMIT 1"
-            % (" OR ".join(clauses),), args).fetchone()
+        sql = "SELECT * FROM kits WHERE guild_id=? AND (%s)" % (" OR ".join(clauses),)
+        if kind is not None:
+            sql += " AND kind=?"
+            args.append(kind)
+        return self._db.execute(sql + " ORDER BY created_at DESC LIMIT 1", args).fetchone()
 
     def cooldown(self, guild_id: int, cooldown_days: int,
                  discord_user_id: Optional[int] = None,
-                 mc_uuid: Optional[str] = None, now: Optional[int] = None) -> Dict[str, Any]:
-        """``{'blocked': bool, 'days_left': int, 'last_at': int|None, 'matched': str|None}``"""
-        row = self.last_kit(guild_id, discord_user_id, mc_uuid)
+                 mc_uuid: Optional[str] = None, now: Optional[int] = None,
+                 kind: Optional[str] = None) -> Dict[str, Any]:
+        """``{'blocked': bool, 'days_left': int, 'last_at': int|None, 'matched': str|None}``
+
+        Pass `kind` to ask about one cooldown. A rescue kit and a funding grant run their own
+        clocks, so asking without a kind answers a question nobody has: "have they had
+        anything at all recently", which would block a rescue because a build got funded.
+        """
+        row = self.last_kit(guild_id, discord_user_id, mc_uuid, kind)
         if row is None or cooldown_days <= 0:
             return {"blocked": False, "days_left": 0, "last_at": None, "matched": None}
         now = _now() if now is None else int(now)
@@ -492,7 +622,10 @@ class Store(object):
                 "last_at": int(row["created_at"]), "matched": matched}
 
     def kit_history(self, guild_id: int, discord_user_id: Optional[int] = None,
-                    mc_uuid: Optional[str] = None, limit: int = 10) -> List[sqlite3.Row]:
+                    mc_uuid: Optional[str] = None, limit: int = 10,
+                    kind: Optional[str] = None) -> List[sqlite3.Row]:
+        """Past grants, newest first. `kind` None means both sorts -- the reviewer card wants
+        the whole history even when only one cooldown applies."""
         clauses, args = [], [int(guild_id)]
         if discord_user_id is not None:
             clauses.append("discord_user_id=?")
@@ -502,10 +635,13 @@ class Store(object):
             args.append(mc_uuid)
         if not clauses:
             return []
+        sql = "SELECT * FROM kits WHERE guild_id=? AND (%s)" % (" OR ".join(clauses),)
+        if kind is not None:
+            sql += " AND kind=?"
+            args.append(kind)
         args.append(int(limit))
         return list(self._db.execute(
-            "SELECT * FROM kits WHERE guild_id=? AND (%s) ORDER BY created_at DESC LIMIT ?"
-            % (" OR ".join(clauses),), args))
+            sql + " ORDER BY created_at DESC LIMIT ?", args))
 
     def linked_accounts(self, guild_id: int, discord_user_id: Optional[int] = None,
                         mc_uuid: Optional[str] = None) -> List[sqlite3.Row]:
@@ -553,6 +689,29 @@ class Store(object):
             (int(guild_id), mc_uuid or "", mc_name or "")))
 
     # --------------------------------------------------------- instrumentation
+
+    def shown_chats_for_guild(self, guild_id: int, ticket_id: int) -> List[sqlite3.Row]:
+        """The chat lines a reviewer was shown, scoped to the guild owning that ticket.
+
+        This is the read side the in-Discord chat pager runs on, and the reason the pager can
+        exist at all: the lines were persisted when the card was built, so paging through them
+        needs no second call to api.2b2t.vc and survives a restart. What is stored is what was
+        shown, already coordinate-redacted.
+
+        Scoped, unlike the plain `shown_chats` below, and the distinction is the point. That
+        one is safe for an internal caller that already holds a ticket row it trusts -- the
+        transcript builder. This one is for anything reached by a ticket number a *user* can
+        supply, which includes a button whose custom_id carries one. shown_chats has no
+        guild_id of its own -- deliberately, see `_migrate` -- so the scope comes from a join
+        onto its parent. Row ids are globally unique, so filtering on ticket_id alone would
+        hand one server's reviewers another server's chat history for the price of guessing a
+        number. Same argument as `get_ticket`.
+        """
+        return list(self._db.execute(
+            "SELECT s.position, s.chat_ts, s.chat, s.flagged FROM shown_chats s "
+            "JOIN tickets t ON t.id = s.ticket_id "
+            "WHERE s.ticket_id=? AND t.guild_id=? ORDER BY s.position",
+            (int(ticket_id), int(guild_id))))
 
     def record_shown_chats(self, ticket_id: int,
                            lines: Sequence[Dict[str, Optional[str]]]) -> None:
