@@ -93,19 +93,56 @@ def is_admin(member: Any) -> bool:
                 getattr(perms, "administrator", False))
 
 
+# One server's staff is rarely one role: reviewers might be Admin, Mod and Kit Team, and
+# delivery might be several regional courier roles. A cap keeps the reviewer ping from becoming
+# an announcement and keeps the list readable; 8 is well inside Discord's 25-option select.
+MAX_STAFF_ROLES = 8
+
+
+def role_ids(g: Dict[str, Any], key: str) -> "list[int]":
+    """The configured role ids for `key`, as a list, whichever way they were stored.
+
+    Reads the plural `<key>s` first and falls back to the singular. Both exist because the
+    singular is what every deployment before multi-role has in its stored config, and an
+    upgrade must not silently drop a server's only reviewer role -- which would lock every
+    reviewer out of their own queue until somebody re-ran /setup.
+    """
+    raw = g.get(key + "s")
+    if isinstance(raw, (list, tuple)):
+        out = []
+        for value in raw:
+            try:
+                as_int = int(value)
+            except (TypeError, ValueError):
+                continue
+            if as_int and as_int not in out:
+                out.append(as_int)
+        if out:
+            return out[:MAX_STAFF_ROLES]
+    single = int(g.get(key) or 0)
+    return [single] if single else []
+
+
+def _has_any(member: Any, wanted: "list[int]") -> bool:
+    if not wanted:
+        return False
+    held = {r.id for r in getattr(member, "roles", [])}
+    return any(rid in held for rid in wanted)
+
+
 def is_reviewer(member: Any, g: Dict[str, Any]) -> bool:
     """`g` is a merged per-guild config, not the file config -- roles differ per server."""
-    role_id = int(g.get("reviewer_role_id") or 0)
-    if not role_id:
+    wanted = role_ids(g, "reviewer_role_id")
+    if not wanted:
         return is_admin(member)
-    return any(r.id == role_id for r in getattr(member, "roles", []))
+    return _has_any(member, wanted)
 
 
 def may_claim(member: Any, g: Dict[str, Any]) -> bool:
-    role_id = int(g.get("runner_role_id") or 0)
-    if not role_id:
+    wanted = role_ids(g, "runner_role_id")
+    if not wanted:
         return True
-    if any(r.id == role_id for r in getattr(member, "roles", [])):
+    if _has_any(member, wanted):
         return True
     # A reviewer can always pick up a delivery; requiring a second role to do the thing you
     # just approved is friction with no purpose.
@@ -401,6 +438,70 @@ def _normalise_dimension(text: str) -> Optional[str]:
     return text.strip()[:40]
 
 
+class StaffRoleSelect(discord.ui.RoleSelect):
+    """Pick up to `MAX_STAFF_ROLES` roles for one job, and save on selection.
+
+    A role select rather than eight optional slash-command arguments: `/setup` would have grown
+    to twenty-two options, an admin would be filling in `reviewer_role_7` by hand, and removing
+    one would mean re-typing the rest. This shows what is currently set and replaces the whole
+    list in one interaction, which is also how somebody *removes* a role -- deselect it.
+
+    Not a persistent view, deliberately. It is sent ephemerally in response to `/roles`, so it
+    inherits discord.py's forced 15-minute ephemeral timeout, and that is correct here: this
+    holds no page state worth recovering, and a stale copy left open for an hour should not
+    still be able to rewrite the guild's staff list.
+    """
+
+    def __init__(self, app: "KitBot", key: str, label: str,
+                 current: "list[int]") -> None:
+        super().__init__(
+            placeholder="%s - pick up to %d" % (label, MAX_STAFF_ROLES),
+            min_values=0, max_values=MAX_STAFF_ROLES,
+            default_values=[discord.Object(id=rid) for rid in current])
+        self.app = app
+        self.key = key
+        self.label_text = label
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        picked = [r.id for r in self.values][:MAX_STAFF_ROLES]
+        # Write both shapes: the plural is what the gates read, the singular keeps a build that
+        # predates multi-role working if this is ever rolled back.
+        self.app.store.set_guild_config(interaction.guild_id, {
+            self.key + "s": picked,
+            self.key: picked[0] if picked else 0,
+        })
+        LOG.info("staff roles set guild=%s key=%s count=%d by=%s",
+                 interaction.guild_id, self.key, len(picked), interaction.user.id)
+
+        if not picked:
+            # Empty is meaningful and different per job, so say which one applies.
+            fallback = ("anyone with **Manage Server** reviews" if "reviewer" in self.key
+                        else "**anyone** can claim a delivery")
+            note = "Cleared. With none set, %s." % fallback
+        else:
+            note = "%s: %s" % (self.label_text,
+                               " ".join("<@&%d>" % rid for rid in picked))
+
+        missing = await self.app.grant_staff_access(interaction.guild, picked)
+        if missing:
+            note += ("\n\n⚠️ I couldn't give %s access to %s. Adding a role here does "
+                     "not grant it channel access -- editing overwrites needs **Manage Roles**, "
+                     "which I don't ask for. Add them by hand, or they will not see the queue."
+                     % ("them" if len(picked) > 1 else "it",
+                        ", ".join(c.mention for c in missing)))
+        await interaction.response.send_message(note, ephemeral=True,
+                                                allowed_mentions=discord.AllowedMentions.none())
+
+
+class StaffRolesView(discord.ui.View):
+    def __init__(self, app: "KitBot", g: Dict[str, Any]) -> None:
+        super().__init__(timeout=600)
+        self.add_item(StaffRoleSelect(app, "reviewer_role_id", "Reviewers",
+                                      role_ids(g, "reviewer_role_id")))
+        self.add_item(StaffRoleSelect(app, "runner_role_id", "Delivery",
+                                      role_ids(g, "runner_role_id")))
+
+
 class CoordsButton(discord.ui.DynamicItem[discord.ui.Button],
                    template=r"melonkit:coords:(?P<ticket>\d+)"):
     """Lets the applicant say where to meet, once their request is approved.
@@ -674,6 +775,8 @@ class KitBot(discord.Client):
             "transcript_channel_id": 0,
             "reviewer_role_id": 0,
             "runner_role_id": 0,
+            "reviewer_role_ids": [],
+            "runner_role_ids": [],
             "capture_thread_messages": self.cfg["discord"]["capture_thread_messages"],
         }
         merged.update(self.cfg["policy"])
@@ -1039,9 +1142,11 @@ class KitBot(discord.Client):
         if built["chat_lines"]:
             view.add_item(ChatHistoryButton(ticket_id))
 
-        role_id = int(g.get("reviewer_role_id") or 0)
+        # Every reviewer role, not just the first. A server that configured three of them did so
+        # because all three review, and pinging one would quietly make the other two optional.
+        ping = " ".join("<@&%d>" % rid for rid in role_ids(g, "reviewer_role_id"))
         header = "%sTicket #%d - **%s** requested by %s%s" % (
-            "<@&%d> " % role_id if role_id else "", ticket_id,
+            ping + " " if ping else "", ticket_id,
             store_mod.KIND_LABEL[kind], user.mention,
             "\nApplicant thread: <#%d>" % thread.id if thread is not None else "")
         mentions = discord.AllowedMentions(roles=True, users=True)
@@ -1069,6 +1174,47 @@ class KitBot(discord.Client):
             LOG.error("could not post queue card ticket=%d status=%s",
                       ticket_id, getattr(exc, "status", "?"))
             return False
+
+    async def grant_staff_access(self, guild: Any,
+                                 role_ids_wanted: "list[int]") -> "list[Any]":
+        """Give these roles sight of the staff channels. Returns the channels it could not.
+
+        Necessary because the two are genuinely separate: the ledger decides who the bot *lets*
+        press Approve, and the channel overwrites decide who can *see* the post to press it on.
+        Adding a role to the list without the second half produces the worst kind of failure --
+        a reviewer who is configured, believes they are a reviewer, and simply never sees a
+        ticket.
+
+        Best effort on purpose. Editing overwrites needs Manage Roles ("Manage Permissions"),
+        which this bot deliberately does not ask for, so the honest outcome is to try and then
+        name what is left for a human. Also note a role above the bot's own top role cannot be
+        granted anything by it, which fails the same way.
+        """
+        if guild is None or not role_ids_wanted:
+            return []
+        g = self.gcfg(guild.id)
+        failed = []
+        for key in ("queue_channel_id", "transcript_channel_id"):
+            channel = guild.get_channel(int(g.get(key) or 0))
+            if channel is None:
+                continue
+            for rid in role_ids_wanted:
+                role = guild.get_role(int(rid))
+                if role is None:
+                    continue
+                if channel.permissions_for(role).view_channel:
+                    continue                      # already fine, often via another role
+                try:
+                    await channel.set_permissions(
+                        role, view_channel=True, read_message_history=True,
+                        send_messages=True, send_messages_in_threads=True,
+                        embed_links=True, attach_files=True,
+                        reason="Melon Kits staff role added")
+                except discord.HTTPException:
+                    if channel not in failed:
+                        failed.append(channel)
+                    break
+        return failed
 
     # ------------------------------------------------------------- the chat pager
 
@@ -1818,8 +1964,9 @@ def _adoption_warnings(channel: Any, me: Any, *, public: bool) -> list:
     return out
 
 
-async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
-                         runner: Optional[discord.Role],
+async def build_channels(guild: discord.Guild,
+                         reviewers: "list[discord.Role]",
+                         runners: "list[discord.Role]",
                          category: Optional[discord.CategoryChannel] = None,
                          requests: Optional[discord.TextChannel] = None,
                          queue: Optional[Any] = None,
@@ -1878,8 +2025,8 @@ async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
                 read_message_history=True, create_private_threads=True,
                 send_messages_in_threads=True, manage_threads=True, manage_messages=True),
         }
-        if reviewer:
-            ow[reviewer] = discord.PermissionOverwrite(
+        for role in reviewers:
+            ow[role] = discord.PermissionOverwrite(
                 view_channel=True, send_messages=True, read_message_history=True,
                 send_messages_in_threads=True, manage_threads=True)
         ch = await guild.create_text_channel(
@@ -1932,11 +2079,10 @@ async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
                 read_message_history=True, create_public_threads=True,
                 send_messages_in_threads=True, manage_threads=True, manage_messages=True),
         }
-        for role in (reviewer, runner):
-            if role:
-                qow[role] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, read_message_history=True,
-                    send_messages_in_threads=True, attach_files=True, embed_links=True)
+        for role in set(reviewers) | set(runners):
+            qow[role] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                send_messages_in_threads=True, attach_files=True, embed_links=True)
         forum = await guild.create_forum(
             "kit-queue", overwrites=qow, reason="Melon Kits setup",
             available_tags=[discord.ForumTag(name=n, emoji=e) for n, e in SETUP_TAGS],
@@ -1973,11 +2119,10 @@ async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
                 view_channel=True, send_messages=True, embed_links=True,
                 attach_files=True, read_message_history=True),
         }
-        for role in (reviewer, runner):
-            if role:
-                aow[role] = discord.PermissionOverwrite(
-                    view_channel=True, read_message_history=True, send_messages=False,
-                    create_public_threads=False, create_private_threads=False)
+        for role in set(reviewers) | set(runners):
+            aow[role] = discord.PermissionOverwrite(
+                view_channel=True, read_message_history=True, send_messages=False,
+                create_public_threads=False, create_private_threads=False)
         arch = await guild.create_text_channel(
             "kit-archive", overwrites=aow, reason="Melon Kits setup",
             topic="Staff only, append-only. One transcript per finished ticket, with the "
@@ -2086,7 +2231,7 @@ def register_commands(app: KitBot) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             built = await build_channels(
-                interaction.guild, reviewer_role, delivery_role or reviewer_role,
+                interaction.guild, [reviewer_role], [delivery_role or reviewer_role],
                 category=category, requests=requests_channel, queue=queue_channel,
                 archive=archive_channel)
         except discord.Forbidden:
@@ -2097,6 +2242,11 @@ def register_commands(app: KitBot) -> None:
             return
 
         values = {k: v for k, v in built.items() if k not in ("notes", "warnings")}
+        # Both shapes. The plural is what the gates read; the singular stays written so a
+        # rollback to a build that predates multi-role still finds a reviewer role and does not
+        # lock every reviewer out of their own queue.
+        values["reviewer_role_ids"] = [reviewer_role.id]
+        values["runner_role_ids"] = [(delivery_role or reviewer_role).id]
         values["reviewer_role_id"] = reviewer_role.id
         values["runner_role_id"] = (delivery_role or reviewer_role).id
         app.store.set_guild_config(interaction.guild.id, values)
@@ -2134,8 +2284,10 @@ def register_commands(app: KitBot) -> None:
             colour=discord.Colour.from_str("#8A6D1F" if warnings else "#2E6B3F"))
         embed.add_field(
             name="Roles",
-            value="Reviewers: %s\nDelivery: %s"
-                  % (reviewer_role.mention, (delivery_role or reviewer_role).mention),
+            value="Reviewers: %s\nDelivery: %s\n\nRun **/roles** to add more of either - up to "
+                  "%d each."
+                  % (reviewer_role.mention, (delivery_role or reviewer_role).mention,
+                     MAX_STAFF_ROLES),
             inline=False)
         if warnings:
             body = "\n".join("- %s" % w for w in warnings)
@@ -2159,6 +2311,47 @@ def register_commands(app: KitBot) -> None:
         if warnings:
             LOG.info("setup finished with %d adoption warning(s) guild=%s",
                      len(warnings), interaction.guild.id)
+
+    @tree.command(name="roles",
+                  description="Set which roles review requests and which deliver "
+                              "(up to 8 each).")
+    async def roles(interaction: discord.Interaction) -> None:
+        """The multi-role editor.
+
+        Gated on Manage Server rather than the reviewer role, because this command can *remove*
+        reviewer roles -- letting reviewers edit the list is letting them edit who outranks
+        them, and a mistake locks the server's own admins out of their queue.
+        """
+        if interaction.guild is None:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+        if not is_admin(interaction.user):
+            await interaction.response.send_message(
+                "You need **Manage Server** to change staff roles.", ephemeral=True)
+            return
+        g = app.gcfg(interaction.guild_id)
+
+        def shown(key, empty):
+            ids = role_ids(g, key)
+            return " ".join("<@&%d>" % r for r in ids) if ids else "*none set - %s*" % empty
+
+        embed = discord.Embed(
+            title="Staff roles",
+            description=(
+                "**Reviewers** approve, decline and read reviewer cards.\n%s\n\n"
+                "**Delivery** claim deliveries. Reviewers can always claim too, so a server "
+                "where the same people do both needs nothing here.\n%s\n\n"
+                "Pick up to **%d** of each below. Whatever you select *replaces* the list, so "
+                "removing a role means deselecting it. Each menu saves on its own."
+                % (shown("reviewer_role_id", "anyone with Manage Server reviews"),
+                   shown("runner_role_id", "anyone can claim"), MAX_STAFF_ROLES)),
+            colour=discord.Colour.from_str("#2E6B3F"))
+        if not app.is_configured(interaction.guild_id):
+            embed.set_footer(text="This server hasn't run /setup yet, so there are no channels "
+                                  "to give these roles access to.")
+        await interaction.response.send_message(
+            embed=embed, view=StaffRolesView(app, g), ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none())
 
     @tree.command(name="panel", description="Post the kit-request panel in this channel.")
     async def panel(interaction: discord.Interaction) -> None:

@@ -353,9 +353,97 @@ if not any("can't see it" in w for w in blind):
 else:
     print("  invisible channel -> warns nothing will appear there")
 
+print("  adoption logic ok")
+
+
+# ======================== multiple reviewer / delivery roles ========================
+#
+# The gates live in bot.py, so this is where they get covered. The upgrade path is the part
+# that matters: every deployment before multi-role has only the singular key stored, and
+# reading the plural without falling back would lock every reviewer out of their own queue.
+
+class _Role(object):
+    def __init__(self, rid):
+        self.id = rid
+
+
+class _Member(object):
+    def __init__(self, *role_ids, **kw):
+        self.roles = [_Role(r) for r in role_ids]
+        self.guild_permissions = _Perms(**kw)
+
+
+print("\n-- staff role gates --")
+
+
+def gate(label, ok):
+    if ok:
+        print("  ok   %s" % label)
+    else:
+        fails.append(label)
+        print("  FAIL %s" % label)
+
+
+REV, MOD, KIT, RANDOM = 11, 22, 33, 99
+
+# The upgrade path: only the singular key exists, as every pre-multi-role guild has it.
+legacy = {"reviewer_role_id": REV}
+gate("a legacy single reviewer role still passes",
+     bot_mod.is_reviewer(_Member(REV), legacy))
+gate("a legacy config still refuses everyone else",
+     not bot_mod.is_reviewer(_Member(RANDOM), legacy))
+gate("role_ids reads the singular when there is no plural",
+     bot_mod.role_ids(legacy, "reviewer_role_id") == [REV])
+
+# Plural wins once written, and any one of the roles is enough.
+multi = {"reviewer_role_id": REV, "reviewer_role_ids": [REV, MOD, KIT]}
+for rid, name in ((REV, "first"), (MOD, "second"), (KIT, "third")):
+    gate("the %s of three reviewer roles passes" % name,
+         bot_mod.is_reviewer(_Member(rid), multi))
+gate("someone holding none of the three is refused",
+     not bot_mod.is_reviewer(_Member(RANDOM), multi))
+gate("holding two of them is still fine",
+     bot_mod.is_reviewer(_Member(REV, MOD), multi))
+
+# No roles configured at all -> Manage Server reviews, which is the /setup bootstrap.
+gate("with no reviewer role set, Manage Server reviews",
+     bot_mod.is_reviewer(_Member(RANDOM, manage_guild=True), {}))
+gate("with no reviewer role set, a random member does not",
+     not bot_mod.is_reviewer(_Member(RANDOM), {}))
+
+# Delivery.
+runners = {"runner_role_ids": [MOD, KIT]}
+gate("a delivery role can claim", bot_mod.may_claim(_Member(KIT), runners))
+gate("a non-delivery member cannot claim", not bot_mod.may_claim(_Member(RANDOM), runners))
+gate("a reviewer can always claim",
+     bot_mod.may_claim(_Member(REV), dict(runners, reviewer_role_ids=[REV])))
+gate("with no delivery role set, anyone can claim", bot_mod.may_claim(_Member(RANDOM), {}))
+
+# The cap, and junk in the stored list.
+over = {"reviewer_role_ids": list(range(1, 20))}
+gate("the list is capped at %d" % bot_mod.MAX_STAFF_ROLES,
+     len(bot_mod.role_ids(over, "reviewer_role_id")) == bot_mod.MAX_STAFF_ROLES)
+messy = {"reviewer_role_ids": [REV, None, "22", 0, REV, "not-an-id"]}
+gate("junk and duplicates are dropped, strings are kept",
+     bot_mod.role_ids(messy, "reviewer_role_id") == [REV, 22])
+gate("an empty plural falls back to the singular rather than locking everyone out",
+     bot_mod.role_ids({"reviewer_role_ids": [], "reviewer_role_id": REV},
+                      "reviewer_role_id") == [REV])
+
+# The select is inside Discord's limits.
+sel = bot_mod.StaffRoleSelect(None, "reviewer_role_id", "Reviewers", [REV, MOD])
+gate("the role select allows up to %d" % bot_mod.MAX_STAFF_ROLES,
+     sel.max_values == bot_mod.MAX_STAFF_ROLES and sel.max_values <= 25)
+gate("the role select allows clearing to none", sel.min_values == 0)
+gate("the role select pre-selects what is already configured",
+     len(sel._underlying.default_values) == 2)
+
+rcmd = app.tree.get_command("roles")
+gate("/roles is registered", rcmd is not None)
+
 print()
 if fails:
     for f in fails:
         print("FAIL: %s" % f)
     sys.exit(1)
-print("ADOPTION LOGIC OK")
+print("ALL CHECKS PASSED")

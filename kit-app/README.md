@@ -108,6 +108,7 @@ counter keeps the pin and the position — you never need to delete and re-post.
 | command | who | what |
 |---|---|---|
 | `/setup <reviewer_role> [delivery_role] [category] [requests_channel] [queue_channel] [archive_channel]` | **Manage Server** | install on this server: makes the three channels and the tags, stores the config, posts the panel. Idempotent |
+| `/roles` | **Manage Server** | set which roles review and which deliver — **up to 8 each**, via role-pickers |
 | `/panel` | reviewer | re-post or update the panel. Edits an existing one in place |
 | `/lookup <name>` | reviewer | a reviewer card with no ticket attached — for answering "would this even pass" |
 | `/flag <name> <kind> <note>` | reviewer | mark an account: known alt, do not serve, or a note. Resolves to a UUID so it survives a rename |
@@ -148,6 +149,20 @@ to:
        queue_channel:#staff-review         ← optional; a forum, or a text channel
        archive_channel:#ticket-logs
 ```
+
+**More than one role of each kind: `/roles`.** `/setup` takes one reviewer and one delivery role
+because it needs *a* reviewer to exist before anything works. Servers where three roles review
+and two deliver use `/roles` afterwards, which shows what is set and replaces the list from a
+role-picker — up to **8 each**. Removing a role means deselecting it.
+
+Two things to know about it. Whatever is selected *replaces* the list, so it is also how you
+clear one; with no reviewer role set, anyone with Manage Server reviews, and with no delivery
+role set, anyone can claim. And **adding a role to the list does not give it channel access** —
+those are genuinely separate things, the ledger deciding who may press Approve and the channel
+overwrites deciding who can see the post to press it on. `/roles` tries to grant it and names
+any channel it could not, because editing overwrites needs Manage Roles, which this bot does not
+ask for. A configured reviewer who cannot see the queue is the worst version of this failure:
+they believe they are a reviewer and simply never see a ticket.
 
 Everything past `reviewer_role` is optional, so the one-argument install is unchanged. Two
 things follow from adopting rather than creating:
