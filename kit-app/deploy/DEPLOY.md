@@ -1,18 +1,36 @@
 # Deploying the kit bot
 
-Live on **ovh-2** (`158.69.219.29`, Ubuntu 25.04, Python 3.13.3), alongside the ARD stack. This
-file is the record of how it got there, so it can be rebuilt without archaeology.
+## For a new host, use the installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aquariusnetwork9/Melon-Kits/main/install.sh | sudo bash
+```
+
+It asks for the bot token and nothing else, then prints the invite link and the one remaining
+step (`/setup`). Re-run the same command to upgrade — it never overwrites the token, the config
+or the ledger. `--help` lists the flags; `--uninstall` removes the service and deliberately
+keeps the data.
+
+Everything in the rest of this file is what the installer *does*, and is worth reading before
+changing it. The paths below are the installer's defaults; **ovh-2 predates it** and runs the
+same thing at different paths as the `ubuntu` user, which is why the unit is a template.
 
 ## Layout on the host
 
 | path | what | owner |
 |---|---|---|
-| `/home/ubuntu/melon-kits` | the repo checkout | `ubuntu` |
-| `/home/ubuntu/melon-kits/kit-app/.venv` | virtualenv, `discord.py` only | `ubuntu` |
-| `/home/ubuntu/melon-kits/kit-app/melonkit.json` | config: guild/channel/role ids | `ubuntu` 640 |
-| `/var/lib/melonkit/melonkit.sqlite3` | **the ledger** | `ubuntu`, dir 750 |
+| `/opt/melon-kits` | the repo checkout | `melonkit` |
+| `/opt/melon-kits/kit-app/.venv` | virtualenv, `discord.py` only | `melonkit` |
+| `/opt/melon-kits/kit-app/melonkit.json` | config: paths and user agent | `melonkit` 640 |
+| `/var/lib/melonkit/melonkit.sqlite3` | **the ledger** | `melonkit`, dir 750 |
 | `/etc/melonkit/env` | **the token, and nothing else** | `root` 600 |
-| `/etc/systemd/system/melonkit-bot.service` | the unit | `root` 644 |
+| `/etc/systemd/system/melonkit-bot.service` | the unit, rendered from `melonkit-bot.service.in` | `root` 644 |
+
+On **ovh-2** (`158.69.219.29`, Ubuntu 25.04, Python 3.13.3) the same layout lives under
+`/home/ubuntu/melon-kits` and runs as `ubuntu`.
+
+**Channel and role ids are not in the config file.** `/setup` writes them to the ledger, per
+guild, which is why one config works for any server.
 
 Two separations that are deliberate:
 
@@ -27,7 +45,7 @@ Two separations that are deliberate:
 
 | script | what it does |
 |---|---|
-| `melonkit-bot.service` | the systemd unit, mirrored from what is installed |
+| `melonkit-bot.service.in` | the systemd unit **template**. `install.sh` substitutes the user and paths and writes the result. Edit this, never the installed copy — a re-run overwrites it |
 | `setup_channels.py` | creates the three channels with the right overwrites and the six forum tags. Idempotent; prints the ids as JSON |
 | `smoke_ticket.py` | drives a real ticket without a button press, for testing after a change. `--cleanup <id>` removes it |
 | `reset_tickets.py` | clears ticket history for a test reset. Backs the ledger up first |
@@ -37,9 +55,11 @@ never under plain `sudo`, for the reason in the next section.
 
 ## Updating
 
+Re-run the installer. On ovh-2, whose install predates it, it is still done by hand:
+
 ```bash
 ssh ubuntu@158.69.219.29
-git -C ~/melon-kits pull                      # deploy key is stored in core.sshCommand
+git -C ~/melon-kits pull
 ~/melon-kits/kit-app/.venv/bin/pip install -q -r ~/melon-kits/kit-app/requirements.txt
 sudo systemctl restart melonkit-bot
 journalctl -u melonkit-bot -f
@@ -55,19 +75,28 @@ sudo nano /etc/melonkit/env      # MELONKIT_DISCORD_TOKEN=...
 sudo systemctl restart melonkit-bot
 ```
 
-## Repo access
+Or re-run the installer with `--token`, which also resets the start-limit counter — see below.
 
-The repo is private, so the host has a **read-only deploy key** (`~/.ssh/melonkit_deploy`),
-registered on the repo as *"ovh-2 deploy (read-only)"*. It is wired in per-repo rather than
-globally, matching the `ard-server` convention:
+## The start limit latches
+
+The unit gives up after five failed starts in five minutes, on purpose: a crash-loop against
+Discord's auth endpoint is how an application gets rate-limited. The consequence is that after a
+bad token, **systemd refuses a plain `systemctl restart`** until the counter is cleared:
 
 ```bash
-git -C ~/melon-kits config core.sshCommand \
-  'ssh -i ~/.ssh/melonkit_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
+sudo systemctl reset-failed melonkit-bot
+sudo systemctl restart melonkit-bot
 ```
 
-Read-only on purpose: the host has no reason to push, and a compromised VPS should not be
-able to rewrite the repo.
+The installer does this for you, which matters because "mistype the token, then re-run with the
+right one" is the single most likely recovery path there is.
+
+## Repo access
+
+The repo is **public**, so a host needs no credentials to clone or pull it. (An earlier version
+of this file described a read-only deploy key for a private repo; that is no longer the case.)
+Nothing secret is in it — the token lives only in `/etc/melonkit/env`, and the shipped
+`lexicon.example.json` deliberately has empty `slur` and `profanity` lists.
 
 ## Sandboxing
 
@@ -134,7 +163,21 @@ channel create.
 
 - **`python3-venv` is not installed by default on Ubuntu 25.04**, and `python3 -c "import
   venv"` *succeeds* anyway — the module is present, `ensurepip` is not. Check by actually
-  creating a venv, not by importing. Fix: `sudo apt-get install -y python3.13-venv`.
+  creating a venv, not by importing. Fix: `sudo apt-get install -y python3.13-venv`. The
+  installer does exactly this: it tries to create one, and on failure installs
+  `python3.N-venv` and retries.
+- **An unknown key in `melonkit.json` is a hard startup error**, by design, so that a typo
+  cannot silently do nothing. That includes a `"_comment"` key — there is no way to annotate the
+  config from inside it. The installer therefore writes a bare config and validates it (by
+  importing `config`, which touches neither the ledger nor the token) *before* starting the
+  service, because otherwise the unit flaps five times and the reason ends up buried.
+- **`raw.githubusercontent.com` caches for a few minutes.** Right after pushing a change to
+  `install.sh`, a fetch can still return the previous version. Use
+  `https://api.github.com/repos/aquariusnetwork9/Melon-Kits/contents/install.sh?ref=main` with
+  `Accept: application/vnd.github.raw` to bypass it when testing.
+- **`set -o pipefail` plus `grep -q` inverts the test.** A matching `grep -q` exits early, the
+  upstream command takes SIGPIPE, and the pipeline reports failure — so the branch that matched
+  is the one that does not fire. Read into a variable and match that instead.
 - **sudo here refuses `DEBIAN_FRONTEND`** (`sorry, you are not allowed to set the following
   environment variables`). `apt-get -y -qq < /dev/null` is non-interactive enough.
 - discord.py logs two warnings at startup about `PyNaCl`/`davey` and voice support. Expected

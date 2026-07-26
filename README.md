@@ -14,6 +14,29 @@ cut.
 
 ---
 
+## Running it on your own server
+
+On any Linux box with systemd:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aquariusnetwork9/Melon-Kits/main/install.sh | sudo bash
+```
+
+It asks for your bot token and nothing else, sets everything up under a dedicated unprivileged
+user, and prints the invite link plus the one remaining step. Then run **`/setup`** in your
+server as somebody with Manage Server — it offers to adopt the roles and channels you already
+have, and creates whatever is missing.
+
+Re-run the same command to upgrade; it never overwrites your token, config or ledger.
+`--uninstall` removes the service and keeps the data. Details, and every trap worth knowing
+before changing any of it, are in [kit-app/deploy/DEPLOY.md](kit-app/deploy/DEPLOY.md).
+
+You will need a bot application at
+[discord.com/developers/applications](https://discord.com/developers/applications) —
+**Bot → Reset Token** gives you the token to paste in. No privileged intents are required.
+
+---
+
 ## Status
 
 | component | state |
