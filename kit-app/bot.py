@@ -78,6 +78,45 @@ def may_claim(member: Any, cfg: Dict[str, Any]) -> bool:
     return any(r.id == role_id for r in getattr(member, "roles", []))
 
 
+# Dispatch state, expressed as forum tags when the dispatch channel is a forum. Tag names
+# are matched case-insensitively against whatever the channel already has, so an operator can
+# rename or restyle them without touching code -- a missing tag is skipped rather than being
+# an error, because a forum with no tags configured must still work.
+DISPATCH_TAGS = ("unclaimed", "claimed", "delivered")
+
+
+def _state_tags(forum: "discord.ForumChannel", state: str) -> list:
+    want = state.casefold()
+    return [t for t in forum.available_tags if t.name.casefold() == want]
+
+
+async def _set_dispatch_state(channel: Any, state: str) -> None:
+    """Move a forum post's tags to `state`. No-op for a text-channel dispatch."""
+    if not isinstance(channel, discord.Thread):
+        return
+    parent = channel.parent
+    if not isinstance(parent, discord.ForumChannel):
+        return
+    tags = _state_tags(parent, state)
+    if not tags:
+        return
+    try:
+        await channel.edit(applied_tags=tags)
+    except discord.HTTPException as exc:
+        # Cosmetic. A dispatch whose tag is stale is still a dispatch, and failing the
+        # claim over it would be worse than a wrong label.
+        LOG.warning("could not set dispatch tag state=%s thread=%s status=%s",
+                    state, channel.id, getattr(exc, "status", "?"))
+
+
+def panel_embed(cfg: Dict[str, Any]) -> discord.Embed:
+    """The pinned panel. Shared by /panel and --post-panel so the copy cannot drift."""
+    return discord.Embed(
+        title=PANEL_TITLE,
+        description=PANEL_BODY.format(cooldown=cfg["policy"]["cooldown_days"]),
+        colour=discord.Colour.from_str("#2E6B3F"))
+
+
 def _embed_for(card: Dict[str, Any], cfg: Dict[str, Any]) -> discord.Embed:
     colour = discord.Colour.from_str("#2E6B3F")
     if card["cooldown"]["blocked"] or card["flags"]:
@@ -254,13 +293,16 @@ async def _safe_followup(interaction: discord.Interaction, text: str) -> None:
 # ----------------------------------------------------------------------------- bot
 
 class KitBot(discord.Client):
-    def __init__(self, cfg: Dict[str, Any]) -> None:
+    def __init__(self, cfg: Dict[str, Any], post_panel_to: int = 0) -> None:
         # No privileged intents are needed for the request flow itself. MESSAGE_CONTENT is
         # only required by the optional Discord-history lookup, so it is not demanded here:
         # a bot that cannot start without a privileged intent it barely uses is a bot that
         # does not start.
         super().__init__(intents=discord.Intents.default())
         self.cfg = cfg
+        # One-shot deploy mode: post the panel to this channel, then exit. Lets a deployment
+        # finish without a human having to run /panel in a client.
+        self._post_panel_to = int(post_panel_to or 0)
         self.tree = app_commands.CommandTree(self)
         self.store = store_mod.open_store(cfg["store"]["path"])
         self.vc = vc_mod.Client(cfg, LOG)
@@ -292,6 +334,32 @@ class KitBot(discord.Client):
 
     async def on_ready(self) -> None:
         LOG.info("connected as %s (%s)", self.user, getattr(self.user, "id", "?"))
+        if self._post_panel_to:
+            await self._deploy_panel()
+
+    async def _deploy_panel(self) -> None:
+        channel = self.get_channel(self._post_panel_to)
+        try:
+            if channel is None:
+                LOG.error("panel channel %d not visible to the bot -- check it can View "
+                          "Channels there", self._post_panel_to)
+                return
+            if isinstance(channel, discord.ForumChannel):
+                LOG.error("panel channel %d is a forum. A forum cannot hold a standalone "
+                          "message, and forum posts cannot be private -- which would make "
+                          "every applicant's reviewer card readable by everyone. Use a text "
+                          "channel.", self._post_panel_to)
+                return
+            msg = await channel.send(embed=panel_embed(self.cfg), view=PanelView())
+            LOG.info("panel posted channel=%d message=%d", channel.id, msg.id)
+            try:
+                await msg.pin()
+                LOG.info("panel pinned")
+            except discord.HTTPException as exc:
+                LOG.warning("panel posted but not pinned (needs Manage Messages): status=%s",
+                            getattr(exc, "status", "?"))
+        finally:
+            await self.close()
 
     # ------------------------------------------------------------- panel -> modal
 
@@ -507,7 +575,16 @@ class KitBot(discord.Client):
         view = discord.ui.View(timeout=None)
         view.add_item(ClaimButton(kit_id))
         try:
-            await channel.send(embed=embed, view=view)
+            if isinstance(channel, discord.ForumChannel):
+                # A forum is the better home for this: each dispatch is a post, and the tags
+                # below make the queue filterable instead of scrollable. Note you cannot
+                # `send` to a forum at all -- a post IS a thread, so this is create_thread.
+                await channel.create_thread(
+                    name="kit #%d - %s" % (kit_id, ticket["mc_name"]),
+                    embed=embed, view=view,
+                    applied_tags=_state_tags(channel, "unclaimed"))
+            else:
+                await channel.send(embed=embed, view=view)
             return True
         except discord.HTTPException as exc:
             LOG.error("dispatch post failed kit=%d status=%s", kit_id,
@@ -543,7 +620,10 @@ class KitBot(discord.Client):
             colour=discord.Colour.from_str("#2E6B3F"))
         view = discord.ui.View(timeout=None)
         view.add_item(DeliveredButton(kit_id))
+        # The interaction response has to land first -- it is on a 3-second clock. Retagging
+        # is a separate call and is allowed to be slow or to fail.
         await interaction.response.edit_message(embed=embed, view=view)
+        await _set_dispatch_state(interaction.channel, "claimed")
 
     async def handle_delivered(self, interaction: discord.Interaction,
                                kit_id: int) -> None:
@@ -570,6 +650,17 @@ class KitBot(discord.Client):
                         % (kit["mc_name"], interaction.user.mention),
             colour=discord.Colour.from_str("#4A4A4A"))
         await interaction.response.edit_message(embed=embed, view=None)
+        await _set_dispatch_state(interaction.channel, "delivered")
+        # Closing the post keeps the forum's default view to live work without deleting the
+        # record. Archived rather than locked, so it can be reopened if a delivery falls
+        # through after being marked done.
+        if isinstance(interaction.channel, discord.Thread) and \
+                isinstance(interaction.channel.parent, discord.ForumChannel):
+            try:
+                await interaction.channel.edit(archived=True)
+            except discord.HTTPException:
+                LOG.warning("could not archive delivered dispatch thread=%s",
+                            interaction.channel.id)
 
 
 # ------------------------------------------------------------------------ commands
@@ -583,11 +674,7 @@ def register_commands(app: KitBot) -> None:
             await interaction.response.send_message(
                 "Only reviewers can post the panel.", ephemeral=True)
             return
-        embed = discord.Embed(
-            title=PANEL_TITLE,
-            description=PANEL_BODY.format(cooldown=app.cfg["policy"]["cooldown_days"]),
-            colour=discord.Colour.from_str("#2E6B3F"))
-        await interaction.channel.send(embed=embed, view=PanelView())
+        await interaction.channel.send(embed=panel_embed(app.cfg), view=PanelView())
         await interaction.response.send_message(
             "Panel posted. Pin it - the button keeps working indefinitely, so it only needs "
             "posting once.", ephemeral=True)
@@ -747,6 +834,9 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--config", help="path to melonkit.json")
     parser.add_argument("--print-config", action="store_true",
                         help="show the effective config (including env overrides) and exit")
+    parser.add_argument("--post-panel", type=int, metavar="CHANNEL_ID", default=0,
+                        help="connect, post and pin the request panel in this channel, then "
+                             "exit. For deployment; /panel does the same thing from a client")
     args = parser.parse_args(argv)
 
     try:
@@ -768,7 +858,7 @@ def main(argv: Optional[list] = None) -> int:
             % cfg["discord"]["token_env"])
         return 2
 
-    app = KitBot(cfg)
+    app = KitBot(cfg, post_panel_to=args.post_panel)
     try:
         app.run(token, log_handler=None)
     except discord.LoginFailure:
