@@ -339,11 +339,22 @@ class Backfiller(threading.Thread):
                 self._writer.advance_gap(gap_id, cursor, 0)
                 continue
 
-            if max_ts == sent_cursor and written == 0:
+            if len(rows) >= self._page_size and max_ts == sent_cursor and written == 0:
                 # SPEC §7.4 tie-group guard: a full page whose last timestamp equals the
                 # cursor we sent, every row already known. pageSize is already at max, so
                 # the only way forward is to step past the tie by one microsecond and accept
                 # that rows sharing that exact instant beyond the page may be missed.
+                #
+                # The page-FULL check is load-bearing, not defensive. Without it this fires
+                # on the ordinary last fetch of a healthy walk: the cursor sits *on* the
+                # last row written, the inclusive lower bound re-delivers exactly that row,
+                # so max_ts == sent_cursor and written == 0 with a one-row page. That is
+                # end-of-window, not a tie group — nothing is beyond the page to lose. A
+                # short page cannot hide a tie group by definition, and since tie_skips is
+                # a cumulative counter wired to a health warning that is never reset, one
+                # spurious bump pins the collector at warn permanently and destroys the
+                # signal SPEC §7.4 wants it to carry ("treat any occurrence as a signal
+                # that the lookback clamp misfired").
                 self._writer.bump("tie_skips")
                 self._log.warning("tie group larger than a page gap_id=%s ts_us=%d "
                                   "page_size=%d: advancing cursor by 1us, rows at this "
