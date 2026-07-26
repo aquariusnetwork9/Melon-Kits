@@ -680,6 +680,12 @@ class Store(object):
         """
         empty = {"blocked": False, "days_left": 0, "last_at": None,
                  "last_ticket_id": None, "last_status": None}
+        # Coerced rather than trusted: a per-guild override arrives from the config table as
+        # whatever was stored there, and `"180" <= 0` is a TypeError rather than a comparison.
+        try:
+            cooldown_days = int(cooldown_days)
+        except (TypeError, ValueError):
+            return empty
         if cooldown_days <= 0:
             return empty
         row = self.last_request(guild_id, discord_user_id, exclude_ticket_id)
@@ -710,15 +716,22 @@ class Store(object):
         otherwise split one MC account's history -- and a name match alone is weak enough that
         the card says which of the two it was.
 
+        A uuid match ALSO picks up rows whose uuid is null and whose name matches. Those are
+        tickets opened while the identity lookup was down, and without this they would be
+        unreachable forever: a farm only has to make one request during an outage to get a row
+        that no later uuid search can see. Two accounts can only share a name across a rename,
+        so the false-positive risk is much smaller than the hole it closes.
+
         Cancelled tickets are included here, unlike the request clock: for evidence, an attempt
         that never reached a reviewer still shows somebody tried.
         """
         if not mc_uuid and not mc_name:
             return []
         if mc_uuid:
-            where, args = "mc_uuid=?", [mc_uuid]
+            where = "(mc_uuid=? OR (mc_uuid IS NULL AND LOWER(mc_name)=?))"
+            args = [mc_uuid, str(mc_name or "").lower()]
         else:
-            where, args = "mc_uuid IS NULL AND LOWER(mc_name)=?", [str(mc_name).lower()]
+            where, args = "(mc_uuid IS NULL AND LOWER(mc_name)=?)", [str(mc_name).lower()]
         sql = ("SELECT discord_user_id, mc_name, mc_uuid, COUNT(*) AS tickets, "
                "MAX(created_at) AS newest, "
                "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS approved, "

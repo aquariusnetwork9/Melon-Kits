@@ -276,6 +276,27 @@ class StoreCase(unittest.TestCase):
         self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
         self.assertEqual(self.st.other_requesters(GUILD, mc_name="alice"), [])
 
+    def test_a_uuid_search_still_finds_a_ticket_opened_during_an_outage(self):
+        """A ticket whose uuid never resolved would otherwise be unreachable forever: a farm
+        only has to make one request while the identity API is down to get a row that no later
+        uuid search can see."""
+        self.st.create_ticket(GUILD, 100, "Alice", None, None)       # uuid lookup failed
+        rows = self.st.other_requesters(GUILD, mc_uuid=UUID_A, mc_name="Alice",
+                                       exclude_user_id=200)
+        self.assertEqual([int(r["discord_user_id"]) for r in rows], [100])
+
+    def test_that_fallback_does_not_match_a_different_name(self):
+        self.st.create_ticket(GUILD, 100, "Someone", None, None)
+        self.assertEqual(
+            self.st.other_requesters(GUILD, mc_uuid=UUID_A, mc_name="Alice"), [])
+
+    def test_a_string_cooldown_from_a_guild_override_does_not_raise(self):
+        """Per-guild overrides come out of the config table as whatever was stored, and
+        `"180" <= 0` is a TypeError rather than a comparison."""
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertTrue(self.st.request_cooldown(GUILD, "180", 100)["blocked"])
+        self.assertFalse(self.st.request_cooldown(GUILD, "nonsense", 100)["blocked"])
+
     def test_the_farm_list_is_per_guild(self):
         self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
         self.assertEqual(self.st.other_requesters(GUILD + 1, mc_uuid=UUID_A), [])

@@ -137,6 +137,27 @@ def guides_embed() -> discord.Embed:
     return embed
 
 
+def longer_block(cd: Dict[str, Any], rq: Dict[str, Any]) -> Optional[str]:
+    """Which of the two clocks to tell the applicant about: ``'request'``, ``'kit'`` or None.
+
+    Whichever has longer left, not whichever was checked first. Telling somebody "about 14 days
+    to go" off the 21-day kit cooldown while the 180-day request clock still has 166 left invites
+    them back in a fortnight to be refused again by a rule nobody mentioned.
+
+    Neither dominates in general: the kit cooldown also matches on the MC account, so a *second*
+    Discord account asking for a recently-helped account trips it while the request clock, keyed
+    on the Discord id alone, stays clear.
+    """
+    # `blocked` is the authoritative flag and `days_left` only orders the two. -1 for "not
+    # blocked" keeps a clock that says blocked with no count from reading as clear, which is the
+    # safer way round: the alternative silently lets somebody through.
+    kit = int(cd.get("days_left") or 0) if cd.get("blocked") else -1
+    req = int(rq.get("days_left") or 0) if rq.get("blocked") else -1
+    if kit < 0 and req < 0:
+        return None
+    return "request" if req >= kit else "kit"
+
+
 def is_admin(member: Any) -> bool:
     """Who may run /setup. Manage Server, i.e. whoever could have invited the bot."""
     perms = getattr(member, "guild_permissions", None)
@@ -1072,27 +1093,22 @@ class KitBot(discord.Client):
                 % where, ephemeral=True)
             return
 
-        # Per kind, so a funded build does not block a rescue and a rescue does not block a
-        # build. The one-open-ticket rule above is deliberately NOT per kind: two open tickets
-        # is two threads and two cards for one person, and being stuck open is the most
-        # expensive failure this app has.
+        # Two clocks, and BOTH are computed before either is reported. Whichever has longer left
+        # is the one the applicant hears about, because telling somebody "about 14 days to go"
+        # off the 21-day kit cooldown while the 180-day request clock still has 166 left invites
+        # them back in a fortnight to be refused again. Neither dominates in general -- the kit
+        # cooldown also matches on the MC account, so a *second* Discord account asking for a
+        # recently-helped account trips it while the request clock, which is keyed on the Discord
+        # id alone, stays clear.
+        #
+        # The kit cooldown is per kind, so a funded build does not block a rescue and vice versa.
+        # The one-open-ticket rule above is deliberately NOT per kind: two open tickets is two
+        # threads and two cards for one person, and being stuck open is the most expensive
+        # failure this app has.
         cd = self.store.cooldown(gid, g["cooldown_days"], discord_user_id=user_id, kind=kind)
-        if cd["blocked"]:
-            await interaction.response.send_message(
-                "You had %s from us recently, so you're inside the %d-day cooldown for that - "
-                "about %d day(s) to go. This is to spread help around rather than anything "
-                "against you.%s" % (
-                    "a rescue kit" if kind == store_mod.KIND_RESCUE else "project funding",
-                    g["cooldown_days"], cd["days_left"],
-                    "\n\nThe other kind of request has its own cooldown, so that one may "
-                    "still be open to you."), ephemeral=True)
-            return
-
-        # The per-identity request clock, checked LAST of the three because it is the broadest:
-        # not per kind and not per outcome, so it is the one most likely to be the real answer
-        # and the least useful thing to say first if a narrower rule also applies.
-        rq = self.store.request_cooldown(gid, int(g["request_cooldown_days"]), user_id)
-        if rq["blocked"]:
+        rq = self.store.request_cooldown(gid, g["request_cooldown_days"], user_id)
+        report = longer_block(cd, rq)
+        if report == "request":
             await interaction.response.send_message(
                 "You've already made a request here - #%d, %s. It's **one request per %d "
                 "days** per Discord account, so there's about %d day(s) to go.\n\n"
@@ -1103,6 +1119,16 @@ class KitBot(discord.Client):
                    else "turned down" if rq["last_status"] == store_mod.STATUS_DECLINED
                    else "still open",
                    int(g["request_cooldown_days"]), rq["days_left"]), ephemeral=True)
+            return
+        if report == "kit":
+            await interaction.response.send_message(
+                "You had %s from us recently, so you're inside the %d-day cooldown for that - "
+                "about %d day(s) to go. This is to spread help around rather than anything "
+                "against you.%s" % (
+                    "a rescue kit" if kind == store_mod.KIND_RESCUE else "project funding",
+                    g["cooldown_days"], cd["days_left"],
+                    "\n\nThe other kind of request has its own cooldown, so that one may "
+                    "still be open to you."), ephemeral=True)
             return
 
         await interaction.response.send_modal(

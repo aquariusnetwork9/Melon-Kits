@@ -107,6 +107,40 @@ def panel_embed_renders():
 
 check("panel_embed", panel_embed_renders)
 
+print("\n-- an applicant hears about the LONGER of the two clocks --")
+
+
+def block(days):
+    return {"blocked": bool(days), "days_left": days}
+
+
+CLOCK_CASES = [
+    # (kit days, request days, which the applicant should be told about)
+    (0, 0, None),
+    (14, 0, "kit"),
+    (0, 166, "request"),
+    # The trap this exists for: 21-day kit cooldown reported over a 166-day request clock sends
+    # somebody away for a fortnight to be refused again by a rule nobody mentioned.
+    (14, 166, "request"),
+    # ...and the reverse, which is real: the kit cooldown also matches on the MC account, so a
+    # second Discord account asking for a recently-helped account trips it alone.
+    (21, 0, "kit"),
+    (200, 166, "kit"),
+    (166, 166, "request"),
+]
+
+
+def clocks():
+    for kit, req, want in CLOCK_CASES:
+        got = bot_mod.longer_block(block(kit), block(req))
+        assert got == want, "kit=%s request=%s -> %s, wanted %s" % (kit, req, got, want)
+    # A blocked clock with a missing count must not read as "not blocked".
+    assert bot_mod.longer_block({"blocked": True}, {"blocked": False}) == "kit"
+    print("       %d cases" % len(CLOCK_CASES))
+
+
+check("longer_block picks the longer wait", clocks)
+
 print("\n-- the card's colour agrees with its heading --")
 
 
