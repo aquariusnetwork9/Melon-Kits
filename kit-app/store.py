@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -121,11 +122,15 @@ class Store(object):
         parent = os.path.dirname(os.path.abspath(path))
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
-        self._db = sqlite3.connect(path, timeout=15, isolation_level=None)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute("PRAGMA foreign_keys=ON")
+        # One connection PER THREAD. The bot runs every blocking call -- the 2b2t API
+        # requests, and the ledger reads inside card.gather -- through
+        # loop.run_in_executor, so the store is genuinely touched from worker threads, and
+        # a single shared connection raises
+        # "SQLite objects created in a thread can only be used in that same thread".
+        # WAL mode makes multiple connections to one file the normal, supported case.
+        self._local = threading.local()
+        self._conns = []
+        self._conns_lock = threading.Lock()
         self._db.executescript(_SCHEMA)
         self._migrate()
         cur = self._db.execute("SELECT value FROM meta WHERE key='schema_version'")
@@ -141,6 +146,28 @@ class Store(object):
                 "ledger at %s was written by a newer version (schema %s > %s); refusing to "
                 "open it read-write rather than risk mangling the kit history"
                 % (path, row["value"], SCHEMA_VERSION))
+
+    def _connect(self) -> sqlite3.Connection:
+        # check_same_thread=False alongside the thread-local: the guard is redundant once
+        # every thread has its own connection, and disabling it is what lets close() tidy
+        # up connections belonging to worker threads that have already gone away.
+        db = sqlite3.connect(self.path, timeout=15, isolation_level=None,
+                             check_same_thread=False)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")      # persistent, but harmless to re-assert
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("PRAGMA foreign_keys=ON")       # per-connection, so this one matters
+        return db
+
+    @property
+    def _db(self) -> sqlite3.Connection:
+        db = getattr(self._local, "db", None)
+        if db is None:
+            db = self._connect()
+            self._local.db = db
+            with self._conns_lock:
+                self._conns.append(db)
+        return db
 
     def _migrate(self) -> None:
         """Additive column migrations.
@@ -160,10 +187,14 @@ class Store(object):
             "CREATE INDEX IF NOT EXISTS ix_tickets_queue ON tickets(queue_thread_id)")
 
     def close(self) -> None:
-        try:
-            self._db.close()
-        except Exception:
-            pass
+        with self._conns_lock:
+            conns, self._conns = self._conns, []
+        for db in conns:
+            try:
+                db.close()
+            except Exception:
+                pass
+        self._local = threading.local()
 
     # ------------------------------------------------------------------ tickets
 

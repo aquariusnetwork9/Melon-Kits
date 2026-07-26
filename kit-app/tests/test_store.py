@@ -289,6 +289,57 @@ class StoreCase(unittest.TestCase):
         st.set_queue_thread(int(row["id"]), 999)
         self.assertEqual(st.get_ticket(int(row["id"]))["queue_thread_id"], 999)
 
+    def test_store_is_usable_from_a_worker_thread(self):
+        """The bug that broke every button press in production.
+
+        The bot runs blocking work -- the 2b2t requests, and the ledger reads inside
+        card.gather -- through loop.run_in_executor, so the store really is touched from a
+        thread other than the one that opened it. A single shared sqlite3 connection raises
+        ProgrammingError("SQLite objects created in a thread can only be used in that same
+        thread") the moment that happens, and the failure surfaced only in the real
+        interaction path: a smoke test that called gather directly, on the main thread, was
+        perfectly green.
+        """
+        import concurrent.futures
+
+        tid = self.st.create_ticket(100, "Alice", UUID_A)
+
+        def worker():
+            # Exactly what card.gather touches.
+            cd = self.st.cooldown(21, discord_user_id=100, mc_uuid=UUID_A)
+            hist = self.st.kit_history(discord_user_id=100, mc_uuid=UUID_A)
+            flags = self.st.flags_for(mc_uuid=UUID_A, mc_name="Alice")
+            linked = self.st.linked_accounts(discord_user_id=100, mc_uuid=UUID_A)
+            # ...and a write, which is what record_shown_chats does after it.
+            self.st.record_shown_chats(tid, [{"ts": None, "chat": "gg"}])
+            return cd, hist, flags, linked
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            cd, hist, flags, linked = pool.submit(worker).result(timeout=20)
+
+        self.assertFalse(cd["blocked"])
+        self.assertEqual(hist, [])
+        self.assertEqual(flags, [])
+        self.assertEqual(len(linked), 1)
+        # The write from the worker thread is visible from this one.
+        self.assertEqual(len(self.st.shown_chats(tid)), 1)
+
+    def test_concurrent_threads_can_both_write(self):
+        """Two workers writing at once. WAL plus a per-connection busy timeout is what makes
+        this safe; it is the shape of two reviews being built simultaneously."""
+        import concurrent.futures
+
+        def worker(n):
+            tid = self.st.create_ticket(200 + n, "Player%d" % n, None)
+            self.st.record_shown_chats(tid, [{"ts": None, "chat": "line"}])
+            return tid
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            ids = [f.result(timeout=30)
+                   for f in [pool.submit(worker, n) for n in range(4)]]
+        self.assertEqual(len(set(ids)), 4)
+        self.assertEqual(self.st.counts()["tickets"], 4)
+
     def test_a_future_schema_is_refused_rather_than_mangled(self):
         path = self.st.path
         self.st._db.execute("UPDATE meta SET value='99' WHERE key='schema_version'")

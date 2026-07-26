@@ -37,11 +37,14 @@ import config as config_mod   # noqa: E402
 
 REQUESTS_NAME = "kit-requests"
 QUEUE_NAME = "kit-queue"
+ARCHIVE_NAME = "kit-archive"
 
 REQUESTS_TOPIC = ("Ask for a barebones diamond kit. Press the button on the pinned panel - "
                   "each request opens a private thread just for you.")
 QUEUE_TOPIC = ("Staff only. One post per kit request: the reviewer card, the decision, and "
                "the delivery claim. Filter by tag.")
+ARCHIVE_TOPIC = ("Staff only, append-only. One transcript per finished ticket, with the chat "
+                 "log attached, so the record outlives the thread and the queue post.")
 
 # Lifecycle tags. Names must match QUEUE_TAGS in bot.py (matched case-insensitively).
 TAGS = [
@@ -176,6 +179,32 @@ async def run(cfg, token):
                 sys.stderr.write("  reused #%s\n" % QUEUE_NAME)
             out["queue_channel_id"] = forum.id
 
+            # ----------------------------------------------------------- archive
+            # A text channel, not a forum: it is read chronologically and searched, never
+            # worked through, and it should never sprout threads.
+            arch = find_channel(guild, ARCHIVE_NAME, discord.TextChannel)
+            aow = {
+                everyone: discord.PermissionOverwrite(view_channel=False),
+                me: discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, embed_links=True,
+                    attach_files=True, read_message_history=True),
+            }
+            for role in (reviewer, runner):
+                if role:
+                    aow[role] = discord.PermissionOverwrite(
+                        view_channel=True, read_message_history=True,
+                        # Read-only for humans: an archive nobody can edit is worth more.
+                        send_messages=False,
+                        create_public_threads=False, create_private_threads=False)
+            if arch is None:
+                arch = await guild.create_text_channel(
+                    ARCHIVE_NAME, topic=ARCHIVE_TOPIC, overwrites=aow,
+                    reason="Melon Kits: finished-ticket archive")
+                sys.stderr.write("  created #%s\n" % ARCHIVE_NAME)
+            else:
+                await sync_existing(arch, ARCHIVE_TOPIC, aow, ARCHIVE_NAME)
+            out["transcript_channel_id"] = arch.id
+
             # ------------------------------------------------------- verification
             sys.stderr.write("\neffective permissions:\n")
             for label, channel, needs in (
@@ -205,7 +234,7 @@ async def run(cfg, token):
 
     await client.start(token)
     print(json.dumps(out))
-    return 0 if "error" not in out and len(out) == 2 else 1
+    return 0 if "error" not in out and len(out) == 3 else 1
 
 
 def main(argv=None):

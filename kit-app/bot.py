@@ -299,7 +299,12 @@ class KitBot(discord.Client):
         # only required by the optional Discord-history lookup, so it is not demanded here:
         # a bot that cannot start without a privileged intent it barely uses is a bot that
         # does not start.
-        super().__init__(intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        if cfg["discord"]["capture_thread_messages"]:
+            # Privileged. Without it Discord returns empty content and a transcript would
+            # quietly record an empty conversation, which is worse than not recording one.
+            intents.message_content = True
+        super().__init__(intents=intents)
         self.cfg = cfg
         # One-shot deploy mode: post the panel to this channel, then exit. Lets a deployment
         # finish without a human having to run /panel in a client.
@@ -364,11 +369,43 @@ class KitBot(discord.Client):
 
     # ------------------------------------------------------------- panel -> modal
 
+    async def _heal_orphaned_ticket(self, user_id: int) -> None:
+        """Close an open ticket whose applicant thread no longer exists.
+
+        Deleting the thread in Discord does nothing to the ledger, so the row stays `open`
+        and the pre-check below bars that person from ever requesting again -- the same
+        permanent lockout /close exists for, arrived at by accident instead of neglect. This
+        runs on every button press rather than relying only on the on_thread_delete event,
+        because a thread deleted while the bot was down generates no event to catch.
+        """
+        row = self.store.open_ticket_for(user_id)
+        if row is None or not row["thread_id"]:
+            # No thread recorded is not the same as a deleted thread: the queue post may
+            # still be live and awaiting review, so leave it alone.
+            return
+        tid = int(row["thread_id"])
+        if self.get_channel(tid) is not None:
+            return
+        try:
+            await self.fetch_channel(tid)
+            return                      # exists, just was not cached
+        except discord.NotFound:
+            pass
+        except discord.HTTPException:
+            return                      # transient: do not close a ticket on a network blip
+        self.store.record_decision(int(row["id"]), self.user.id,
+                                   store_mod.STATUS_CANCELLED,
+                                   "auto-closed: applicant thread was deleted")
+        LOG.info("auto-closed orphaned ticket ticket=%s user=%s thread=%s gone",
+                 row["id"], user_id, tid)
+        await self._post_transcript(int(row["id"]))
+
     async def handle_panel_click(self, interaction: discord.Interaction) -> None:
         """Pre-check, THEN show the form. Never the other way round."""
         user_id = interaction.user.id
         pol = self.cfg["policy"]
 
+        await self._heal_orphaned_ticket(user_id)
         open_n = self.store.open_ticket_count(user_id)
         if open_n >= int(pol["max_open_tickets_per_user"]):
             existing = self.store.open_ticket_for(user_id)
@@ -618,6 +655,8 @@ class KitBot(discord.Client):
                 "Request #%d wasn't approved this time. We don't go into specifics, but the "
                 "usual reasons are on the request panel. This isn't permanent - you're "
                 "welcome to ask again later." % ticket_id)
+            # Archive before the thread gets cleaned up, not after.
+            await self._post_transcript(ticket_id)
             return
 
         kit_id = self.store.record_kit(ticket_id, int(ticket["discord_user_id"]),
@@ -645,6 +684,191 @@ class KitBot(discord.Client):
             "Request #%d is **approved**. Someone will claim the delivery and message you "
             "here to sort out where to meet. Times aren't guaranteed - everyone here is a "
             "volunteer." % ticket_id)
+
+    # ------------------------------------------------------------- transcripts
+
+    async def on_thread_delete(self, thread: discord.Thread) -> None:
+        """Close a ticket whose thread someone deleted, and archive it while we still can.
+
+        Fires promptly for deletions that happen with the bot running; the pre-check in
+        _heal_orphaned_ticket covers the ones that happen while it is down.
+        """
+        row = self.store.ticket_for_thread(thread.id)
+        if row is None or row["status"] != store_mod.STATUS_OPEN:
+            return
+        self.store.record_decision(int(row["id"]), self.user.id,
+                                   store_mod.STATUS_CANCELLED,
+                                   "auto-closed: applicant thread was deleted")
+        LOG.info("ticket auto-closed on thread delete ticket=%s thread=%s",
+                 row["id"], thread.id)
+        fresh = self.store.get_ticket(int(row["id"])) or row
+        qthread, qmsg = await self._queue_post(fresh)
+        if qmsg is not None:
+            try:
+                await qmsg.edit(content="Ticket #%s - **closed**: the applicant thread was "
+                                        "deleted." % row["id"], view=None)
+            except discord.HTTPException:
+                pass
+        await _set_queue_state(qthread, "closed", archive=True)
+        await self._post_transcript(int(row["id"]))
+
+    async def _thread_conversation(self, ticket: Any) -> Optional[str]:
+        """The applicant thread's messages, oldest first. None when unavailable."""
+        if not self.cfg["discord"]["capture_thread_messages"] or not ticket["thread_id"]:
+            return None
+        ch = self.get_channel(int(ticket["thread_id"]))
+        if ch is None:
+            try:
+                ch = await self.fetch_channel(int(ticket["thread_id"]))
+            except (discord.HTTPException, discord.NotFound):
+                return None
+        if not isinstance(ch, discord.Thread):
+            return None
+        lines = []
+        try:
+            async for msg in ch.history(limit=500, oldest_first=True):
+                stamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%SZ")
+                body = (msg.content or "").replace("\n", "\n" + " " * 30)
+                lines.append("%s  %-18s %s" % (stamp, msg.author.display_name[:18], body))
+                for att in msg.attachments:
+                    lines.append("%s  %-18s [attachment: %s]"
+                                 % (" " * 20, "", att.filename))
+        except discord.HTTPException:
+            return None
+        return "\n".join(lines) if lines else None
+
+    async def _post_transcript(self, ticket_id: int) -> None:
+        """One self-contained record of a finished ticket, in the staff archive.
+
+        Built from the ledger rather than by scraping Discord, so it still works after the
+        thread and the queue post are gone -- which is the situation it exists for.
+        """
+        channel_id = int(self.cfg["discord"]["transcript_channel_id"] or 0)
+        if not channel_id:
+            return
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            LOG.warning("transcript channel %d unavailable, ticket=%d not archived",
+                        channel_id, ticket_id)
+            return
+
+        t = self.store.get_ticket(ticket_id)
+        if t is None:
+            return
+        decisions = self.store.decisions_for(ticket_id)
+        kits = [k for k in self.store.kit_history(
+            discord_user_id=int(t["discord_user_id"]), mc_uuid=t["mc_uuid"], limit=20)
+            if k["ticket_id"] == ticket_id]
+        shown = self.store.shown_chats(ticket_id)
+        flagged = [r for r in shown if r["flagged"]]
+
+        opened = card_mod.parse_ts_epoch(t["created_at"])
+        closed = card_mod.parse_ts_epoch(t["closed_at"])
+        colour = {store_mod.STATUS_APPROVED: "#2E6B3F",
+                  store_mod.STATUS_DECLINED: "#8A2F2F",
+                  store_mod.STATUS_CANCELLED: "#4A4A4A"}.get(str(t["status"]), "#4A4A4A")
+
+        embed = discord.Embed(
+            title="Ticket #%d - %s" % (ticket_id, str(t["status"]).upper()),
+            colour=discord.Colour.from_str(colour))
+        embed.add_field(
+            name="Applicant",
+            value="<@%d> (`%d`)\nMinecraft: **%s**\nUUID: `%s`"
+                  % (int(t["discord_user_id"]), int(t["discord_user_id"]),
+                     t["mc_name"], t["mc_uuid"] or "unresolved"),
+            inline=False)
+        timing = ["Opened: %s" % (opened.strftime("%Y-%m-%d %H:%M:%SZ") if opened else "?")]
+        if closed:
+            timing.append("Closed: %s" % closed.strftime("%Y-%m-%d %H:%M:%SZ"))
+            if opened:
+                timing.append("Open for: %s"
+                              % card_mod.duration(int((closed - opened).total_seconds())))
+        embed.add_field(name="Timing", value="\n".join(timing), inline=False)
+
+        if t["note"]:
+            embed.add_field(name="What they asked for", value=str(t["note"])[:1000],
+                            inline=False)
+
+        if decisions:
+            rows = []
+            for d in decisions:
+                who = "the bot" if int(d["reviewer_id"]) == int(self.user.id) \
+                    else "<@%d>" % int(d["reviewer_id"])
+                rows.append("**%s** by %s\n> %s"
+                            % (d["outcome"], who, d["reason"] or "(no reason given)"))
+            embed.add_field(name="Decision", value="\n".join(rows)[:1024], inline=False)
+        else:
+            embed.add_field(name="Decision", value="none recorded", inline=False)
+
+        if kits:
+            k = kits[0]
+            claimed = card_mod.parse_ts_epoch(k["claimed_at"])
+            delivered = card_mod.parse_ts_epoch(k["delivered_at"])
+            embed.add_field(
+                name="Delivery",
+                value="Dispatch #%d\nClaimed by: %s\nDelivered: %s"
+                      % (int(k["id"]),
+                         "<@%d> (%s)" % (int(k["claimed_by"]), card_mod.ago(claimed))
+                         if k["claimed_by"] else "never claimed",
+                         delivered.strftime("%Y-%m-%d %H:%M:%SZ") if delivered
+                         else "**not delivered**"),
+                inline=False)
+
+        embed.add_field(
+            name="Screening",
+            value="%d chat line(s) shown, %d flagged by a reviewer%s"
+                  % (len(shown), len(flagged),
+                     "" if shown else " (no chat was on record)"),
+            inline=False)
+        embed.set_footer(text="Archived automatically when the ticket finished")
+
+        # The attachment is what makes this survive a deleted thread.
+        parts = ["MELON KITS - TICKET #%d TRANSCRIPT" % ticket_id,
+                 "=" * 72,
+                 "status      : %s" % t["status"],
+                 "applicant   : discord %s" % t["discord_user_id"],
+                 "minecraft   : %s (%s)" % (t["mc_name"], t["mc_uuid"] or "unresolved"),
+                 "opened      : %s" % (opened.isoformat() if opened else "?"),
+                 "closed      : %s" % (closed.isoformat() if closed else "-"),
+                 "request note: %s" % (t["note"] or "-"),
+                 ""]
+        parts.append("DECISIONS")
+        for d in decisions:
+            parts.append("  %s  %s by %s: %s"
+                         % (card_mod.parse_ts_epoch(d["decided_at"]), d["outcome"],
+                            d["reviewer_id"], d["reason"] or "-"))
+        if not decisions:
+            parts.append("  (none)")
+        parts += ["", "CHAT SHOWN TO THE REVIEWER (coordinate-redacted at capture)"]
+        if shown:
+            for r in shown:
+                parts.append("  %4d %s %s %s"
+                             % (r["position"], "[FLAGGED]" if r["flagged"] else "         ",
+                                (r["chat_ts"] or "")[:19], r["chat"]))
+        else:
+            parts.append("  (no chat on record)")
+
+        convo = await self._thread_conversation(t)
+        parts += ["", "APPLICANT THREAD CONVERSATION"]
+        if convo:
+            parts.append(convo)
+        elif self.cfg["discord"]["capture_thread_messages"]:
+            parts.append("  (unavailable - thread already deleted)")
+        else:
+            parts.append("  (not captured - set discord.capture_thread_messages and enable "
+                         "the MESSAGE_CONTENT intent)")
+
+        data = ("\n".join(parts) + "\n").encode("utf-8")
+        try:
+            await channel.send(
+                embed=embed,
+                file=discord.File(io.BytesIO(data),
+                                  filename="ticket-%d-%s.txt" % (ticket_id, t["mc_name"])),
+                allowed_mentions=discord.AllowedMentions.none())
+            LOG.info("transcript archived ticket=%d bytes=%d", ticket_id, len(data))
+        except discord.HTTPException as exc:
+            LOG.error("could not post transcript ticket=%d status=%s",
+                      ticket_id, getattr(exc, "status", "?"))
 
     async def _notify_thread(self, ticket: Any, text: str) -> None:
         thread_id = ticket["thread_id"]
@@ -731,6 +955,9 @@ class KitBot(discord.Client):
             if ticket is not None:
                 await self._notify_thread(
                     ticket, "Marked delivered. Good luck out there \U0001F348")
+                # A delivered kit is the end of the ticket, so this is where the approved
+                # path gets archived.
+                await self._post_transcript(int(kit["ticket_id"]))
 
 
 # ------------------------------------------------------------------------ commands
@@ -910,6 +1137,7 @@ def register_commands(app: KitBot) -> None:
                 except discord.HTTPException:
                     pass
 
+        await app._post_transcript(ticket)
         await interaction.followup.send(
             "Ticket #%d closed. %s can open a new request straight away."
             % (ticket, "You" if mine else "The applicant"), ephemeral=True)

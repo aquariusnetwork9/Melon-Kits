@@ -30,6 +30,16 @@ DEFAULTS: Dict[str, Any] = {
         # decision and the delivery claim -- the whole lifecycle in one place, with tags for
         # state. A text channel also works; the forum just makes it filterable.
         "queue_channel_id": 0,
+        # Staff-only archive. Every finished ticket -- delivered, declined or closed -- gets
+        # one self-contained summary posted here, with the chat log attached, so the record
+        # survives the thread and the queue post being deleted. 0 disables it.
+        "transcript_channel_id": 0,
+        # Include the applicant<->staff conversation in the transcript. Requires the
+        # MESSAGE_CONTENT privileged intent (Developer Portal > Bot > Message Content
+        # Intent); without it Discord returns empty strings for message content and the
+        # transcript would silently record an empty conversation, so this stays off unless
+        # you turn the intent on.
+        "capture_thread_messages": False,
         # May approve/decline and see reviewer cards.
         "reviewer_role_id": 0,
         # May claim a dispatch. 0 means "anyone in the dispatch channel".
