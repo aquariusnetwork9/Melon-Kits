@@ -47,7 +47,37 @@ Also worth an afternoon:
   all lines is not evidence about an individual.
 - **Fuzzy-match thresholds set from data** rather than from taste.
 
-All of it is DuckDB against the CSVs directly. Convert to Parquet if you'll iterate.
+**`kit-app/tools/mine.py` does this.** It deliberately reuses `screening.normalise` and
+`screening.scan` rather than folding in SQL: mine with a different normaliser and you get
+variants that look right and then fail to match at runtime, because the bot folds differently.
+One normaliser, or the exercise is worthless.
+
+```bash
+# the bulk dump: 468 MB zipped, 2.08 GB out, chats.csv is 740 MB / 6,701,781 rows
+curl -O https://cdn.2b2t.vc/vcdb-2025.zip && unzip vcdb-2025.zip
+
+# 1. what people actually type, ranked. ~3 minutes over the full corpus.
+python tools/mine.py discover --chats chats.csv --out tokens.tsv --top 6000
+
+# 2. put the NORMALISED forms (column 2) in a lexicon, then see what they really catch
+python tools/mine.py test --chats chats.csv --lexicon lexicon.json --out report.txt
+```
+
+The report is the part that matters. Per term: lines hit, **base rate per 1,000 lines**, every
+real spelling ranked by frequency, and sample lines. Read it for three things:
+
+- **A high base rate means the term is ambient register, not evidence about a person.**
+  Profanity will look like this. That is the expected result, not a fault in the term.
+- **Sample lines full of innocent uses** mean the term wants an `exceptions` entry.
+- **Spellings you did not predict** are the whole point — and you do not need to add them,
+  because the normaliser already folds them onto the same form.
+
+Both outputs go to a file rather than stdout, and sample lines are coordinate-redacted first:
+the dump is real chat, and the coordinates in it are real people's bases.
+
+The corpus holds 733,514 distinct normalised tokens, so search it for terms you already have
+in mind rather than reading top to bottom. The frequency table's real job is showing you the
+*variants* of words you already care about.
 
 This is where the corpus earns its keep, and it explains why the live collector runs
 continuously: the filter changes *what* gets said, but the mining target is **how people spell
