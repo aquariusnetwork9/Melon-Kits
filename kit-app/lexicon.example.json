@@ -1,47 +1,95 @@
 {
-  "_readme": [
-    "Copy to lexicon.json and point screening.lexicon_path at it. This file ships almost",
-    "empty on purpose -- the terms that matter are the ones your own community actually",
-    "sees, and a lexicon written from imagination is a lexicon of spellings nobody uses.",
-    "",
-    "Populate it by MINING, not guessing. Against the 2025 bulk dump (see",
-    "docs/chat-screening.md): normalise the corpus, group by normalised form, then read",
-    "back the ORIGINAL spellings ranked by frequency. Nobody guesses the top twenty",
-    "variants correctly. You do not need to list evasion spellings here -- the normaliser",
-    "already folds case, accents, separators, repeated characters and digit/symbol",
-    "substitutions, so one entry covers its whole family. 'badword' matches 'b4dw0rd',",
-    "'B-A-D W0RD' and 'baaadwooord' on its own.",
-    "",
-    "'exceptions' is how you kill a substring collision: the innocent word is blanked out",
-    "before anything looks for a term inside it, so 'grapefruit' can suppress 'grape'",
-    "cleanly. Find the ones you need by running a candidate term across the 6.7M lines of",
-    "the dump and reading what it catches.",
-    "",
-    "There is no weight or severity field, deliberately. A weight is a score with extra",
-    "steps, and a score gets read as the verdict. The output is counts; the reviewer reads",
-    "the lines."
-  ],
-
   "categories": {
     "off_game": {
-      "note": "Leaves the game. This is the category that should actually change a decision -- targeting someone as a person rather than as a player.",
-      "terms": ["doxx", "dox you", "swat you", "ip grab", "ip logger", "irl threat"],
+      "note": "Leaves the game -- targeting a person rather than a player. The only category that should reliably change a decision.",
+      "terms": [
+        "doxx",
+        "dox you",
+        "doxxed",
+        "doxxing",
+        "ip grab",
+        "ip grabber",
+        "ip logger",
+        "ip log",
+        "grab your ip",
+        "got your ip",
+        "pull your ip",
+        "swat you",
+        "swatted",
+        "swatting",
+        "call the swat",
+        "your address",
+        "know where you live",
+        "find your house",
+        "come to your house",
+        "show up at your",
+        "your real name",
+        "irl threat",
+        "kill you irl",
+        "kill you in real",
+        "hurt you irl",
+        "stab you irl",
+        "shoot up your",
+        "your parents",
+        "your mother lives",
+        "post your info",
+        "leak your info",
+        "ddos you",
+        "ddos your",
+        "booter",
+        "grabify"
+      ],
       "exceptions": []
     },
     "slur": {
-      "note": "Add your own. Intentionally empty in the repository -- a public checkout is not the place for a slur list, and yours should come from what your community actually sees.",
+      "note": "Counted, never scored. Context is not visible to a keyword list, so a reviewer reads the lines.",
       "terms": [],
+      "exceptions": [
+        "scunthorpe",
+        "penistone",
+        "cockburn",
+        "faggot pasta"
+      ]
+    },
+    "scam": {
+      "note": "Kit-relevant in its own right: someone running stash scams is a different question from someone swearing.",
+      "terms": [
+        "free stash",
+        "double your",
+        "trust trade",
+        "trust me bro trade",
+        "send first",
+        "you go first",
+        "free diamonds",
+        "free elytra",
+        "giving away kits",
+        "click this link",
+        "free alt",
+        "alt generator",
+        "free cape"
+      ],
       "exceptions": []
     },
     "profanity": {
-      "note": "Present so the count is visible, NOT so it counts against anyone. Profanity is 2b2t's ambient register: flagging it flags practically everyone, including the people handing out the kits. Expect this number to be high and to mean nothing.",
+      "note": "Present so the count is VISIBLE, not so it counts against anyone. 2b2t's ambient register -- expect a high base rate that means nothing.",
       "terms": [],
       "exceptions": []
-    },
-    "scam": {
-      "note": "Kit-relevant: someone running stash scams is a different question from someone swearing.",
-      "terms": ["free stash", "double your", "trust trade"],
-      "exceptions": []
     }
-  }
+  },
+  "_readme": [
+    "Copy to lexicon.json (gitignored) and point screening.lexicon_path at it.",
+    "",
+    "The slur and profanity lists ship EMPTY on purpose. A public repository is the wrong",
+    "place for them, and yours should come from mining your own corpus rather than from",
+    "imagination -- see docs/chat-screening.md and tools/mine.py.",
+    "",
+    "Put the NORMALISED form in 'terms'. One entry covers its whole spelling family: the",
+    "normaliser folds case, accents, separators, repeated characters and digit/symbol",
+    "substitutions, so 'badword' already matches 'b4dw0rd', 'BaAaDword' and 'b\u00e1dword'.",
+    "",
+    "Mind the length floor. A term whose NORMALISED form is under 6 characters only ever",
+    "matches a whole token -- it will not fire inside a longer word, and it will not be",
+    "caught when spelled out with separators. That is deliberate: measured against the",
+    "2025 dump, relaxing it flagged 26% of all chat."
+  ]
 }

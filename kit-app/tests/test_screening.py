@@ -72,9 +72,15 @@ class NormaliseCase(unittest.TestCase):
         matching raw strings."""
         l = lex(a={"terms": ["kill"]})
         self.assertEqual(l.categories["a"]["terms"], ["kil"])
-        for spelling in ("kill", "kiiiill", "k i l l", "k1ll"):
+        for spelling in ("kill", "kiiiill", "k1ll", "KILL", "kíll"):
             self.assertEqual(len(screening.scan(spelling, l)), 1,
                              "%r did not match" % (spelling,))
+        # ...but NOT spelled out with separators. `kill` folds to `kil`, three characters,
+        # and separator-spanning is only accepted at six or more -- below that the letters
+        # fall adjacent across ordinary word boundaries far too often to be a signal. This
+        # is a real and deliberate loss of coverage, bought for not flagging a quarter of
+        # all chat. Long terms keep it; see the evasion test below.
+        self.assertEqual(screening.scan("k i l l", l), [])
 
 
 class ScanCase(unittest.TestCase):
@@ -91,19 +97,94 @@ class ScanCase(unittest.TestCase):
         hits = screening.scan("i will s w a t you", lex(t={"terms": ["swat you"]}))
         self.assertEqual(len(hits), 1)
 
-    def test_exception_kills_a_substring_collision(self):
-        """The Scunthorpe family. The innocent word is blanked out *before* anything looks
-        for a substring inside it, so the collision cannot occur rather than being filtered
-        after the fact."""
-        catless = lex(a={"terms": ["grape"]})
-        self.assertEqual(len(screening.scan("i ate a grapefruit", catless)), 1)
-        with_exc = lex(a={"terms": ["grape"], "exceptions": ["grapefruit"]})
-        self.assertEqual(screening.scan("i ate a grapefruit", with_exc), [])
+    def test_a_short_term_cannot_fire_inside_a_longer_word(self):
+        """The Scunthorpe family, now structurally impossible rather than filtered.
+
+        A term under 6 characters only ever matches a whole token, so it cannot appear
+        inside an innocent word at all -- no exception entry required.
+        """
+        l = lex(a={"terms": ["grape"]})
+        self.assertEqual(screening.scan("i ate a grapefruit", l), [])
+        self.assertEqual(len(screening.scan("i ate a grape", l)), 1)
+
+    def test_the_collapse_collisions_that_flagged_a_quarter_of_all_chat(self):
+        """Measured against the 2025 bulk dump, plain substring matching flagged 25.9% of
+        every line. Normalisation collapses doubles, so `ass` -> `as`, `hell` -> `hel`,
+        `coon` -> `con`, and a substring search fired those inside ordinary words. `as`
+        alone hit 1.18 million lines."""
+        for term, innocent in (("ass", "that was a big ask"),
+                               ("hell", "hello there, need help?"),
+                               ("coon", "i lost control of my connection"),
+                               ("piss", "nice pistol"),
+                               ("abo", "what about it")):
+            l = lex(a={"terms": [term]})
+            self.assertEqual(screening.scan(innocent, l), [],
+                             "%r wrongly fired on %r" % (term, innocent))
+
+    def test_numbers_do_not_fold_into_words(self):
+        """The biggest false-positive source found in the 2025 bulk dump.
+
+        The fold maps 6->g, 0->o, 4->a, 8->b, so on a Minecraft server -- where people talk
+        in distances and coordinates all day -- `60k` normalises to `gok` and `480` to `abo`.
+        Those produced tens of thousands of false hits against 18 genuine ones. A match whose
+        original text is more digits than letters is a number, because leet substitution
+        writes *letters as digits* and still leaves a minority of digits.
+        """
+        for term, number in (("gook", "60k"), ("gook", "600k"), ("gook", "90k")):
+            l = lex(a={"terms": [term]})
+            self.assertEqual(screening.scan("base is %s out" % number, l), [],
+                             "%r wrongly fired on %r" % (term, number))
+        # ...while genuine leet spelling, which is mostly letters, still matches.
+        l = lex(a={"terms": ["gook"]})
+        self.assertEqual(len(screening.scan("g00k", l)), 1)
+        l2 = lex(a={"terms": ["badword"]})
+        self.assertEqual(len(screening.scan("b4dw0rd", l2)), 1)
+
+    def test_a_long_term_still_matches_inside_a_compound(self):
+        l = lex(a={"terms": ["badword"]})
+        self.assertEqual(len(screening.scan("badwordery", l)), 1)
+
+    def test_a_short_term_does_not_match_letters_that_merely_fall_adjacent(self):
+        """The last big false-positive source in the bulk dump.
+
+        A three-letter term finds its letters lying consecutively across a word boundary
+        constantly: `gok` matched `gg/ok`-shaped spans 22,245 times, `abo` matched `a bo`
+        15,439, `hel` matched `he l` 31,273. Spelling a word out with separators is only a
+        recognisable evasion when the word is long enough for that to be deliberate.
+        """
+        for term, innocent in (("gook", "gg/ok mate"), ("abo", "a bomb"),
+                               ("hell", "he left"), ("piss", "a pistol")):
+            l = lex(a={"terms": [term]})
+            self.assertEqual(screening.scan(innocent, l), [],
+                             "%r wrongly fired on %r" % (term, innocent))
+
+    def test_separator_evasion_spanning_tokens_is_still_caught(self):
+        """The whole reason whole-line matching was attractive. A match is accepted across
+        tokens only when the original span really does cross a separator, which no innocent
+        single word can do."""
+        l = lex(a={"terms": ["badword"]})
+        for spelling in ("b a d w o r d", "b.a.d.w.o.r.d", "b-a-d w0rd", "BAD WORD"):
+            self.assertEqual(len(screening.scan("you %s here" % spelling, l)), 1,
+                             "%r was not caught" % spelling)
+
+    def test_the_infix_threshold_applies_to_the_NORMALISED_length(self):
+        """Easy to trip over: `kitten` collapses to `kiten`, five characters, so it is
+        treated as a short term and will not fire inside `kittenish`. The threshold is about
+        the folded form, not what you typed."""
+        self.assertEqual(screening.normalise("kitten")[0], "kiten")
+        l = lex(a={"terms": ["kitten"]})
+        self.assertEqual(screening.scan("that is kittenish", l), [])
+        self.assertEqual(len(screening.scan("a kitten", l)), 1)
+
+    def test_exception_suppresses_an_infix_match(self):
+        l = lex(a={"terms": ["badword"]})
+        self.assertEqual(len(screening.scan("that is badwordery", l)), 1)
+        with_exc = lex(a={"terms": ["badword"], "exceptions": ["badwordery"]})
+        self.assertEqual(screening.scan("that is badwordery", with_exc), [])
 
     def test_exception_does_not_hide_a_real_hit_elsewhere_in_the_line(self):
-        l = lex(a={"terms": ["grape"], "exceptions": ["grapefruit"]})
-        hits = screening.scan("grapefruit but also grape", l)
-        self.assertEqual(len(hits), 1)
+        l = lex(a={"terms": ["badword"], "exceptions": ["badwordery"]})
+        self.assertEqual(len(screening.scan("badwordery but also badword", l)), 1)
 
     def test_repeated_term_counts_each_occurrence(self):
         hits = screening.scan("kitten kitten kitten", lex(a={"terms": ["kitten"]}))
