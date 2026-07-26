@@ -22,7 +22,7 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 STATUS_OPEN = "open"
 STATUS_APPROVED = "approved"
@@ -39,7 +39,11 @@ CREATE TABLE IF NOT EXISTS tickets (
     discord_user_id INTEGER NOT NULL,
     mc_name         TEXT    NOT NULL,
     mc_uuid         TEXT,
+    -- The applicant-facing private thread: conversation only, never the reviewer card.
     thread_id       INTEGER,
+    -- The staff forum post holding the card, the decision and the claim. A forum post's
+    -- starter message shares the thread's id, so this one column locates both.
+    queue_thread_id INTEGER,
     status          TEXT    NOT NULL,
     note            TEXT,
     created_at      INTEGER NOT NULL,
@@ -48,6 +52,9 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE INDEX IF NOT EXISTS ix_tickets_user   ON tickets(discord_user_id, status);
 CREATE INDEX IF NOT EXISTS ix_tickets_uuid   ON tickets(mc_uuid);
 CREATE INDEX IF NOT EXISTS ix_tickets_thread ON tickets(thread_id);
+-- ix_tickets_queue is created in _migrate(), NOT here. This script runs before the column
+-- migration, so indexing queue_thread_id at this point fails outright on a database written
+-- by a version that predates the column.
 
 CREATE TABLE IF NOT EXISTS decisions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,16 +127,37 @@ class Store(object):
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.executescript(_SCHEMA)
+        self._migrate()
         cur = self._db.execute("SELECT value FROM meta WHERE key='schema_version'")
         row = cur.fetchone()
         if row is None:
             self._db.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)",
+                             (str(SCHEMA_VERSION),))
+        elif int(row["value"]) < SCHEMA_VERSION:
+            self._db.execute("UPDATE meta SET value=? WHERE key='schema_version'",
                              (str(SCHEMA_VERSION),))
         elif int(row["value"]) > SCHEMA_VERSION:
             raise RuntimeError(
                 "ledger at %s was written by a newer version (schema %s > %s); refusing to "
                 "open it read-write rather than risk mangling the kit history"
                 % (path, row["value"], SCHEMA_VERSION))
+
+    def _migrate(self) -> None:
+        """Additive column migrations.
+
+        CREATE TABLE IF NOT EXISTS silently leaves an existing table alone, so a database
+        made by an older version keeps the older columns and every later query referencing a
+        new one fails at runtime rather than at startup. Adding them here means an upgrade
+        never needs the ledger rebuilt -- which matters because the ledger is the one thing
+        in this project that cannot be regenerated.
+        """
+        have = {r["name"] for r in self._db.execute("PRAGMA table_info(tickets)")}
+        if "queue_thread_id" not in have:
+            self._db.execute("ALTER TABLE tickets ADD COLUMN queue_thread_id INTEGER")
+        # Unconditional, and outside the branch above: on a fresh database the column comes
+        # from CREATE TABLE, so a branch-local index would never be created there.
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_tickets_queue ON tickets(queue_thread_id)")
 
     def close(self) -> None:
         try:
@@ -162,6 +190,15 @@ class Store(object):
     def set_ticket_thread(self, ticket_id: int, thread_id: int) -> None:
         self._db.execute("UPDATE tickets SET thread_id=? WHERE id=?",
                          (int(thread_id), int(ticket_id)))
+
+    def set_queue_thread(self, ticket_id: int, queue_thread_id: int) -> None:
+        self._db.execute("UPDATE tickets SET queue_thread_id=? WHERE id=?",
+                         (int(queue_thread_id), int(ticket_id)))
+
+    def ticket_for_queue_thread(self, queue_thread_id: int) -> Optional[sqlite3.Row]:
+        return self._db.execute(
+            "SELECT * FROM tickets WHERE queue_thread_id=? ORDER BY id DESC LIMIT 1",
+            (int(queue_thread_id),)).fetchone()
 
     def set_ticket_uuid(self, ticket_id: int, mc_uuid: Optional[str],
                         mc_name: Optional[str] = None) -> None:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -216,6 +217,49 @@ class StoreCase(unittest.TestCase):
         again = store_mod.open_store(path)
         self.addCleanup(again.close)
         self.assertTrue(again.cooldown(21, discord_user_id=100)["blocked"])
+
+    def test_queue_thread_round_trips(self):
+        tid = self.st.create_ticket(100, "Alice", UUID_A)
+        self.st.set_queue_thread(tid, 777)
+        self.assertEqual(self.st.get_ticket(tid)["queue_thread_id"], 777)
+        self.assertEqual(self.st.ticket_for_queue_thread(777)["id"], tid)
+
+    def test_a_v1_ledger_gains_the_new_column_without_being_rebuilt(self):
+        """CREATE TABLE IF NOT EXISTS leaves an existing table alone, so without an explicit
+        migration a v1 database keeps v1 columns and every later query fails at runtime. The
+        ledger is the one thing here that cannot be regenerated, so an upgrade must never
+        require rebuilding it."""
+        path = os.path.join(self.dir, "v1.sqlite3")
+        # Build a v1-shaped tickets table: no queue_thread_id.
+        db = sqlite3.connect(path)
+        db.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version','1');
+            CREATE TABLE tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discord_user_id INTEGER NOT NULL, mc_name TEXT NOT NULL, mc_uuid TEXT,
+                thread_id INTEGER, status TEXT NOT NULL, note TEXT,
+                created_at INTEGER NOT NULL, closed_at INTEGER);
+            INSERT INTO tickets(discord_user_id, mc_name, status, created_at)
+                VALUES (100, 'Alice', 'open', 1750000000);
+        """)
+        db.commit()
+        db.close()
+
+        st = store_mod.open_store(path)
+        self.addCleanup(st.close)
+        cols = {r[1] for r in st._db.execute("PRAGMA table_info(tickets)")}
+        self.assertIn("queue_thread_id", cols)
+        # The pre-existing row survived, and the version was moved forward.
+        row = st.open_ticket_for(100)
+        self.assertEqual(row["mc_name"], "Alice")
+        self.assertIsNone(row["queue_thread_id"])
+        self.assertEqual(
+            st._db.execute("SELECT value FROM meta WHERE key='schema_version'")
+            .fetchone()["value"], str(store_mod.SCHEMA_VERSION))
+        # ...and the new column is usable straight away.
+        st.set_queue_thread(int(row["id"]), 999)
+        self.assertEqual(st.get_ticket(int(row["id"]))["queue_thread_id"], 999)
 
     def test_a_future_schema_is_refused_rather_than_mangled(self):
         path = self.st.path

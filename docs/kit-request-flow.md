@@ -38,24 +38,44 @@ this flow.
 Modal collects the Minecraft username and a free-text note. On submit, a **private thread**
 hangs off the panel channel with the applicant and the reviewer role in it.
 
-The bot posts the reviewer card into the thread. See [reviewing.md](reviewing.md) for what is
-on it and how to read it.
+The bot posts a **receipt** in that thread — and nothing else. The reviewer card goes to a
+separate **staff-only forum**, one post per ticket, tagged `awaiting review`. See
+[reviewing.md](reviewing.md) for what is on the card.
+
+**The applicant never sees the card.** It carries the ledger fan-out, the reviewer flag list
+and the screening counts. Showing someone the exact criteria applied to them exposes notes
+written about them and teaches them how to clear the bar next time — and the fan-out can name
+other accounts. That split is the whole reason there are two channels.
+
+**The panel channel has to be a text channel.** Forum posts are always public threads
+(`ForumChannel.create_thread` has no privacy parameter) and threads carry no permission
+overwrites of their own, so visibility follows the parent channel. Putting tickets in a forum
+would let every applicant read every other applicant's card. A Discord constraint, not a
+preference.
 
 ## 3. The decision
 
-Two buttons for the reviewer role: **Approve** and **Decline**. Decline opens a modal for the
-reason, which is required — the reason is what makes the ledger useful a year later, and an
-optional field is an empty field.
+Two buttons for the reviewer role on the queue post: **Approve** and **Decline**. Decline opens
+a modal for the reason, which is required — the reason is what makes the ledger useful a year
+later, and an optional field is an empty field.
 
-Both outcomes post into the thread and update the ledger.
+**The applicant is told the outcome, never the internal reason.** "Known alt of \<name\>" is
+written for whoever reads the ledger in a year, not for the person it describes. A decline
+points back at the panel, which already lists the three usual reasons, and says the decision
+isn't permanent. A reviewer who wants to say more can type it in the thread.
 
 ## 4. Dispatch
 
-An approval places a **dispatch ember** in the team channel: the username, the approval, and a
-**Claim** button. Whoever presses it — person or bot — owns the delivery, and the ember shows
-who claimed it.
+An approval **turns the same queue post into the dispatch**: retagged `approved`, a **Claim**
+button attached, the card left in place. Whoever presses Claim owns the delivery and is
+introduced in the applicant's thread. Marking delivered retags and archives the post —
+archived rather than locked, so a delivery that falls through afterwards can be reopened.
 
-Nothing about dispatch is automated. The ember is a claim board, not a queue.
+One post is therefore the entire record of a ticket — request, card, decision, claim, delivery
+— instead of a card in one channel and an ember in another, and tags make the queue filterable:
+`awaiting review`, `approved`, `declined`, `claimed`, `delivered`.
+
+Nothing about dispatch is automated. The queue is a claim board, not a work assigner.
 
 ---
 

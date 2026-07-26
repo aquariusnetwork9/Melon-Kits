@@ -2,7 +2,7 @@
   "discord": {
     "guild_id": 0,
     "panel_channel_id": 0,
-    "dispatch_channel_id": 0,
+    "queue_channel_id": 0,
     "reviewer_role_id": 0,
     "runner_role_id": 0
   },

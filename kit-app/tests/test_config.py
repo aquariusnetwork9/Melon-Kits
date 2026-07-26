@@ -114,6 +114,17 @@ class ConfigCase(unittest.TestCase):
         cfg = config.load_config(path, env={})
         self.assertIsNone(cfg["screening"]["lexicon_path"])
 
+    def test_queue_channel_replaced_dispatch_channel(self):
+        """The staff side is one forum now, so the old key must fail loudly rather than be
+        silently ignored on an existing deployment's config file."""
+        cfg = config.load_config(None, env={})
+        self.assertIn("queue_channel_id", cfg["discord"])
+        self.assertNotIn("dispatch_channel_id", cfg["discord"])
+        path = self.cfg_file({"discord": {"dispatch_channel_id": 123}})
+        with self.assertRaises(config.ConfigError) as ctx:
+            config.load_config(path, env={})
+        self.assertIn("dispatch_channel_id", str(ctx.exception))
+
     def test_env_name_mapping(self):
         self.assertEqual(config.env_name("vc.min_interval_s"),
                          "MELONKIT_VC_MIN_INTERVAL_S")

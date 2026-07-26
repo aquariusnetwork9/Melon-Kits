@@ -59,8 +59,8 @@ Fill in `melonkit.json`:
 | key | what it is |
 |---|---|
 | `discord.guild_id` | your server. Setting it makes slash-command updates appear instantly instead of taking up to an hour |
-| `discord.panel_channel_id` | the read-only channel the panel lives in; threads hang off it |
-| `discord.dispatch_channel_id` | where approvals post a claimable ember |
+| `discord.panel_channel_id` | the read-only **text** channel the panel lives in; private ticket threads hang off it. Cannot be a forum — see below |
+| `discord.queue_channel_id` | the **staff-only forum**. One post per ticket: card, decision, claim, delivery |
 | `discord.reviewer_role_id` | may approve, decline, flag, and run `/lookup`. Falls back to Manage Server if unset |
 | `discord.runner_role_id` | may claim a delivery. `0` means anyone who can see the channel |
 
@@ -82,6 +82,32 @@ Fill in `melonkit.json`:
 
 ---
 
+## Two channels, split by audience
+
+| channel | type | who can see it | holds |
+|---|---|---|---|
+| `#kit-requests` | **text**, public | everyone | the pinned panel, and a **private thread per ticket** — the applicant ↔ staff conversation |
+| `#kit-queue` | **forum**, staff only | reviewer + delivery | one post per ticket: the reviewer card, the decision, the claim, the delivery. Tags carry the state |
+
+**The applicant never sees the reviewer card.** Their thread gets a receipt, the outcome, and
+delivery coordination — nothing else. The card carries the ledger fan-out, the reviewer flag
+list and the screening counts; showing someone the exact criteria applied to them exposes
+notes written about them and teaches them how to game the next request. For the same reason a
+decline tells the applicant the outcome but **not** the internal reason, which is written for
+whoever reads the ledger in a year. A reviewer who wants to say more can just type in the
+thread.
+
+**The panel channel cannot be a forum, and this is a Discord limit rather than a preference.**
+`ForumChannel.create_thread` has no `type`/`private`/`invitable` parameter — forum posts are
+always public threads — and `Thread` has no `overwrites` and no `set_permissions`, so a
+thread's visibility strictly follows its parent channel. There is therefore no way to let one
+applicant into one post without letting them read every other ticket. `--post-panel` refuses
+a forum with that explanation rather than posting something broken.
+
+The queue forum wants three to five tags, matched case-insensitively:
+`awaiting review`, `approved`, `declined`, `claimed`, `delivered`. Missing ones are skipped,
+so a forum with no tags still works — you just lose the filtering.
+
 ## The flow, and why it is in this order
 
 1. **Button press → pre-checks → *then* the form.** Open-ticket and cooldown checks run
@@ -91,17 +117,21 @@ Fill in `melonkit.json`:
 2. **Modal submit → deferred.** Name resolution plus three API calls takes a few seconds, so
    the interaction is acknowledged immediately and the work continues behind the 15-minute
    follow-up token.
-3. **A private thread** with the applicant and the reviewer role, and the card posted into it.
-   If thread creation fails — the guild's ~1000 active-thread ceiling, or missing permissions
-   — the card goes to the channel instead. Losing the request would be worse than posting it
-   in the wrong place.
-4. **Approve / Decline.** Decline requires a reason; it is what makes the ledger legible a
+3. **A private thread** for the applicant, with a receipt in it. If thread creation fails —
+   the guild's ~1000 active-thread ceiling, or missing permissions — the ticket still goes to
+   the queue. Losing the request would be worse than losing the thread.
+4. **A queue post** with the card and Approve / Decline, tagged `awaiting review`.
+5. **Approve / Decline.** Decline requires a reason; it is what makes the ledger legible a
    year later, and an optional field is an empty field.
-5. **Approval posts a dispatch ember** with a Claim button, then Mark delivered. Claiming is a
-   conditional `UPDATE`, so two runners pressing at the same instant is resolved by the
-   database rather than by whichever callback ran second — the loser gets told who beat them.
+6. **Approval turns the same post into the dispatch** — retagged `approved`, Claim button
+   attached, card left in place. One post ends up being the entire record of a ticket rather
+   than a card in one channel and an ember in another. Claiming is a conditional `UPDATE`, so
+   two runners pressing at the same instant is resolved by the database rather than by
+   whichever callback ran second, and the loser is told who beat them. Delivery retags and
+   archives the post — archived, not locked, so a delivery that falls through after being
+   marked done can be reopened.
 
-Nothing about dispatch is automated. The ember is a claim board, not a queue.
+Nothing about dispatch is automated. The queue is a claim board, not a work assigner.
 
 ---
 

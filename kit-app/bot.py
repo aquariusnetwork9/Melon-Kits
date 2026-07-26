@@ -78,11 +78,11 @@ def may_claim(member: Any, cfg: Dict[str, Any]) -> bool:
     return any(r.id == role_id for r in getattr(member, "roles", []))
 
 
-# Dispatch state, expressed as forum tags when the dispatch channel is a forum. Tag names
-# are matched case-insensitively against whatever the channel already has, so an operator can
-# rename or restyle them without touching code -- a missing tag is skipped rather than being
-# an error, because a forum with no tags configured must still work.
-DISPATCH_TAGS = ("unclaimed", "claimed", "delivered")
+# A ticket's whole lifecycle, expressed as forum tags on its queue post. Tag names are
+# matched case-insensitively against whatever the channel already has, so they can be renamed
+# or restyled without touching code -- a missing tag is skipped rather than being an error,
+# because a forum with no tags configured must still work.
+QUEUE_TAGS = ("awaiting review", "approved", "declined", "claimed", "delivered")
 
 
 def _state_tags(forum: "discord.ForumChannel", state: str) -> list:
@@ -90,22 +90,23 @@ def _state_tags(forum: "discord.ForumChannel", state: str) -> list:
     return [t for t in forum.available_tags if t.name.casefold() == want]
 
 
-async def _set_dispatch_state(channel: Any, state: str) -> None:
-    """Move a forum post's tags to `state`. No-op for a text-channel dispatch."""
+async def _set_queue_state(channel: Any, state: str, *,
+                           archive: bool = False) -> None:
+    """Move a queue post's tags to `state`. No-op when the queue is a plain text channel."""
     if not isinstance(channel, discord.Thread):
         return
-    parent = channel.parent
-    if not isinstance(parent, discord.ForumChannel):
+    if not isinstance(channel.parent, discord.ForumChannel):
         return
-    tags = _state_tags(parent, state)
-    if not tags:
-        return
+    tags = _state_tags(channel.parent, state)
     try:
-        await channel.edit(applied_tags=tags)
+        if tags:
+            await channel.edit(applied_tags=tags, archived=archive or False)
+        elif archive:
+            await channel.edit(archived=True)
     except discord.HTTPException as exc:
-        # Cosmetic. A dispatch whose tag is stale is still a dispatch, and failing the
-        # claim over it would be worse than a wrong label.
-        LOG.warning("could not set dispatch tag state=%s thread=%s status=%s",
+        # Cosmetic. A post whose tag is stale is still the record of the ticket, and failing
+        # the decision over a label would be strictly worse than a wrong label.
+        LOG.warning("could not set queue tag state=%s thread=%s status=%s",
                     state, channel.id, getattr(exc, "status", "?"))
 
 
@@ -443,7 +444,47 @@ class KitBot(discord.Client):
         except Exception:
             LOG.error("could not record shown chats ticket=%d", ticket_id)
 
-        target = thread or interaction.channel
+        # The applicant's thread gets a receipt and nothing else. The reviewer card must
+        # never land here: it carries the ledger fan-out, the reviewer flag list and the
+        # screening counts, and showing someone the exact criteria applied to them both
+        # exposes notes written about them and teaches them how to game the next request.
+        if thread is not None:
+            try:
+                await thread.send(
+                    "Thanks %s - this is request **#%d** for `%s`.\n\n"
+                    "A reviewer will look at it when someone's around. Help here is "
+                    "voluntary, so there's no queue position to give you, and a kit isn't "
+                    "guaranteed. You don't need to do anything else - if it's approved, "
+                    "whoever is delivering will message you in this thread to sort out "
+                    "where to meet." % (user.mention, ticket_id, canonical))
+            except discord.HTTPException:
+                LOG.warning("could not post receipt to applicant thread ticket=%d", ticket_id)
+
+        posted = await self._post_queue_card(ticket_id, canonical, user, built, thread)
+        if not posted:
+            await interaction.followup.send(
+                "Your request was recorded as **#%d**, but I couldn't post it to the review "
+                "queue - a reviewer will have to pick it up by hand. Nothing you need to do."
+                % ticket_id, ephemeral=True)
+            return
+
+        where = "<#%d>" % thread.id if thread is not None else "a reviewer thread"
+        await interaction.followup.send(
+            "Request #%d is in, and %s is yours to follow it in. Help is voluntary, so "
+            "there's no queue position to give you - but you don't need to do anything else."
+            % (ticket_id, where), ephemeral=True)
+
+    async def _post_queue_card(self, ticket_id: int, mc_name: str, user: Any,
+                               built: Dict[str, Any],
+                               thread: Optional[discord.Thread]) -> bool:
+        """Put the reviewer card in the staff-only queue. Returns False if it could not."""
+        channel_id = int(self.cfg["discord"]["queue_channel_id"] or 0)
+        channel = self.get_channel(channel_id) if channel_id else None
+        if channel is None:
+            LOG.error("queue channel %s unavailable, ticket=%d has no card posted",
+                      channel_id, ticket_id)
+            return False
+
         view = discord.ui.View(timeout=None)
         view.add_item(ApproveButton(ticket_id))
         view.add_item(DeclineButton(ticket_id))
@@ -452,28 +493,53 @@ class KitBot(discord.Client):
         if built["chat_lines"]:
             files.append(discord.File(
                 io.BytesIO(card_mod.chat_dump(built).encode("utf-8")),
-                filename="chat-%s-ticket%d.txt" % (canonical, ticket_id)))
+                filename="chat-%s-ticket%d.txt" % (mc_name, ticket_id)))
 
         role_id = int(self.cfg["discord"]["reviewer_role_id"] or 0)
-        mention = "<@&%d>" % role_id if role_id else ""
-        try:
-            await target.send(
-                content="%s Ticket #%d - requested by %s" % (mention, ticket_id, user.mention),
-                embed=_embed_for(built, self.cfg), view=view, files=files,
-                allowed_mentions=discord.AllowedMentions(roles=True, users=True))
-        except discord.HTTPException as exc:
-            LOG.error("could not post reviewer card ticket=%d status=%s",
-                      ticket_id, getattr(exc, "status", "?"))
-            await interaction.followup.send(
-                "Your request was recorded as #%d, but I couldn't post the review card. "
-                "A reviewer will need to look at it manually." % ticket_id, ephemeral=True)
-            return
+        header = "%sTicket #%d - requested by %s%s" % (
+            "<@&%d> " % role_id if role_id else "", ticket_id, user.mention,
+            "\nApplicant thread: <#%d>" % thread.id if thread is not None else "")
+        mentions = discord.AllowedMentions(roles=True, users=True)
 
-        where = "<#%d>" % thread.id if thread is not None else "this channel"
-        await interaction.followup.send(
-            "Request #%d is in. A reviewer will pick it up in %s when someone's around. "
-            "Help is voluntary, so there's no queue position to give you - but you don't "
-            "need to do anything else." % (ticket_id, where), ephemeral=True)
+        try:
+            if isinstance(channel, discord.ForumChannel):
+                created = await channel.create_thread(
+                    name="#%d %s" % (ticket_id, mc_name),
+                    content=header, embed=_embed_for(built, self.cfg), view=view,
+                    files=files, allowed_mentions=mentions,
+                    applied_tags=_state_tags(channel, "awaiting review"))
+                # A forum post's starter message shares the thread's id, so storing the
+                # thread id is enough to find and edit the card later.
+                self.store.set_queue_thread(ticket_id, created.thread.id)
+            else:
+                msg = await channel.send(content=header,
+                                         embed=_embed_for(built, self.cfg), view=view,
+                                         files=files, allowed_mentions=mentions)
+                self.store.set_queue_thread(ticket_id, msg.id)
+            return True
+        except discord.HTTPException as exc:
+            LOG.error("could not post queue card ticket=%d status=%s",
+                      ticket_id, getattr(exc, "status", "?"))
+            return False
+
+    async def _queue_post(self, ticket: Any):
+        """(thread_or_None, partial_message_or_None) for a ticket's queue post."""
+        qid = ticket["queue_thread_id"]
+        if not qid:
+            return None, None
+        channel = self.get_channel(int(qid))
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(int(qid))
+            except (discord.HTTPException, discord.NotFound):
+                channel = None
+        if isinstance(channel, discord.Thread):
+            return channel, channel.get_partial_message(channel.id)
+        # Text-channel queue: qid is a message id inside queue_channel_id.
+        parent = self.get_channel(int(self.cfg["discord"]["queue_channel_id"] or 0))
+        if isinstance(parent, discord.TextChannel):
+            return None, parent.get_partial_message(int(qid))
+        return None, None
 
     async def _open_thread(self, interaction: discord.Interaction, ticket_id: int,
                            mc_name: str) -> Optional[discord.Thread]:
@@ -524,26 +590,61 @@ class KitBot(discord.Client):
         LOG.info("ticket decided ticket=%d outcome=%s reviewer=%s",
                  ticket_id, outcome, interaction.user.id)
 
+        # Re-read: record_decision changed the status, and the queue id may have been set
+        # after the row we were handed was fetched.
+        ticket = self.store.get_ticket(ticket_id) or ticket
+        qthread, qmsg = await self._queue_post(ticket)
+
         if not approve:
             if not interaction.response.is_done():
                 await interaction.response.send_message(
-                    "Ticket #%d declined. Reason recorded." % ticket_id, ephemeral=True)
+                    "Ticket #%d declined. Reason recorded in the ledger." % ticket_id,
+                    ephemeral=True)
+            if qmsg is not None:
+                try:
+                    await qmsg.edit(
+                        content="Ticket #%d - **declined** by %s\n> %s"
+                                % (ticket_id, interaction.user.mention, reason or ""),
+                        view=None, allowed_mentions=discord.AllowedMentions.none())
+                except discord.HTTPException:
+                    LOG.warning("could not update declined queue post ticket=%d", ticket_id)
+            await _set_queue_state(qthread, "declined", archive=True)
+            # The applicant is told the outcome, never the internal reason: that text is
+            # written for whoever reads the ledger in a year, and it names the criteria and
+            # sometimes other accounts. A reviewer who wants to say more can just type in
+            # the thread.
             await self._notify_thread(
-                ticket, "Ticket #%d was **declined**.\n> %s" % (ticket_id, reason or ""))
+                ticket,
+                "Request #%d wasn't approved this time. We don't go into specifics, but the "
+                "usual reasons are on the request panel. This isn't permanent - you're "
+                "welcome to ask again later." % ticket_id)
             return
 
         kit_id = self.store.record_kit(ticket_id, int(ticket["discord_user_id"]),
                                        str(ticket["mc_name"]), ticket["mc_uuid"])
-        posted = await self._post_dispatch(ticket, kit_id)
+
+        # The same post becomes the dispatch: one post is the entire record of a ticket.
+        if qmsg is not None:
+            claim_view = discord.ui.View(timeout=None)
+            claim_view.add_item(ClaimButton(kit_id))
+            try:
+                await qmsg.edit(
+                    content="Ticket #%d - **approved** by %s\nDispatch #%d, unclaimed."
+                            % (ticket_id, interaction.user.mention, kit_id),
+                    view=claim_view, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                LOG.warning("could not attach claim button ticket=%d kit=%d",
+                            ticket_id, kit_id)
+        await _set_queue_state(qthread, "approved")
+
         await _safe_followup(
             interaction,
-            "Ticket #%d approved and dispatch #%d %s." % (
-                ticket_id, kit_id,
-                "posted" if posted else "recorded (couldn't reach the dispatch channel)"))
+            "Ticket #%d approved. Dispatch #%d is claimable on this post." % (ticket_id, kit_id))
         await self._notify_thread(
             ticket,
-            "Ticket #%d is **approved**. Someone will claim the delivery and get in touch. "
-            "Times aren't guaranteed - everyone here is a volunteer." % ticket_id)
+            "Request #%d is **approved**. Someone will claim the delivery and message you "
+            "here to sort out where to meet. Times aren't guaranteed - everyone here is a "
+            "volunteer." % ticket_id)
 
     async def _notify_thread(self, ticket: Any, text: str) -> None:
         thread_id = ticket["thread_id"]
@@ -558,38 +659,6 @@ class KitBot(discord.Client):
             LOG.warning("could not post to thread=%s", thread_id)
 
     # -------------------------------------------------------------- the dispatch
-
-    async def _post_dispatch(self, ticket: Any, kit_id: int) -> bool:
-        channel_id = int(self.cfg["discord"]["dispatch_channel_id"] or 0)
-        channel = self.get_channel(channel_id) if channel_id else None
-        if channel is None:
-            LOG.error("dispatch channel %s unavailable, kit=%d recorded anyway",
-                      channel_id, kit_id)
-            return False
-        embed = discord.Embed(
-            title="Kit dispatch #%d" % kit_id,
-            description="**%s** - approved from ticket #%d.\nUnclaimed."
-                        % (ticket["mc_name"], ticket["id"]),
-            colour=discord.Colour.from_str("#8CBF5E"))
-        embed.set_footer(text="UUID %s" % (ticket["mc_uuid"] or "unresolved"))
-        view = discord.ui.View(timeout=None)
-        view.add_item(ClaimButton(kit_id))
-        try:
-            if isinstance(channel, discord.ForumChannel):
-                # A forum is the better home for this: each dispatch is a post, and the tags
-                # below make the queue filterable instead of scrollable. Note you cannot
-                # `send` to a forum at all -- a post IS a thread, so this is create_thread.
-                await channel.create_thread(
-                    name="kit #%d - %s" % (kit_id, ticket["mc_name"]),
-                    embed=embed, view=view,
-                    applied_tags=_state_tags(channel, "unclaimed"))
-            else:
-                await channel.send(embed=embed, view=view)
-            return True
-        except discord.HTTPException as exc:
-            LOG.error("dispatch post failed kit=%d status=%s", kit_id,
-                      getattr(exc, "status", "?"))
-            return False
 
     async def handle_claim(self, interaction: discord.Interaction, kit_id: int) -> None:
         if not may_claim(interaction.user, self.cfg):
@@ -613,17 +682,22 @@ class KitBot(discord.Client):
             return
 
         LOG.info("dispatch claimed kit=%d by=%s", kit_id, interaction.user.id)
-        embed = discord.Embed(
-            title="Kit dispatch #%d" % kit_id,
-            description="**%s** - claimed by %s."
-                        % (kit["mc_name"], interaction.user.mention),
-            colour=discord.Colour.from_str("#2E6B3F"))
         view = discord.ui.View(timeout=None)
         view.add_item(DeliveredButton(kit_id))
         # The interaction response has to land first -- it is on a 3-second clock. Retagging
-        # is a separate call and is allowed to be slow or to fail.
-        await interaction.response.edit_message(embed=embed, view=view)
-        await _set_dispatch_state(interaction.channel, "claimed")
+        # is a separate call and is allowed to be slow or to fail. Only the content changes:
+        # the reviewer card embed stays put, because the post is the record of the ticket.
+        await interaction.response.edit_message(
+            content="Dispatch #%d - claimed by %s." % (kit_id, interaction.user.mention),
+            view=view, allowed_mentions=discord.AllowedMentions.none())
+        await _set_queue_state(interaction.channel, "claimed")
+        # Tell the applicant who is coming, in their own thread.
+        if kit["ticket_id"]:
+            ticket = self.store.get_ticket(int(kit["ticket_id"]))
+            if ticket is not None:
+                await self._notify_thread(
+                    ticket, "%s has picked up this delivery and will sort out a meeting "
+                            "point with you here." % interaction.user.mention)
 
     async def handle_delivered(self, interaction: discord.Interaction,
                                kit_id: int) -> None:
@@ -644,23 +718,19 @@ class KitBot(discord.Client):
                 "Dispatch #%d was already marked delivered." % kit_id, ephemeral=True)
             return
         LOG.info("dispatch delivered kit=%d by=%s", kit_id, interaction.user.id)
-        embed = discord.Embed(
-            title="Kit dispatch #%d - delivered" % kit_id,
-            description="**%s** - delivered by %s. \U0001F348"
-                        % (kit["mc_name"], interaction.user.mention),
-            colour=discord.Colour.from_str("#4A4A4A"))
-        await interaction.response.edit_message(embed=embed, view=None)
-        await _set_dispatch_state(interaction.channel, "delivered")
-        # Closing the post keeps the forum's default view to live work without deleting the
-        # record. Archived rather than locked, so it can be reopened if a delivery falls
-        # through after being marked done.
-        if isinstance(interaction.channel, discord.Thread) and \
-                isinstance(interaction.channel.parent, discord.ForumChannel):
-            try:
-                await interaction.channel.edit(archived=True)
-            except discord.HTTPException:
-                LOG.warning("could not archive delivered dispatch thread=%s",
-                            interaction.channel.id)
+        await interaction.response.edit_message(
+            content="Dispatch #%d - delivered by %s. \U0001F348"
+                    % (kit_id, interaction.user.mention),
+            view=None, allowed_mentions=discord.AllowedMentions.none())
+        # Archived, not locked: the forum's default view stays on live work without losing
+        # the record, and a delivery that falls through after being marked done can be
+        # reopened.
+        await _set_queue_state(interaction.channel, "delivered", archive=True)
+        if kit["ticket_id"]:
+            ticket = self.store.get_ticket(int(kit["ticket_id"]))
+            if ticket is not None:
+                await self._notify_thread(
+                    ticket, "Marked delivered. Good luck out there \U0001F348")
 
 
 # ------------------------------------------------------------------------ commands

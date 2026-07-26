@@ -22,10 +22,14 @@ DEFAULTS: Dict[str, Any] = {
         # Name of the environment variable holding the bot token -- never the token itself.
         "token_env": "MELONKIT_DISCORD_TOKEN",
         "guild_id": 0,
-        # Read-only channel holding the pinned request panel. Threads hang off it.
+        # Read-only TEXT channel holding the pinned request panel. Private ticket threads
+        # hang off it. It cannot be a forum: forum posts can only be public threads, so
+        # every applicant would be able to read every other applicant's ticket.
         "panel_channel_id": 0,
-        # Where an approval posts its dispatch ember.
-        "dispatch_channel_id": 0,
+        # Staff-only FORUM channel. One post per ticket, carrying the reviewer card, the
+        # decision and the delivery claim -- the whole lifecycle in one place, with tags for
+        # state. A text channel also works; the forum just makes it filterable.
+        "queue_channel_id": 0,
         # May approve/decline and see reviewer cards.
         "reviewer_role_id": 0,
         # May claim a dispatch. 0 means "anyone in the dispatch channel".
