@@ -68,12 +68,26 @@ class ConfigCase(unittest.TestCase):
             "MELONKIT_POLICY_COOLDOWN_DAYS": "7",
             "MELONKIT_VC_MIN_INTERVAL_S": "2.5",
             "MELONKIT_SCREENING_ENABLED": "false",
-            "MELONKIT_DISCORD_GUILD_ID": "1234567890",
+            "MELONKIT_DISCORD_HOME_GUILD_ID": "1234567890",
         })
         self.assertEqual(cfg["policy"]["cooldown_days"], 7)
         self.assertAlmostEqual(cfg["vc"]["min_interval_s"], 2.5)
         self.assertIs(cfg["screening"]["enabled"], False)
-        self.assertEqual(cfg["discord"]["guild_id"], 1234567890)
+        self.assertEqual(cfg["discord"]["home_guild_id"], 1234567890)
+
+    def test_the_renamed_guild_id_key_still_loads(self):
+        """guild_id became home_guild_id when the bot went multi-guild. An unknown key is a
+        hard startup failure, so without an alias the rename would stop every existing
+        deployment booting -- a rude way to ship an upgrade."""
+        path = self.cfg_file({"discord": {"guild_id": 777}})
+        cfg = config.load_config(path, env={})
+        self.assertEqual(cfg["discord"]["home_guild_id"], 777)
+        self.assertNotIn("guild_id", cfg["discord"])
+
+    def test_an_explicit_new_key_wins_over_the_alias(self):
+        path = self.cfg_file({"discord": {"guild_id": 777, "home_guild_id": 888}})
+        self.assertEqual(
+            config.load_config(path, env={})["discord"]["home_guild_id"], 888)
 
     def test_non_numeric_env_override_is_fatal(self):
         with self.assertRaises(config.ConfigError):

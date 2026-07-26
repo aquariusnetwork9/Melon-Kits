@@ -115,11 +115,29 @@ class ConfigError(ValueError):
     """Raised for an unknown key, an untypeable value, or unreadable JSON."""
 
 
+# Renamed keys, old -> new. An unknown key is a hard startup failure by design, so a rename
+# would otherwise stop an existing deployment booting at all -- a rude way to ship an
+# upgrade. Aliases are accepted and mapped.
+_ALIASES = {("discord", "guild_id"): ("discord", "home_guild_id")}
+
+
+def _apply_aliases(doc: Dict[str, Any]) -> None:
+    for (sect, old), (nsect, new) in _ALIASES.items():
+        block = doc.get(sect)
+        if isinstance(block, dict) and old in block:
+            doc.setdefault(nsect, {})
+            if new not in doc[nsect]:
+                doc[nsect][new] = block[old]
+            del block[old]
+
+
 def load_config(path: Optional[str] = None,
                 env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULTS)
     if path:
-        _merge(cfg, _read_json(path), ())
+        doc = _read_json(path)
+        _apply_aliases(doc)
+        _merge(cfg, doc, ())
     _apply_env(cfg, os.environ if env is None else env)
     _validate(cfg)
     return cfg

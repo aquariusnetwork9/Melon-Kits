@@ -126,15 +126,17 @@ async def _set_queue_state(channel: Any, state: str, *,
                     state, channel.id, getattr(exc, "status", "?"))
 
 
-def panel_embed(cfg: Dict[str, Any]) -> discord.Embed:
-    """The pinned panel. Shared by /panel and --post-panel so the copy cannot drift."""
+def panel_embed(g: Dict[str, Any]) -> discord.Embed:
+    """The pinned panel. `g` is a merged per-guild config, so a server that overrides its
+    cooldown or its rescued counter gets its own copy. Shared by /setup, /panel and
+    --post-panel so the wording cannot drift between them."""
     return discord.Embed(
         title=PANEL_TITLE,
         description=PANEL_BODY.format(
-            cooldown=cfg["policy"]["cooldown_days"],
-            response_time=cfg["panel"]["response_time"],
-            rescued_count=cfg["panel"]["rescued_count"],
-            rescued_as_of=cfg["panel"]["rescued_as_of"]),
+            cooldown=g["cooldown_days"],
+            response_time=g["response_time"],
+            rescued_count=g["rescued_count"],
+            rescued_as_of=g["rescued_as_of"]),
         colour=discord.Colour.from_str("#2E6B3F"))
 
 
@@ -258,7 +260,7 @@ class DeclineButton(discord.ui.DynamicItem[discord.ui.Button],
 
     async def callback(self, interaction: discord.Interaction) -> None:
         app: KitBot = interaction.client            # type: ignore[assignment]
-        if not is_reviewer(interaction.user, app.cfg):
+        if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
             await interaction.response.send_message(
                 "Only reviewers can decide a request.", ephemeral=True)
             return
@@ -516,11 +518,13 @@ class KitBot(discord.Client):
             # would lose the pin and the position and leave stale panels with live buttons.
             existing = await find_existing_panel(channel)
             if existing is not None:
-                await existing.edit(embed=panel_embed(self.cfg), view=PanelView())
+                await existing.edit(embed=panel_embed(self.gcfg(channel.guild.id)),
+                                    view=PanelView())
                 LOG.info("existing panel updated channel=%d message=%d",
                          channel.id, existing.id)
                 return
-            msg = await channel.send(embed=panel_embed(self.cfg), view=PanelView())
+            msg = await channel.send(embed=panel_embed(self.gcfg(channel.guild.id)),
+                                     view=PanelView())
             LOG.info("panel posted channel=%d message=%d", channel.id, msg.id)
             try:
                 await msg.pin()
@@ -693,11 +697,11 @@ class KitBot(discord.Client):
             "there's no queue position to give you - but you don't need to do anything else."
             % (ticket_id, where), ephemeral=True)
 
-    async def _post_queue_card(self, ticket_id: int, mc_name: str, user: Any,
-                               built: Dict[str, Any],
+    async def _post_queue_card(self, g: Dict[str, Any], ticket_id: int, mc_name: str,
+                               user: Any, built: Dict[str, Any],
                                thread: Optional[discord.Thread]) -> bool:
         """Put the reviewer card in the staff-only queue. Returns False if it could not."""
-        channel_id = int(self.cfg["discord"]["queue_channel_id"] or 0)
+        channel_id = int(g.get("queue_channel_id") or 0)
         channel = self.get_channel(channel_id) if channel_id else None
         if channel is None:
             LOG.error("queue channel %s unavailable, ticket=%d has no card posted",
@@ -714,7 +718,7 @@ class KitBot(discord.Client):
                 io.BytesIO(card_mod.chat_dump(built).encode("utf-8")),
                 filename="chat-%s-ticket%d.txt" % (mc_name, ticket_id)))
 
-        role_id = int(self.cfg["discord"]["reviewer_role_id"] or 0)
+        role_id = int(g.get("reviewer_role_id") or 0)
         header = "%sTicket #%d - requested by %s%s" % (
             "<@&%d> " % role_id if role_id else "", ticket_id, user.mention,
             "\nApplicant thread: <#%d>" % thread.id if thread is not None else "")
@@ -755,15 +759,17 @@ class KitBot(discord.Client):
         if isinstance(channel, discord.Thread):
             return channel, channel.get_partial_message(channel.id)
         # Text-channel queue: qid is a message id inside queue_channel_id.
-        parent = self.get_channel(int(self.cfg["discord"]["queue_channel_id"] or 0))
+        parent = self.get_channel(
+            int(self.gcfg(ticket["guild_id"]).get("queue_channel_id") or 0))
         if isinstance(parent, discord.TextChannel):
             return None, parent.get_partial_message(int(qid))
         return None, None
 
-    async def _open_thread(self, interaction: discord.Interaction, ticket_id: int,
+    async def _open_thread(self, interaction: discord.Interaction, g: Dict[str, Any],
+                           ticket_id: int,
                            mc_name: str) -> Optional[discord.Thread]:
         channel = interaction.channel
-        panel_id = int(self.cfg["discord"]["panel_channel_id"] or 0)
+        panel_id = int(g.get("panel_channel_id") or 0)
         if panel_id:
             found = self.get_channel(panel_id)
             if isinstance(found, discord.TextChannel):
@@ -789,7 +795,9 @@ class KitBot(discord.Client):
 
     async def handle_decision(self, interaction: discord.Interaction, ticket_id: int,
                               approve: bool, reason: Optional[str] = None) -> None:
-        if not is_reviewer(interaction.user, self.cfg):
+        gid = interaction.guild_id
+        g = self.gcfg(gid)
+        if not is_reviewer(interaction.user, g):
             await _safe_followup(interaction, "Only reviewers can decide a request.")
             return
 
@@ -802,7 +810,7 @@ class KitBot(discord.Client):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
 
-        ticket = self.store.get_ticket(ticket_id)
+        ticket = self.store.get_ticket(ticket_id, gid)
         if ticket is None:
             await _safe_followup(interaction, "Ticket #%d no longer exists." % ticket_id)
             return
@@ -811,7 +819,7 @@ class KitBot(discord.Client):
         # Conditional at the database, not a read-then-write: this is what actually stops two
         # simultaneous reviewers both winning.
         if not self.store.record_decision(ticket_id, interaction.user.id, outcome, reason):
-            fresh = self.store.get_ticket(ticket_id)
+            fresh = self.store.get_ticket(ticket_id, gid)
             await _safe_followup(
                 interaction,
                 "Ticket #%d was already **%s** - somebody got there first, so nothing "
@@ -822,7 +830,7 @@ class KitBot(discord.Client):
 
         # Re-read: record_decision changed the status, and the queue id may have been set
         # after the row we were handed was fetched.
-        ticket = self.store.get_ticket(ticket_id) or ticket
+        ticket = self.store.get_ticket(ticket_id, gid) or ticket
         qthread, qmsg = await self._queue_post(ticket)
 
         if not approve:
@@ -853,7 +861,7 @@ class KitBot(discord.Client):
             await self._post_transcript(ticket_id)
             return
 
-        kit_id = self.store.record_kit(ticket_id, int(ticket["discord_user_id"]),
+        kit_id = self.store.record_kit(gid, ticket_id, int(ticket["discord_user_id"]),
                                        str(ticket["mc_name"]), ticket["mc_uuid"])
 
         # The same post becomes the dispatch: one post is the entire record of a ticket.
@@ -895,7 +903,7 @@ class KitBot(discord.Client):
                                    "auto-closed: applicant thread was deleted")
         LOG.info("ticket auto-closed on thread delete ticket=%s thread=%s",
                  row["id"], thread.id)
-        fresh = self.store.get_ticket(int(row["id"])) or row
+        fresh = self.store.get_ticket(int(row["id"])) or row  # thread ids are unique
         qthread, qmsg = await self._queue_post(fresh)
         if qmsg is not None:
             try:
@@ -908,7 +916,7 @@ class KitBot(discord.Client):
 
     async def _thread_conversation(self, ticket: Any) -> Optional[str]:
         """The applicant thread's messages, oldest first. None when unavailable."""
-        if not self.cfg["discord"]["capture_thread_messages"] or not ticket["thread_id"]:
+        if not self.gcfg(ticket["guild_id"]).get("capture_thread_messages")                 or not ticket["thread_id"]:
             return None
         ch = self.get_channel(int(ticket["thread_id"]))
         if ch is None:
@@ -956,7 +964,11 @@ class KitBot(discord.Client):
         Built from the ledger rather than by scraping Discord, so it still works after the
         thread and the queue post are gone -- which is the situation it exists for.
         """
-        channel_id = int(self.cfg["discord"]["transcript_channel_id"] or 0)
+        t0 = self.store.get_ticket(ticket_id)
+        if t0 is None:
+            return
+        g = self.gcfg(t0["guild_id"])
+        channel_id = int(g.get("transcript_channel_id") or 0)
         if not channel_id:
             return
         channel = self.get_channel(channel_id)
@@ -1059,7 +1071,7 @@ class KitBot(discord.Client):
         parts += ["", "APPLICANT THREAD CONVERSATION"]
         if convo:
             parts.append(convo)
-        elif self.cfg["discord"]["capture_thread_messages"]:
+        elif g.get("capture_thread_messages"):
             parts.append("  (unavailable - the thread was already deleted, or its content "
                          "could not be read; see the bot log)")
         else:
@@ -1092,11 +1104,13 @@ class KitBot(discord.Client):
     # -------------------------------------------------------------- the dispatch
 
     async def handle_claim(self, interaction: discord.Interaction, kit_id: int) -> None:
-        if not may_claim(interaction.user, self.cfg):
+        gid = interaction.guild_id
+        g = self.gcfg(gid)
+        if not may_claim(interaction.user, g):
             await interaction.response.send_message(
                 "You're not on the delivery team for this.", ephemeral=True)
             return
-        kit = self.store.get_kit(kit_id)
+        kit = self.store.get_kit(kit_id, gid)
         if kit is None:
             await interaction.response.send_message(
                 "Dispatch #%d no longer exists." % kit_id, ephemeral=True)
@@ -1105,7 +1119,7 @@ class KitBot(discord.Client):
         # Conditional UPDATE, so two people pressing at once is resolved by the database
         # rather than by whichever callback happened to run second.
         if not self.store.claim_kit(kit_id, interaction.user.id):
-            holder = self.store.get_kit(kit_id)
+            holder = self.store.get_kit(kit_id, gid)
             who = "<@%d>" % int(holder["claimed_by"]) if holder and holder["claimed_by"] \
                 else "someone else"
             await interaction.response.send_message(
@@ -1132,14 +1146,16 @@ class KitBot(discord.Client):
 
     async def handle_delivered(self, interaction: discord.Interaction,
                                kit_id: int) -> None:
-        kit = self.store.get_kit(kit_id)
+        gid = interaction.guild_id
+        g = self.gcfg(gid)
+        kit = self.store.get_kit(kit_id, gid)
         if kit is None:
             await interaction.response.send_message(
                 "Dispatch #%d no longer exists." % kit_id, ephemeral=True)
             return
         claimer = kit["claimed_by"]
         if claimer and int(claimer) != interaction.user.id \
-                and not is_reviewer(interaction.user, self.cfg):
+                and not is_reviewer(interaction.user, g):
             await interaction.response.send_message(
                 "<@%d> claimed this one - they or a reviewer can close it." % int(claimer),
                 ephemeral=True)
@@ -1169,25 +1185,240 @@ class KitBot(discord.Client):
 
 # ------------------------------------------------------------------------ commands
 
+SETUP_TAGS = [
+    ("awaiting review", "\U0001F552"), ("approved", "✅"), ("declined", "\U0001F6AB"),
+    ("claimed", "\U0001F91D"), ("delivered", "\U0001F348"), ("closed", "\U0001F5C3"),
+]
+
+
+async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
+                         runner: Optional[discord.Role]) -> Dict[str, Any]:
+    """Create (or adopt) the three channels. Returns their ids plus a readable report.
+
+    Idempotent: a channel with the expected name is reused rather than duplicated, so a
+    second /setup after a partial failure finishes the job instead of making a mess.
+
+    Overwrites are only set **at creation**. Editing them afterwards needs Manage Roles
+    ("Manage Permissions"), a different permission from Manage Channels and one this bot
+    deliberately does not ask for -- so an adopted channel keeps whatever permissions it
+    already has, and the report says so rather than implying it was configured.
+    """
+    me = guild.me
+    everyone = guild.default_role
+    notes: list = []
+    out: Dict[str, Any] = {}
+
+    def find(name, cls):
+        return next((c for c in guild.channels
+                     if c.name == name and isinstance(c, cls)), None)
+
+    # --- public requests channel: readable by all, postable by none ----------
+    ch = find("kit-requests", discord.TextChannel)
+    if ch is None:
+        ow = {
+            everyone: discord.PermissionOverwrite(
+                view_channel=True, read_message_history=True, send_messages=False,
+                create_public_threads=False, create_private_threads=False,
+                # True so an applicant can still reply inside their own ticket thread.
+                send_messages_in_threads=True),
+            me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, embed_links=True, attach_files=True,
+                read_message_history=True, create_private_threads=True,
+                send_messages_in_threads=True, manage_threads=True, manage_messages=True),
+        }
+        if reviewer:
+            ow[reviewer] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True,
+                send_messages_in_threads=True, manage_threads=True)
+        ch = await guild.create_text_channel(
+            "kit-requests", overwrites=ow, reason="Melon Kits setup",
+            topic="Ask for a kit. Press the button on the pinned panel - each request "
+                  "opens a private thread just for you.")
+        notes.append("created %s" % ch.mention)
+    else:
+        notes.append("reused %s (existing permissions left alone)" % ch.mention)
+    out["panel_channel_id"] = ch.id
+
+    # --- staff queue: a forum, invisible to @everyone ------------------------
+    forum = find("kit-queue", discord.ForumChannel)
+    if forum is None:
+        qow = {
+            everyone: discord.PermissionOverwrite(view_channel=False),
+            me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, embed_links=True, attach_files=True,
+                read_message_history=True, create_public_threads=True,
+                send_messages_in_threads=True, manage_threads=True, manage_messages=True),
+        }
+        for role in (reviewer, runner):
+            if role:
+                qow[role] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True,
+                    send_messages_in_threads=True, attach_files=True, embed_links=True)
+        forum = await guild.create_forum(
+            "kit-queue", overwrites=qow, reason="Melon Kits setup",
+            available_tags=[discord.ForumTag(name=n, emoji=e) for n, e in SETUP_TAGS],
+            topic="Staff only. One post per request: the reviewer card, the decision and "
+                  "the delivery claim. Filter by tag.")
+        notes.append("created %s with %d tags" % (forum.mention, len(SETUP_TAGS)))
+    else:
+        have = {t.name.casefold() for t in forum.available_tags}
+        added = 0
+        for name, emoji in SETUP_TAGS:
+            if name.casefold() not in have:
+                try:
+                    await forum.create_tag(name=name, emoji=emoji)
+                    added += 1
+                except discord.HTTPException:
+                    break
+        notes.append("reused %s%s" % (forum.mention,
+                                      " (+%d tags)" % added if added else ""))
+    out["queue_channel_id"] = forum.id
+
+    # --- staff archive: text, read-only for humans ---------------------------
+    arch = find("kit-archive", discord.TextChannel)
+    if arch is None:
+        aow = {
+            everyone: discord.PermissionOverwrite(view_channel=False),
+            me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, embed_links=True,
+                attach_files=True, read_message_history=True),
+        }
+        for role in (reviewer, runner):
+            if role:
+                aow[role] = discord.PermissionOverwrite(
+                    view_channel=True, read_message_history=True, send_messages=False,
+                    create_public_threads=False, create_private_threads=False)
+        arch = await guild.create_text_channel(
+            "kit-archive", overwrites=aow, reason="Melon Kits setup",
+            topic="Staff only, append-only. One transcript per finished ticket, with the "
+                  "chat log attached, so the record outlives the thread and the post.")
+        notes.append("created %s" % arch.mention)
+    else:
+        notes.append("reused %s" % arch.mention)
+    out["transcript_channel_id"] = arch.id
+
+    out["notes"] = notes
+    return out
+
+
 def register_commands(app: KitBot) -> None:
     tree = app.tree
 
+    @tree.command(name="setup",
+                  description="Set this server up for kit requests: makes the channels and "
+                              "posts the panel.")
+    @app_commands.describe(
+        reviewer_role="Who may approve, decline and see reviewer cards",
+        delivery_role="Who may claim a delivery (defaults to the reviewer role)")
+    async def setup(interaction: discord.Interaction,
+                    reviewer_role: discord.Role,
+                    delivery_role: Optional[discord.Role] = None) -> None:
+        """The whole install: three channels, the tags, the config, the panel.
+
+        Gated on Manage Server rather than the reviewer role, because at this point there is
+        no reviewer role configured -- gating setup on the thing setup creates would be a
+        chicken-and-egg lockout.
+        """
+        if interaction.guild is None:
+            await interaction.response.send_message("Run this in a server.", ephemeral=True)
+            return
+        if not is_admin(interaction.user):
+            await interaction.response.send_message(
+                "You need **Manage Server** to set the bot up.", ephemeral=True)
+            return
+
+        me = interaction.guild.me
+        missing = [n for n in ("manage_channels", "send_messages", "embed_links",
+                               "attach_files", "create_private_threads", "manage_threads")
+                   if not getattr(me.guild_permissions, n)]
+        if missing:
+            # Checked up front: a half-finished setup is worse than one that refuses.
+            await interaction.response.send_message(
+                "I'm missing these server permissions, so setup would half-finish:\n%s\n\n"
+                "Re-invite me with them and run `/setup` again. **Manage Channels is only "
+                "needed for setup** - you can remove it afterwards."
+                % "\n".join("- `%s`" % m.replace("_", " ") for m in missing),
+                ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            built = await build_channels(interaction.guild, reviewer_role,
+                                         delivery_role or reviewer_role)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Discord refused to create a channel. That is usually my role sitting below "
+                "the roles it is being asked to grant, or a category overwrite beating mine.",
+                ephemeral=True)
+            return
+
+        values = {k: v for k, v in built.items() if k != "notes"}
+        values["reviewer_role_id"] = reviewer_role.id
+        values["runner_role_id"] = (delivery_role or reviewer_role).id
+        app.store.set_guild_config(interaction.guild.id, values)
+        LOG.info("guild configured guild=%s by=%s", interaction.guild.id,
+                 interaction.user.id)
+
+        g = app.gcfg(interaction.guild.id)
+        panel_channel = interaction.guild.get_channel(built["panel_channel_id"])
+        try:
+            existing = await find_existing_panel(panel_channel)
+            if existing is not None:
+                await existing.edit(embed=panel_embed(g), view=PanelView())
+                panel_note = "updated the panel already in %s" % panel_channel.mention
+            else:
+                msg = await panel_channel.send(embed=panel_embed(g), view=PanelView())
+                panel_note = "posted the panel in %s" % panel_channel.mention
+                try:
+                    await msg.pin()
+                    panel_note += " and pinned it"
+                except discord.HTTPException:
+                    # Pin Messages is its own permission, separate from Manage Messages.
+                    panel_note += (" (couldn't pin - that needs the separate **Pin "
+                                   "Messages** permission; harmless, nobody else can post "
+                                   "there so it stays the newest message)")
+        except discord.HTTPException:
+            panel_note = ("couldn't post the panel - run `/panel` in %s once I can post "
+                          "there" % panel_channel.mention)
+
+        embed = discord.Embed(
+            title="\U0001F348 Melon Kits is set up",
+            description="\n".join("- %s" % n for n in built["notes"] + [panel_note]),
+            colour=discord.Colour.from_str("#2E6B3F"))
+        embed.add_field(
+            name="Roles",
+            value="Reviewers: %s\nDelivery: %s"
+                  % (reviewer_role.mention, (delivery_role or reviewer_role).mention),
+            inline=False)
+        embed.add_field(
+            name="What happens now",
+            value="People press the button in %s. Reviewers get a card in the queue with "
+                  "Approve and Decline, and finished tickets archive themselves.\n\n"
+                  "`/setup` is safe to re-run - it reuses whatever already exists. "
+                  "**Manage Channels was only needed for setup and can be removed now.**"
+                  % panel_channel.mention,
+            inline=False)
+        embed.set_footer(text="This server's tickets, cooldowns and flags are its own.")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
     @tree.command(name="panel", description="Post the kit-request panel in this channel.")
     async def panel(interaction: discord.Interaction) -> None:
-        if not is_reviewer(interaction.user, app.cfg):
+        if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
             await interaction.response.send_message(
                 "Only reviewers can post the panel.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         existing = await find_existing_panel(interaction.channel)
         if existing is not None:
-            await existing.edit(embed=panel_embed(app.cfg), view=PanelView())
+            await existing.edit(embed=panel_embed(app.gcfg(interaction.guild_id)),
+                                view=PanelView())
             await interaction.followup.send(
                 "Updated the panel that was already here, so it keeps its pin and its place. "
                 "Run this again after editing any `panel` value in the config.",
                 ephemeral=True)
             return
-        await interaction.channel.send(embed=panel_embed(app.cfg), view=PanelView())
+        await interaction.channel.send(
+            embed=panel_embed(app.gcfg(interaction.guild_id)), view=PanelView())
         await interaction.followup.send(
             "Panel posted - pin it. The button keeps working indefinitely, so it only needs "
             "posting once; running /panel again edits it in place rather than adding another.",
@@ -1204,7 +1435,7 @@ def register_commands(app: KitBot) -> None:
     ])
     async def flag(interaction: discord.Interaction, mc_name: str,
                    kind: app_commands.Choice[str], note: str) -> None:
-        if not is_reviewer(interaction.user, app.cfg):
+        if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
             await interaction.response.send_message(
                 "Only reviewers can set flags.", ephemeral=True)
             return
@@ -1219,7 +1450,8 @@ def register_commands(app: KitBot) -> None:
             # A flag on a name alone still beats losing the knowledge, but it follows the
             # name rather than the account, so say so plainly.
             pass
-        flag_id = app.store.set_flag(kind.value, interaction.user.id, uuid, mc_name, note)
+        flag_id = app.store.set_flag(interaction.guild_id, kind.value,
+                                     interaction.user.id, uuid, mc_name, note)
         await interaction.followup.send(
             "Flagged **%s** as `%s` (flag #%d).%s" % (
                 mc_name, kind.value, flag_id,
@@ -1229,18 +1461,18 @@ def register_commands(app: KitBot) -> None:
 
     @tree.command(name="unflag", description="Clear a flag by its id.")
     async def unflag(interaction: discord.Interaction, flag_id: int) -> None:
-        if not is_reviewer(interaction.user, app.cfg):
+        if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
             await interaction.response.send_message(
                 "Only reviewers can clear flags.", ephemeral=True)
             return
-        ok = app.store.clear_flag(flag_id)
+        ok = app.store.clear_flag(interaction.guild_id, flag_id)
         await interaction.response.send_message(
             "Flag #%d cleared." % flag_id if ok
             else "Flag #%d isn't set (or was already cleared)." % flag_id, ephemeral=True)
 
     @tree.command(name="lookup", description="Build a reviewer card without opening a ticket.")
     async def lookup(interaction: discord.Interaction, mc_name: str) -> None:
-        if not is_reviewer(interaction.user, app.cfg):
+        if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
             await interaction.response.send_message(
                 "Only reviewers can run a lookup.", ephemeral=True)
             return
@@ -1258,7 +1490,8 @@ def register_commands(app: KitBot) -> None:
         except identity.IdentityError:
             pass
         built = await loop.run_in_executor(None, lambda: card_mod.gather(
-            mc_name, uuid, interaction.user.id, app.cfg, app.vc, app.store, app.lex, LOG))
+            interaction.guild_id, mc_name, uuid, interaction.user.id, app.cfg, app.vc,
+            app.store, app.lex, LOG))
         files = []
         if built["chat_lines"]:
             files.append(discord.File(
@@ -1272,7 +1505,7 @@ def register_commands(app: KitBot) -> None:
     @app_commands.describe(ticket="Ticket number",
                            lines="Line numbers from the attached chat log, e.g. 3,7,12")
     async def flagline(interaction: discord.Interaction, ticket: int, lines: str) -> None:
-        if not is_reviewer(interaction.user, app.cfg):
+        if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
             await interaction.response.send_message(
                 "Only reviewers can label chat.", ephemeral=True)
             return
@@ -1283,6 +1516,10 @@ def register_commands(app: KitBot) -> None:
         if not positions:
             await interaction.response.send_message(
                 "Give me line numbers from the attached log, e.g. `3,7,12`.", ephemeral=True)
+            return
+        if app.store.get_ticket(ticket, interaction.guild_id) is None:
+            await interaction.response.send_message(
+                "There's no ticket #%d in this server." % ticket, ephemeral=True)
             return
         done = sum(1 for p in positions if app.store.flag_chat(ticket, p))
         await interaction.response.send_message(
@@ -1306,13 +1543,13 @@ def register_commands(app: KitBot) -> None:
         only frees their own slot, and needing to find a staff member to do it is friction
         with no upside.
         """
-        row = app.store.get_ticket(ticket)
+        row = app.store.get_ticket(ticket, interaction.guild_id)
         if row is None:
             await interaction.response.send_message(
                 "There's no ticket #%d." % ticket, ephemeral=True)
             return
         mine = int(row["discord_user_id"]) == interaction.user.id
-        if not (mine or is_reviewer(interaction.user, app.cfg)):
+        if not (mine or is_reviewer(interaction.user, app.gcfg(interaction.guild_id))):
             await interaction.response.send_message(
                 "Only reviewers, or the person who opened it, can close a ticket.",
                 ephemeral=True)
@@ -1329,7 +1566,7 @@ def register_commands(app: KitBot) -> None:
         LOG.info("ticket closed ticket=%d by=%s self=%s",
                  ticket, interaction.user.id, mine)
 
-        row = app.store.get_ticket(ticket) or row
+        row = app.store.get_ticket(ticket, interaction.guild_id) or row
         qthread, qmsg = await app._queue_post(row)
         if qmsg is not None:
             try:
@@ -1366,7 +1603,7 @@ def register_commands(app: KitBot) -> None:
         """For a runner who said they'd do it and can't, or a reviewer prising a stale claim
         off someone who has gone quiet. Leaves the ticket approved -- the kit is still owed,
         it just needs somebody else."""
-        row = app.store.get_kit(kit)
+        row = app.store.get_kit(kit, interaction.guild_id)
         if row is None:
             await interaction.response.send_message(
                 "There's no dispatch #%d." % kit, ephemeral=True)
@@ -1381,7 +1618,7 @@ def register_commands(app: KitBot) -> None:
             return
 
         holder = int(row["claimed_by"])
-        reviewer = is_reviewer(interaction.user, app.cfg)
+        reviewer = is_reviewer(interaction.user, app.gcfg(interaction.guild_id))
         if holder == interaction.user.id:
             ok = app.store.unclaim_kit(kit, interaction.user.id)
         elif reviewer:
@@ -1402,7 +1639,8 @@ def register_commands(app: KitBot) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         # Put the Claim button back on the queue post and return it to `approved`.
-        ticket = app.store.get_ticket(int(row["ticket_id"])) if row["ticket_id"] else None
+        ticket = (app.store.get_ticket(int(row["ticket_id"]), interaction.guild_id)
+                  if row["ticket_id"] else None)
         if ticket is not None:
             qthread, qmsg = await app._queue_post(ticket)
             if qmsg is not None:
@@ -1426,7 +1664,7 @@ def register_commands(app: KitBot) -> None:
 
     @tree.command(name="ledger", description="Kit history and flags for an account.")
     async def ledger(interaction: discord.Interaction, mc_name: str) -> None:
-        if not is_reviewer(interaction.user, app.cfg):
+        if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
             await interaction.response.send_message(
                 "Only reviewers can read the ledger.", ephemeral=True)
             return
@@ -1442,7 +1680,8 @@ def register_commands(app: KitBot) -> None:
 
         text = ["**%s**%s" % (mc_name, "" if uuid else "  *(UUID unresolved - name only)*")]
 
-        kits = app.store.kit_history(mc_uuid=uuid, limit=10) if uuid else []
+        kits = (app.store.kit_history(interaction.guild_id, mc_uuid=uuid, limit=10)
+                if uuid else [])
         if kits:
             for k in kits:
                 when = card_mod.ago(card_mod.parse_ts_epoch(k["created_at"]))
@@ -1452,11 +1691,13 @@ def register_commands(app: KitBot) -> None:
         else:
             text.append("No kits on record for this account.")
 
-        cd = app.store.cooldown(app.cfg["policy"]["cooldown_days"], mc_uuid=uuid)
+        cd = app.store.cooldown(interaction.guild_id,
+                                app.gcfg(interaction.guild_id)["cooldown_days"],
+                                mc_uuid=uuid)
         text.append("Cooldown: %s" % ("**%d day(s) left**" % cd["days_left"]
                                       if cd["blocked"] else "clear"))
 
-        flags = app.store.flags_for(mc_uuid=uuid, mc_name=mc_name)
+        flags = app.store.flags_for(interaction.guild_id, mc_uuid=uuid, mc_name=mc_name)
         text.append("Flags: %s" % (", ".join(
             "#%d %s" % (f["id"], f["kind"]) for f in flags) or "none"))
 

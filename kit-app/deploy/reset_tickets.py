@@ -73,6 +73,8 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="show what would go")
     ap.add_argument("--delete-discord", action="store_true",
                     help="also delete the applicant threads and queue posts")
+    ap.add_argument("--guild", type=int, default=0,
+                    help="only clear this guild (default: every guild)")
     ap.add_argument("--flags-too", action="store_true",
                     help="also drop reviewer flags (kept by default)")
     args = ap.parse_args(argv)
@@ -92,7 +94,8 @@ def main(argv=None):
                                      and not args.flags_too else ""))
 
     targets = []
-    for r in db.execute("SELECT id, thread_id, queue_thread_id FROM tickets"):
+    where = " WHERE guild_id=%d" % args.guild if args.guild else ""
+    for r in db.execute("SELECT id, thread_id, queue_thread_id FROM tickets" + where):
         if r["thread_id"]:
             targets.append(("applicant thread (ticket %s)" % r["id"], int(r["thread_id"])))
         if r["queue_thread_id"]:
@@ -116,10 +119,21 @@ def main(argv=None):
 
     db.execute("BEGIN")
     try:
-        for t in TICKET_TABLES:
-            db.execute("DELETE FROM %s" % t)
-        if args.flags_too:
-            db.execute("DELETE FROM flags")
+        if args.guild:
+            # Child rows carry no guild of their own, so they are reached through the
+            # tickets that do -- and must go BEFORE those tickets disappear.
+            for t in ("shown_chats", "decisions"):
+                db.execute("DELETE FROM %s WHERE ticket_id IN "
+                           "(SELECT id FROM tickets WHERE guild_id=?)" % t, (args.guild,))
+            db.execute("DELETE FROM kits WHERE guild_id=?", (args.guild,))
+            db.execute("DELETE FROM tickets WHERE guild_id=?", (args.guild,))
+            if args.flags_too:
+                db.execute("DELETE FROM flags WHERE guild_id=?", (args.guild,))
+        else:
+            for t in TICKET_TABLES:
+                db.execute("DELETE FROM %s" % t)
+            if args.flags_too:
+                db.execute("DELETE FROM flags")
         # Restart the id counters so the next ticket is #1 again -- this is a reset, and
         # ticket numbers carrying over from deleted test data is just confusing.
         db.execute("DELETE FROM sqlite_sequence WHERE name IN "
