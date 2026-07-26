@@ -63,8 +63,9 @@ async def drive(cfg, token, mc_name, user_id, cleanup_id):
             member = guild.get_member(user_id) or await guild.fetch_member(user_id)
             log("requester: %s" % member)
 
-            # 1. identity
-            resolved = identity.resolve(mc_name, cfg)
+            # 1. identity -- also off the event loop, as the handler does it
+            resolved = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: identity.resolve(mc_name, cfg))
             uuid, canonical = resolved["uuid"], resolved["name"]
             log("resolved %s -> %s" % (canonical, uuid))
 
@@ -85,10 +86,15 @@ async def drive(cfg, token, mc_name, user_id, cleanup_id):
                 "Smoke test for request **#%d** (`%s`). This is what an applicant sees - "
                 "a receipt, and nothing from the reviewer card." % (ticket_id, canonical))
 
-            # 4. the card, from live 2b2t data
+            # 4. the card, from live 2b2t data -- and deliberately through
+            #    run_in_executor, exactly as the handler does. Calling gather directly on
+            #    this thread is what let the store's cross-thread ProgrammingError reach
+            #    production with a green smoke test, so the executor is load-bearing here
+            #    rather than incidental.
             lex = screening.Lexicon.load(cfg["screening"]["lexicon_path"])
-            built = card_mod.gather(canonical, uuid, member.id, cfg,
-                                    vc_mod.Client(cfg), st, lex)
+            loop = asyncio.get_running_loop()
+            built = await loop.run_in_executor(None, lambda: card_mod.gather(
+                canonical, uuid, member.id, cfg, vc_mod.Client(cfg), st, lex))
             log("card built: tracked=%s deaths=%d chats=%d coords_redacted=%d errors=%d"
                 % (built["tracked"], len(built["deaths"]), len(built["chat_lines"]),
                    built["coords_redacted"], len(built["errors"])))
