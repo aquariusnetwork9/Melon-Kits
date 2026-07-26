@@ -75,6 +75,49 @@ writable path (`/var/lib/melonkit`). Consequences worth knowing before editing t
 
 Verify any edit with `systemd-analyze verify /etc/systemd/system/melonkit-bot.service`.
 
+## Never run bot.py as root
+
+`KitBot.__init__` opens the ledger, so **any** invocation creates or touches
+`/var/lib/melonkit/melonkit.sqlite3` — including `--post-panel` and `--print-config`. Run one
+of those under `sudo` and the database ends up `root`-owned, at which point the service (which
+runs as `ubuntu`) can read it but not write, and the very first ticket fails with
+`attempt to write a readonly database`. It does not fail at startup, because
+`CREATE TABLE IF NOT EXISTS` on an existing schema writes nothing — so the bot connects to
+Discord looking perfectly healthy and breaks on first use.
+
+The token lives in a root-only file, which is what makes this tempting. Use `systemd-run` so
+systemd reads the file as root and the process still runs as `ubuntu`:
+
+```bash
+sudo systemd-run --uid=ubuntu --pipe --wait --collect \
+  --property=EnvironmentFile=/etc/melonkit/env \
+  --property=WorkingDirectory=/home/ubuntu/melon-kits/kit-app \
+  /home/ubuntu/melon-kits/kit-app/.venv/bin/python bot.py --config melonkit.json --post-panel <CHANNEL_ID>
+```
+
+If it has already happened:
+
+```bash
+sudo systemctl stop melonkit-bot
+sudo chown ubuntu:ubuntu /var/lib/melonkit/melonkit.sqlite3*
+sudo chmod 640 /var/lib/melonkit/melonkit.sqlite3*
+sudo systemctl start melonkit-bot
+```
+
+Verify by actually writing, not by reading — a read succeeds either way.
+
+## Pinning needs its own permission
+
+Discord split pinning out of Manage Messages into a separate **`Pin Messages`** permission, so
+a bot holding Manage Messages still gets `403 / 50013` on a pin while every client-side
+permission check says it should work. `discord.py` exposes it as `Permissions.pin_messages`.
+
+It is optional for this app: `@everyone` cannot post in the requests channel, so the panel is
+permanently the newest message whether or not it is pinned. `setup_channels.py` only adds it to
+the bot's overwrite when the bot actually holds it guild-wide, because an overwrite cannot
+grant a permission the granter lacks and including it unconditionally would fail the whole
+channel create.
+
 ## Host gotchas hit during setup
 
 - **`python3-venv` is not installed by default on Ubuntu 25.04**, and `python3 -c "import

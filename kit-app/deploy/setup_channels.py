@@ -81,6 +81,18 @@ async def run(cfg, token):
             sys.stderr.write("  reviewer role: %s\n" % (reviewer.name if reviewer else "NONE"))
             sys.stderr.write("  delivery role: %s\n" % (runner.name if runner else "NONE"))
 
+            # Discord split pinning out of Manage Messages into its own `pin_messages`
+            # permission, so a bot with manage_messages still gets 403/50013 on a pin. It is
+            # only added to the overwrite when the bot actually holds it guild-wide: an
+            # overwrite may not grant a permission the granter lacks, so including it
+            # unconditionally would fail the whole channel create/edit call.
+            can_pin = bool(me.guild_permissions.pin_messages)
+            extra = {"pin_messages": True} if can_pin else {}
+            if not can_pin:
+                sys.stderr.write("  note: bot lacks pin_messages, so the panel cannot be "
+                                 "pinned. Harmless -- nobody else can post in the channel, "
+                                 "so the panel stays the newest message.\n")
+
             # ---------------------------------------------------------- requests
             ch = find_channel(guild, REQUESTS_NAME, discord.TextChannel)
             ow = {
@@ -94,7 +106,7 @@ async def run(cfg, token):
                     view_channel=True, send_messages=True, embed_links=True,
                     attach_files=True, read_message_history=True,
                     create_private_threads=True, send_messages_in_threads=True,
-                    manage_threads=True, manage_messages=True),
+                    manage_threads=True, manage_messages=True, **extra),
             }
             if reviewer:
                 ow[reviewer] = discord.PermissionOverwrite(

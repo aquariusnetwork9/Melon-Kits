@@ -40,9 +40,16 @@ application, add a bot, copy the token into `MELONKIT_DISCORD_TOKEN`.
 Discord-history lookup; the request flow uses interactions, which need nothing special. A bot
 that refuses to start without an intent it barely uses is a bot that does not start.
 
-Invite it with `bot` + `applications.commands` and these permissions: View Channels, Send
-Messages, Send Messages in Threads, Create Private Threads, Manage Threads, Embed Links,
-Attach Files.
+Invite it with `bot` + `applications.commands`. Permissions integer **2252194950925312** for
+normal running, or **2252194950933520** if you want the bot to create its own channels via
+`deploy/setup_channels.py` (that adds Manage Channels and Manage Messages, both of which can
+be removed again once setup is done).
+
+**`Pin Messages` is a separate permission from `Manage Messages`.** Discord split pinning out
+into its own permission bit, so a bot holding Manage Messages still gets `403 / 50013` when it
+tries to pin — the permission check passes and the API refuses anyway. It is optional here:
+`@everyone` cannot post in the requests channel, so the panel stays the newest message
+permanently whether or not it is pinned.
 
 Then, as a reviewer, in your read-only requests channel:
 
