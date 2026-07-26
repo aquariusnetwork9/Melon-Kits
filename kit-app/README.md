@@ -184,6 +184,15 @@ unreadable rather than recording a wall of blank lines.
    before the modal opens, against local SQLite, comfortably inside Discord's 3-second
    deadline. Making somebody fill in a form and only then telling them they were never
    eligible is the one avoidable bad experience in this flow.
+
+   The panel has **two** buttons — rescue kit and project funding — rather than one form with a
+   type selector inside it, and that is a platform constraint rather than a preference: a modal
+   is submitted whole, so it cannot change its own questions once somebody picks a type. Asking
+   a builder "anything we should know?" and a rescue applicant "how big is this?" in the same
+   box makes both answers unusable. The cooldown pre-check is per kind, so being funded for a
+   build does not stop you asking for a rescue kit when you die; the **one-open-ticket rule is
+   deliberately not** per kind, because two open tickets is two threads and two cards for one
+   person, and being stuck open is the most expensive failure this app has.
 2. **Modal submit → deferred.** Name resolution plus three API calls takes a few seconds, so
    the interaction is acknowledged immediately and the work continues behind the 15-minute
    follow-up token.
@@ -199,9 +208,16 @@ unreadable rather than recording a wall of blank lines.
    ledger legible a year later, and an optional field is an empty field.
 6. **Approval turns the same post into the dispatch** — retagged `approved`, Claim button
    attached, card left in place. One post ends up being the entire record of a ticket rather
-   than a card in one channel and an ember in another.
+   than a card in one channel and an ember in another. The applicant's thread simultaneously
+   gets a **Set meeting coordinates** button; whatever they enter appears on the queue post and
+   in the claim confirmation, so the runner does not have to ask.
 7. **Claim → Mark delivered**, then the post retags, archives, and the **transcript is written
    to the archive**.
+
+Every view that replaces the card re-adds the **Chat history** button. That is not tidiness: an
+edit which omits `attachments` leaves them alone, so the chat log used to survive all of step 6
+and 7 for free as a file — components get no such treatment, and without re-adding it a decided
+ticket would lose its chat at exactly the moment a reviewer goes back to check something.
 
 **Every state two people can trigger at once is conditional at the database, not a
 read-then-write.** Approve and Claim both return whether the caller won, and the loser is told
@@ -230,7 +246,14 @@ Ordered by what settles a decision fastest — see
 3. **Kit ledger.** Cooldown checked against the Discord id **and** the UUID independently,
    because either alone is trivially sidestepped.
 4. **Reviewer flags.**
-5. **Recent chat**, attached as a file, with lexicon counts beside it.
+5. **Recent chat** — lexicon counts on the card, and a **Chat history** button that pages the
+   lines themselves in an ephemeral panel rather than making you download a file to read them.
+
+A **project funding** card leads with **The ask** instead — what the project is, what they need
+and roughly how big it is. The two kinds are judged on close to opposite evidence: a death an
+hour ago is the entire case for a rescue kit and says nothing about whether to fund a build, so
+a funding headline reports time on the server and past grants, and the rescue-only "claim
+verified" line is suppressed.
 
 Three things it will not do:
 
@@ -248,10 +271,16 @@ Three things it will not do:
 
 ## Privacy
 
-**Chat reaches Discord only as the attached, already-redacted log.** Coordinate redaction
-happens inside `card.gather`, at the boundary, so no display path can be the one that forgot
-— and `screening.redact_coords` cannot be set false while screening is on, because a config
-file is not a good place to be able to turn a privacy control off.
+**Chat reaches Discord only through the reviewer-only pager, already redacted.** Coordinate
+redaction happens inside `card.gather`, at the boundary, so no display path can be the one that
+forgot — and `screening.redact_coords` cannot be set false while screening is on, because a
+config file is not a good place to be able to turn a privacy control off.
+
+This applies to **chat scraped from api.2b2t.vc**, not to what an applicant types into a form
+about themselves. A meeting point exists to be read by whoever is flying out to it, and a
+project description that names a location is how a build gets described; redacting either would
+break the feature rather than protect anyone. Neither is ever written to a log record — the
+journal says a meeting point was set, never what it was.
 
 The reason is that the coordinates in someone's chat are usually **somebody else's**: a base
 leaked in an argument, a stash traded in public, a location someone is being hunted to. The

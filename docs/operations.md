@@ -61,6 +61,32 @@ sudo systemctl restart melonkit-bot
 journalctl -u melonkit-bot -f
 ```
 
+**Deploy a change that migrates the ledger.** Back it up first, and note that copying
+`melonkit.sqlite3` on its own is **not** a backup: the database runs in WAL mode, so recent
+commits can live entirely in the `-wal` file. Checkpoint first, or copy all three files.
+
+```bash
+$KA/.venv/bin/python -c "import sqlite3; \
+  print(sqlite3.connect('/var/lib/melonkit/melonkit.sqlite3') \
+        .execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone())"
+STAMP=$(date +%Y%m%d-%H%M%S); mkdir -p ~/melonkit-backups
+for f in melonkit.sqlite3 melonkit.sqlite3-wal melonkit.sqlite3-shm; do
+  [ -f /var/lib/melonkit/$f ] && cp -a /var/lib/melonkit/$f ~/melonkit-backups/$f.$STAMP
+done
+```
+
+Then **rehearse the migration on the copy** before restarting the service — it runs in
+`Store.__init__`, so opening the copy is the whole test:
+
+```bash
+cp ~/melonkit-backups/melonkit.sqlite3.$STAMP /tmp/rehearse.sqlite3
+cd $KA && ./.venv/bin/python -c "import store; store.Store('/tmp/rehearse.sqlite3').close()"
+```
+
+A migration is **one-way**: the store refuses to open a ledger written by a newer schema rather
+than risk mangling the kit history, so the old code will not start against a migrated file. The
+backup is the rollback.
+
 **Update the panel** — after editing any `panel` value in the config (the rescued counter, the
 as-of date, the quoted response time), or any copy in `bot.py`:
 
@@ -227,6 +253,59 @@ a `fetch_channel`, then message and thread edits, before responding. Blowing the
 reviewer to press again.
 
 Combined with the race below, a second press meant a second kit. Always `defer()` first.
+
+### A modal has no deadline, but discord.py gives it one anyway
+
+Discord puts **no** time limit on submitting a modal — the dialog sits open as long as somebody
+keeps typing. discord.py's own view timeout does, and when it expires the submission dispatches
+to nothing: *"This interaction failed"*, and everything they wrote is gone.
+
+Every modal here shipped with `timeout=600`. That is fine for a two-field rescue form and wrong
+for the funding one: an applicant assembling a materials list is checking their stock in game
+while the form sits open, so ten minutes is a normal answer rather than an abandoned one. All
+four modals now pass `timeout=None`, which is `Modal.__init__`'s own default.
+
+### An ephemeral view is force-timed-out at 15 minutes
+
+`InteractionResponse.send_message` contains `if ephemeral and view.timeout is None: view.timeout
+= 15 * 60.0`. **There is no way to opt out.** So a paginator that keeps its page number in the
+view instance is dead a quarter of an hour after it opens, with no restart involved — and the
+failure is silent: view dispatch finds nothing registered and simply returns, no exception and no
+log line, on a button that still looks live.
+
+This is why the chat pager encodes the target page in the Prev/Next `custom_id` instead. Anything
+paged or stateful sent ephemerally has to be stateless the same way.
+
+### A plain button among dynamic ones unregisters them globally
+
+Related, and nastier. When a view holding `DynamicItem`s is removed — which the forced 15-minute
+ephemeral timeout above *will* do — discord.py pops each of their compiled templates out of the
+process-global registry, but only when the view also has a dispatchable child that is **not** a
+DynamicItem.
+
+So adding an innocent disabled "Page 3/5" indicator button to the pager would, fifteen minutes
+after the first press, break Prev/Next **for every reviewer in every guild** until the next
+restart. Every child of that view is a DynamicItem, and the page counter lives in the embed
+footer. Do not add an ordinary button to it.
+
+### Components are replaced wholesale; attachments are not
+
+`message.edit(...)` leaves existing attachments alone when you omit `attachments=`, but a view
+you pass replaces the previous one entirely. The chat log used to be a `.txt` on the queue post,
+so it survived approve → claim → deliver → archive for free. As a button it does not: every
+lifecycle edit has to re-add it, which is what `_with_chat` is for.
+
+If chat vanishes from a decided ticket, look for a `qmsg.edit(view=...)` that was not routed
+through that helper. `on_thread_delete` was the one that got missed.
+
+### applied_tags is replace, not merge
+
+`thread.edit(applied_tags=[...])` sets the complete list. `_set_queue_state` used to pass only
+the new lifecycle tag, which was harmless while lifecycle was the only thing tagged — and would
+have silently deleted the request-type tag on the first Approve.
+
+It now keeps every tag that is not in `QUEUE_TAGS` and puts the lifecycle tag **first**, because
+a post is capped at 5 applied tags and the lifecycle tag must never be the one truncated.
 
 ### Read-then-write is not a lock
 

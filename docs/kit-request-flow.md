@@ -6,9 +6,17 @@ From a player wanting a kit to a team member handing one over.
 
 ## 1. The front door
 
-A **pinned panel** in a read-only `#kit-requests` channel with a single **Request a kit**
-button. The button carries a static `custom_id`, so it keeps working across bot restarts and
-redeploys forever — nothing about the panel is stateful.
+A **pinned panel** in a read-only `#kit-requests` channel with two buttons — **Request a rescue
+kit** and **Request project funding**. Both carry static `custom_id`s, so they keep working
+across bot restarts and redeploys forever; nothing about the panel is stateful. The rescue
+button kept the original id it shipped with, which is what lets an already-pinned panel be
+*edited* to gain the second button instead of deleted and re-posted.
+
+**Two buttons rather than one form with a type selector**, and that is Discord's constraint, not
+a preference: a modal is submitted whole, so it cannot change its own questions after somebody
+picks a type inside it. Funding needs to ask what the project is, what materials are needed and
+roughly how big it is; a rescue request needs none of those and a single shared "anything we
+should know?" box would make both answers unusable.
 
 The panel copy carries the volunteer / best-effort / not-guaranteed warning and names the
 three reasons a request gets declined. **That copy doubles as the vetting disclosure**, so
@@ -35,8 +43,15 @@ this flow.
 
 ## 2. The ticket
 
-Modal collects the Minecraft username and a free-text note. On submit, a **private thread**
-hangs off the panel channel with the applicant and the reviewer role in it.
+A rescue modal collects the Minecraft username and a free-text note; the funding modal collects
+the username, what the project is, what they need and roughly how big it is. On submit, a
+**private thread** hangs off the panel channel with the applicant and the reviewer role in it.
+
+The type travels with the ticket and shows up in four places — the queue post's title, the top
+of the card, the forum tag and the transcript. The **tag is a convenience only**, and
+deliberately not the mechanism: a server that ran `/setup` before those tags existed cannot
+re-run it without being granted Manage Channels back, which `/setup` itself tells admins to
+remove. So the type is in the title and the card, where it cannot silently fail to appear.
 
 The bot posts a **receipt** in that thread — and nothing else. The reviewer card goes to a
 separate **staff-only forum**, one post per ticket, tagged `awaiting review`. See
@@ -70,6 +85,14 @@ An approval **turns the same queue post into the dispatch**: retagged `approved`
 button attached, the card left in place. Whoever presses Claim owns the delivery and is
 introduced in the applicant's thread. Marking delivered retags and archives the post —
 archived rather than locked, so a delivery that falls through afterwards can be reopened.
+
+**Approval is also when the applicant is asked where to meet.** Their thread gets a **Set
+meeting coordinates** button, and what they enter appears on the queue post and in the claim
+confirmation, so whoever picks the job up already knows where they are going. It is asked at
+approval rather than on the request form for two reasons: before a decision there is nothing to
+deliver, and asking up front would collect a location from every person who gets declined. They
+can press it again if they move, and anything written alongside the three numbers is kept — "by
+the big cobble tower" is useful to whoever is flying out.
 
 One post is therefore the entire record of a ticket — request, card, decision, claim, delivery
 — instead of a card in one channel and an ember in another, and tags make the queue filterable:

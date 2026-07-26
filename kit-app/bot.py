@@ -16,8 +16,10 @@ Three implementation notes that are decisions, not incidentals:
 - **Components V2 is not used.** Its message flag is irreversible once sent, and the panel is
   the one message here intended to live indefinitely and stay editable.
 
-Chat text reaches Discord only as the attached, already-redacted log. It never reaches a log
-record: diagnostics carry ticket ids, user ids and counts.
+Chat text reaches Discord only through the reviewer-only pager, read back from the ledger rows
+that were stored already-redacted. It never reaches a log record: diagnostics carry ticket ids,
+user ids and counts. The same holds for a meeting point -- it goes to the runner who needs it,
+and the journal records only that one was set.
 """
 from __future__ import annotations
 

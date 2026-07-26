@@ -13,6 +13,27 @@ card is ambiguous, the tie goes to the applicant.
 
 ---
 
+## Two kinds of request, judged on different evidence
+
+A **rescue kit** and **project funding** arrive in the same queue and are close to opposite
+decisions, so the card reorders itself depending on which it is.
+
+For a rescue kit, a recent death is the claim already verified and most of the decision. For
+funding it is irrelevant — it verifies a claim nobody made — so a funding card leads with **The
+ask** (what the project is, what they need, how big it is), and its headline reports time on the
+server and past grants rather than the death. The rescue-only "this is the lost-everything
+claim, verified" line is suppressed on a funding card for the same reason.
+
+The question above also changes shape. For funding it is not "did they get wiped" but "is this a
+real project and have we already funded it" — and there is no equivalent of the death line to
+settle it, so expect to read the whole card.
+
+The two have **separate cooldowns**. Someone funded for a build three days ago is not inside a
+cooldown for a rescue kit, and vice versa; a card reports whichever one applies to the request in
+front of you. `/lookup`, which has no request behind it, reports *any* grant.
+
+---
+
 ## The card, and what each line is actually worth
 
 ### Recent deaths — read this first
@@ -102,3 +123,18 @@ survives the thread being deleted — you can clean threads up freely without lo
 The one thing that **cannot** be reconstructed later is which chat lines you objected to. That
 is what `/flagline <ticket> <lines>` captures, and it is the only labelled screening data this
 project will ever get. See [chat-screening.md](chat-screening.md).
+
+## Reading the chat
+
+The card gives you counts; **Chat history** on the queue post gives you the lines. It opens a
+panel only you can see, twenty lines a page, with Previous / Next and a **Download .txt** if you
+would rather search the whole thing at once. Flagged lines carry a `!` in the left column.
+
+The numbers down the left are the ones `/flagline` wants — they are positions in the stored log,
+not positions on the page, so they stay correct however you got there.
+
+Two things worth knowing. The panel is ephemeral, so it disappears when your Discord client
+restarts; press the button again, it is always there on the post, including after the ticket is
+decided and archived. And if a ticket has **no** chat recorded, the button is simply absent —
+because an empty log cannot tell you whether the player said nothing or the lookup failed, and
+the card's *Recent public chat* field is the thing that distinguishes those.
