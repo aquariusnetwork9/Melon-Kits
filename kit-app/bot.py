@@ -84,7 +84,58 @@ PANEL_CHOICE = (
 )
 
 
+# The Melon Men guides. Hardcoded deliberately: this bot is deployed to exactly one server, so
+# four more /setup questions would be four more ways to misconfigure a value that will never
+# differ. Sent as `<#id>` mentions rather than as names and URLs, which means a channel rename
+# is followed automatically and the reader gets a real jump link instead of a copied title.
+GUIDES_CATEGORY_ID = 1398069725531213834
+GUIDE_ESCAPE_WITH_KIT_ID = 1398184983117565982
+GUIDE_ESCAPE_NO_KIT_ID = 1398071458084950146
+GUIDE_CLIENT_SETUP_ID = 1398890536907047012
+
+HELP_TITLE = "\U0001F4D6 Read these while you wait"
+HELP_BODY = (
+    "Help here is voluntary, so a reviewer gets to your request when someone's around. "
+    "These are the guides that get people out of spawn in the meantime.\n"
+    "\n"
+    "⚠️ **If you die with your kit through your own actions, you won't get another one.** "
+    "Reading the right one of these first is usually the difference."
+)
+
+# (channel id, field heading, one-line gloss). The glosses restate the channel names rather
+# than summarising their contents, so nothing here goes stale when a guide is rewritten.
+HELP_GUIDES = (
+    (GUIDE_ESCAPE_WITH_KIT_ID, "\U0001F392 Escaping with a kit",
+     "What to do once your kit lands, so you don't lose it on the way out."),
+    (GUIDE_ESCAPE_NO_KIT_ID, "\U0001F97E Escaping without a kit",
+     "Getting out on your own - slower, but nobody has to be online for it."),
+    (GUIDE_CLIENT_SETUP_ID, "\U0001F5A5️ Client setup",
+     "Get your client ready before you try either of the above."),
+)
+
+
 # --------------------------------------------------------------------------- helpers
+
+def guides_embed() -> discord.Embed:
+    """The applicant-facing reading list posted on a new rescue ticket.
+
+    Unconditional, and deliberately not gated on the bot being able to see those channels.
+    Discord renders `<#id>` against the *reader's* permissions, so an applicant's link works
+    whether or not the bot holds View Channel on the guides -- gating on `guild.get_channel`
+    would have hidden the reading list over a bot permission that does not affect it.
+
+    The cost of that choice is that in any server other than the Melon Men one these render as
+    `#unknown-channel`, which is the documented trade: see the id block above.
+    """
+    embed = discord.Embed(title=HELP_TITLE, description=HELP_BODY,
+                          colour=discord.Colour.from_str("#2E6B3F"))
+    for channel_id, heading, gloss in HELP_GUIDES:
+        embed.add_field(name=heading, value="<#%d>\n%s" % (channel_id, gloss), inline=False)
+    embed.add_field(name="Everything else",
+                    value="The rest of the guides are in <#%d>." % GUIDES_CATEGORY_ID,
+                    inline=False)
+    return embed
+
 
 def is_admin(member: Any) -> bool:
     """Who may run /setup. Manage Server, i.e. whoever could have invited the bot."""
@@ -1101,6 +1152,11 @@ class KitBot(discord.Client):
         # screening counts, and showing someone the exact criteria applied to them both
         # exposes notes written about them and teaches them how to game the next request.
         if thread is not None:
+            # Rescue only: the guides are about getting out of spawn alive, which is not what
+            # somebody asking for build materials came here for. Rides along with the receipt
+            # instead of being a second message, so the applicant's first view of the thread is
+            # one block -- and so a rejected embed can't cost them the receipt.
+            help_embed = guides_embed() if kind == store_mod.KIND_RESCUE else None
             try:
                 await thread.send(
                     "Thanks %s - this is request **#%d**, for **%s**, on `%s`.\n\n"
@@ -1109,7 +1165,8 @@ class KitBot(discord.Client):
                     "guaranteed. You don't need to do anything else - if it's approved, "
                     "whoever is delivering will message you in this thread to sort out "
                     "where to meet." % (user.mention, ticket_id,
-                                        store_mod.KIND_LABEL[kind], canonical))
+                                        store_mod.KIND_LABEL[kind], canonical),
+                    embed=help_embed)
             except discord.HTTPException:
                 LOG.warning("could not post receipt to applicant thread ticket=%d", ticket_id)
 

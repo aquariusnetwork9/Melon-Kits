@@ -106,6 +106,53 @@ def panel_embed_renders():
 
 check("panel_embed", panel_embed_renders)
 
+print("\n-- the guides embed links all four channels --")
+
+ALL_GUIDES = (bot_mod.GUIDES_CATEGORY_ID, bot_mod.GUIDE_ESCAPE_WITH_KIT_ID,
+              bot_mod.GUIDE_ESCAPE_NO_KIT_ID, bot_mod.GUIDE_CLIENT_SETUP_ID)
+
+
+def guides_renders():
+    e = bot_mod.guides_embed()
+    # Three guides plus the category line.
+    assert len(e.fields) == 4, [f.name for f in e.fields]
+    for cid in ALL_GUIDES:
+        assert any("<#%d>" % cid in f.value for f in e.fields), "%d is not linked" % cid
+    total = len(e.title or "") + len(e.description or "") + sum(
+        len(f.name) + len(f.value) for f in e.fields)
+    assert total <= 6000, total
+    for f in e.fields:
+        assert len(f.value) <= 1024, (f.name, len(f.value))
+    assert len(e.description) <= 4096
+    print("       embed %d chars, %d fields" % (total, len(e.fields)))
+
+
+def guides_needs_no_guild():
+    # Takes no guild on purpose: the bot does not have to be in the server, or be able to see
+    # those channels, for a reader's <#id> to resolve. Regression guard on that decision.
+    import inspect
+    params = list(inspect.signature(bot_mod.guides_embed).parameters)
+    assert params == [], "guides_embed grew a %r parameter -- see its docstring" % params
+
+
+def guides_ids_distinct():
+    assert len(set(ALL_GUIDES)) == 4, "two guide constants hold the same id"
+    for cid in ALL_GUIDES:
+        # Discord snowflakes are 17-19 digits; a truncated paste would silently link nothing.
+        assert 10 ** 16 < cid < 10 ** 19, cid
+
+
+def guides_warn_survives():
+    # The die-with-your-kit warning is the one line here with a consequence attached.
+    e = bot_mod.guides_embed()
+    assert "won't get another" in e.description, e.description
+
+
+check("guides_embed renders", guides_renders)
+check("guides_embed takes no guild", guides_needs_no_guild)
+check("guide ids are distinct snowflakes", guides_ids_distinct)
+check("the kit warning is still in it", guides_warn_survives)
+
 print("\n-- every dynamic button round-trips its own custom_id --")
 
 

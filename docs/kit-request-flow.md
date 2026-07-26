@@ -57,6 +57,19 @@ The bot posts a **receipt** in that thread — and nothing else. The reviewer ca
 separate **staff-only forum**, one post per ticket, tagged `awaiting review`. See
 [reviewing.md](reviewing.md) for what is on the card.
 
+A **rescue** receipt carries a reading list with it: both escape guides, the client setup guide
+and the guides category. Funding tickets do not get it — those guides are about getting out of
+spawn alive, which is not what somebody asking for build materials came for. The channel ids are
+hardcoded in `bot.py` (`HELP_GUIDES`), because this bot is deployed to one server and four more
+`/setup` questions would be four more ways to misconfigure a constant.
+
+They are sent as `<#id>` mentions, which matters more than it looks: Discord resolves a channel
+mention against **the reader's** permissions, not the bot's. The links therefore work whether or
+not the bot can see those channels, and the bot does not need to be in the server for the code
+to be correct. The embed is deliberately *not* gated on `guild.get_channel()` — that would have
+hidden the reading list over a bot permission with no bearing on whether the applicant can click
+it. The trade is that in any other server these render as `#unknown-channel`.
+
 **The applicant never sees the card.** It carries the ledger fan-out, the reviewer flag list
 and the screening counts. Showing someone the exact criteria applied to them exposes notes
 written about them and teaches them how to clear the bar next time — and the fan-out can name
