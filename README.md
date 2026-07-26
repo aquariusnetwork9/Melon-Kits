@@ -29,12 +29,21 @@ Nothing here has served a real kit request yet.
 ## Layout
 
 ```
+docs/                 project documentation (see below)
 chat-corpus/          the collector: SSE feed → append-only JSONL, stdlib only, crash-safe
   docs/SPEC.md        full behavioural spec
   docs/INTERFACES.md  binding module API
   tools/              export / dedupe-audit / gap-injection / stats
   tests/              244 tests, no network, no third-party deps
 ```
+
+| document | what it covers |
+|---|---|
+| [docs/kit-request-flow.md](docs/kit-request-flow.md) | panel → ticket → decision → dispatch, and what the design deliberately omits |
+| [docs/reviewing.md](docs/reviewing.md) | the reviewer card line by line, and what each signal is actually worth |
+| [docs/chat-screening.md](docs/chat-screening.md) | the keyword list, why it isn't a model, and the DuckDB queries that make it good |
+| [docs/external-apis.md](docs/external-apis.md) | verified findings on `api.2b2t.vc`, Minecraft identity, and Discord — the counter-intuitive ones only |
+| [chat-corpus/README.md](chat-corpus/README.md) | running the collector: quickstart, runbook, health states, disk |
 
 The Discord app will land alongside it. The collector is deliberately standalone — it has no
 dependency on the app and the app has no runtime dependency on it, so either can be run,
