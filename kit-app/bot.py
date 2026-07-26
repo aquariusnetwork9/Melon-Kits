@@ -764,63 +764,56 @@ class KitBot(discord.Client):
 
         opened = card_mod.parse_ts_epoch(t["created_at"])
         closed = card_mod.parse_ts_epoch(t["closed_at"])
+        status = str(t["status"])
         colour = {store_mod.STATUS_APPROVED: "#2E6B3F",
                   store_mod.STATUS_DECLINED: "#8A2F2F",
-                  store_mod.STATUS_CANCELLED: "#4A4A4A"}.get(str(t["status"]), "#4A4A4A")
+                  store_mod.STATUS_CANCELLED: "#4A4A4A"}.get(status, "#4A4A4A")
 
-        embed = discord.Embed(
-            title="Ticket #%d - %s" % (ticket_id, str(t["status"]).upper()),
-            colour=discord.Colour.from_str(colour))
-        embed.add_field(
-            name="Applicant",
-            value="<@%d> (`%d`)\nMinecraft: **%s**\nUUID: `%s`"
-                  % (int(t["discord_user_id"]), int(t["discord_user_id"]),
-                     t["mc_name"], t["mc_uuid"] or "unresolved"),
-            inline=False)
-        timing = ["Opened: %s" % (opened.strftime("%Y-%m-%d %H:%M:%SZ") if opened else "?")]
+        # Deliberately three dense lines in the description rather than stacked fields.
+        # Discord gives every inline=False field its own row plus a heading, so the six-field
+        # version ran to ~18 rendered lines per ticket and a few dozen tickets became
+        # unscrollable. Everything cut from here is still in the attachment, which is the
+        # authoritative copy; the message only has to be enough to scan and to search.
+        # The colour stripe is kept because it is the fastest outcome cue there is.
+        delivered_label = status.upper()
+        if kits and kits[0]["delivered_at"]:
+            delivered_label = "DELIVERED"
+        lines = ["<@%d> → **%s**  ·  `%s`"
+                 % (int(t["discord_user_id"]), t["mc_name"],
+                    (t["mc_uuid"] or "unresolved")[:8])]
+
+        span = []
+        if opened:
+            span.append("opened %s" % opened.strftime("%d %b %H:%M"))
         if closed:
-            timing.append("Closed: %s" % closed.strftime("%Y-%m-%d %H:%M:%SZ"))
+            span.append("closed %s" % closed.strftime("%d %b %H:%M"))
             if opened:
-                timing.append("Open for: %s"
-                              % card_mod.duration(int((closed - opened).total_seconds())))
-        embed.add_field(name="Timing", value="\n".join(timing), inline=False)
+                span.append("open %s"
+                            % card_mod.duration(int((closed - opened).total_seconds())))
+        lines.append(" · ".join(span) or "timing unknown")
+
+        third = []
+        if decisions:
+            d = decisions[-1]
+            third.append("reviewer %s" % ("the bot" if int(d["reviewer_id"]) == int(self.user.id)
+                                          else "<@%d>" % int(d["reviewer_id"])))
+            if d["reason"]:
+                third.append(str(d["reason"])[:120])
+        if kits and kits[0]["claimed_by"]:
+            third.append("runner <@%d>" % int(kits[0]["claimed_by"]))
+        elif kits:
+            third.append("never claimed")
+        third.append("%d lines%s" % (len(shown),
+                                     ", %d flagged" % len(flagged) if flagged else ""))
+        lines.append(" · ".join(third))
 
         if t["note"]:
-            embed.add_field(name="What they asked for", value=str(t["note"])[:1000],
-                            inline=False)
+            lines.append("> %s" % str(t["note"]).replace("\n", " ")[:160])
 
-        if decisions:
-            rows = []
-            for d in decisions:
-                who = "the bot" if int(d["reviewer_id"]) == int(self.user.id) \
-                    else "<@%d>" % int(d["reviewer_id"])
-                rows.append("**%s** by %s\n> %s"
-                            % (d["outcome"], who, d["reason"] or "(no reason given)"))
-            embed.add_field(name="Decision", value="\n".join(rows)[:1024], inline=False)
-        else:
-            embed.add_field(name="Decision", value="none recorded", inline=False)
-
-        if kits:
-            k = kits[0]
-            claimed = card_mod.parse_ts_epoch(k["claimed_at"])
-            delivered = card_mod.parse_ts_epoch(k["delivered_at"])
-            embed.add_field(
-                name="Delivery",
-                value="Dispatch #%d\nClaimed by: %s\nDelivered: %s"
-                      % (int(k["id"]),
-                         "<@%d> (%s)" % (int(k["claimed_by"]), card_mod.ago(claimed))
-                         if k["claimed_by"] else "never claimed",
-                         delivered.strftime("%Y-%m-%d %H:%M:%SZ") if delivered
-                         else "**not delivered**"),
-                inline=False)
-
-        embed.add_field(
-            name="Screening",
-            value="%d chat line(s) shown, %d flagged by a reviewer%s"
-                  % (len(shown), len(flagged),
-                     "" if shown else " (no chat was on record)"),
-            inline=False)
-        embed.set_footer(text="Archived automatically when the ticket finished")
+        embed = discord.Embed(
+            title="Ticket #%d · %s" % (ticket_id, delivered_label),
+            description="\n".join(lines)[:4000],
+            colour=discord.Colour.from_str(colour))
 
         # The attachment is what makes this survive a deleted thread.
         parts = ["MELON KITS - TICKET #%d TRANSCRIPT" % ticket_id,
