@@ -62,6 +62,14 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def at_epoch(secs: Optional[int]) -> Optional[datetime.datetime]:
+    """Ledger timestamps are epoch ints; `ago` wants an aware datetime. Bridge, so the
+    conversion is written once instead of at every call site that mixes the two."""
+    if not secs:
+        return None
+    return datetime.datetime.fromtimestamp(int(secs), datetime.timezone.utc)
+
+
 def ago(when: Optional[datetime.datetime], now: Optional[datetime.datetime] = None) -> str:
     """Human relative time. 'never' when unknown -- never a blank."""
     if when is None:
@@ -108,7 +116,8 @@ def gather(guild_id: int, mc_name: str, mc_uuid: Optional[str], discord_user_id:
            lex: Optional[screening.Lexicon] = None,
            log: Optional[logging.Logger] = None,
            *, request_type: Optional[str] = None,
-           details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+           details: Optional[Dict[str, Any]] = None,
+           ticket_id: Optional[int] = None) -> Dict[str, Any]:
     """Everything the card needs. Partial failures degrade rather than abort.
 
     A review must not be impossible because one endpoint is briefly rate-limited: whatever
@@ -241,6 +250,30 @@ def gather(guild_id: int, mc_name: str, mc_uuid: Optional[str], discord_user_id:
         guild_id, mc_uuid=mc_uuid, mc_name=mc_name)]
     card["linked"] = [dict(r) for r in st.linked_accounts(
         guild_id, discord_user_id=discord_user_id, mc_uuid=mc_uuid)]
+
+    # The per-identity request clock. Not kind-scoped and not outcome-scoped: one request per
+    # identity per window, whatever it was for and whatever came of it. `ticket_id` excludes the
+    # applicant's own row, which `create_ticket` has already written by the time this runs and
+    # would otherwise be the most recent request every single time.
+    #
+    # Skipped entirely on a lookup. `/lookup` passes the REVIEWER's Discord id -- there is no
+    # applicant -- so computing this there would put the reviewer's own request history on the
+    # card as though it were the subject's, which is worse than showing nothing.
+    is_lookup = request_type is None
+    card["request_cooldown_days"] = 0 if is_lookup else pol["request_cooldown_days"]
+    card["request_cooldown"] = st.request_cooldown(
+        guild_id, card["request_cooldown_days"], discord_user_id,
+        exclude_ticket_id=ticket_id)
+
+    # The kit-farm shape: other Discord identities that have asked for THIS MC account. On a
+    # lookup nothing is excluded, because "who has asked for this account" is the whole question
+    # a reviewer vetting a name is asking; on a ticket the applicant is excluded so the card says
+    # *other* accounts and means it.
+    card["other_requesters"] = [dict(r) for r in st.other_requesters(
+        guild_id, mc_uuid=mc_uuid, mc_name=mc_name,
+        exclude_user_id=None if is_lookup else discord_user_id)]
+    card["farmed_before"] = sum(
+        int(r.get("approved") or 0) for r in card["other_requesters"])
 
     # ---- screening --------------------------------------------------------
     if cfg["screening"]["enabled"] and lex:
@@ -437,6 +470,33 @@ def recommend(card: Dict[str, Any]) -> Dict[str, Any]:
         fires("cooldown", CALL_DENY,
               "inside the %d-day cooldown for %s, %d day(s) left"
               % (card.get("cooldown_days", 21), store_mod.KIND_LABEL[kind], cd["days_left"]))
+    rq = card.get("request_cooldown") or {}
+    if rq.get("blocked"):
+        fires("one request per %d days" % card.get("request_cooldown_days", 180), CALL_DENY,
+              "this Discord account opened #%s %s and it was %s - %d day(s) left, and being "
+              "declined is not a free retry"
+              % (rq.get("last_ticket_id"), ago(at_epoch(rq.get("last_at")),
+                                               card["generated_at"]),
+                 rq.get("last_status"), rq.get("days_left")))
+    # A second Discord identity asking for an account somebody was ALREADY GRANTED a kit on is
+    # the farm, and it is a fact about the ledger rather than an inference about a person -- which
+    # is why it may deny. Prior requests that were never granted are the same shape without the
+    # payoff, so those only ask for a look: a friend asking on someone's behalf, an account that
+    # changed hands and a farm all look identical until one of them collects.
+    others = card.get("other_requesters") or []
+    if others:
+        who = len(others)
+        matched = "uuid" if card.get("mc_uuid") else "name only"
+        if card.get("farmed_before"):
+            fires("kit farming", CALL_DENY,
+                  "%d other Discord account(s) have requested this same Minecraft account and "
+                  "%d of those request(s) were granted (matched on %s)"
+                  % (who, card["farmed_before"], matched))
+        else:
+            fires("same MC account, different Discord", CALL_LOOK,
+                  "%d other Discord account(s) have requested this Minecraft account, none "
+                  "granted (matched on %s) - a farm, a friend asking for someone, and an "
+                  "account that changed hands all look like this" % (who, matched))
 
     # --- chat: asks for a look, and denies once there is volume behind it -------
     scr = card["screening"]
@@ -657,12 +717,38 @@ def sections(card: Dict[str, Any]) -> List[Dict[str, str]]:
                    % (card.get("cooldown_days", 21), cd["days_left"]))
         led.append("Matched on: %s" % cd["matched"])
     elif cd["last_at"]:
-        led.append("Last kit: %s (cooldown clear)" % ago(
-            datetime.datetime.fromtimestamp(cd["last_at"], datetime.timezone.utc), gen))
+        led.append("Last kit: %s (cooldown clear)" % ago(at_epoch(cd["last_at"]), gen))
     else:
         led.append("No kit from us before.")
     if card["kit_history"]:
         led.append("Kits on record: %d" % len(card["kit_history"]))
+
+    rq = card.get("request_cooldown") or {}
+    days = card.get("request_cooldown_days") or 0
+    if rq.get("blocked"):
+        led.append("**One request per %d days: %d day(s) left** (#%s, %s, %s)"
+                   % (days, rq["days_left"], rq["last_ticket_id"], rq["last_status"],
+                      ago(at_epoch(rq["last_at"]), gen)))
+    elif rq.get("last_at"):
+        led.append("Previous request: #%s, %s, %s" % (
+            rq["last_ticket_id"], rq["last_status"], ago(at_epoch(rq["last_at"]), gen)))
+    elif days:
+        led.append("First request from this Discord account.")
+
+    others = card.get("other_requesters") or []
+    if others:
+        led.append("")
+        led.append("**%d other Discord account(s) have requested this Minecraft account**%s"
+                   % (len(others),
+                      " - %d of those were granted" % card["farmed_before"]
+                      if card.get("farmed_before") else ", none granted"))
+        for r in others[:5]:
+            led.append("- <@%s> - %s ticket(s), last %s%s"
+                       % (r.get("discord_user_id"), r.get("tickets"),
+                          ago(at_epoch(r.get("newest")), gen),
+                          ", %s approved" % r["approved"] if r.get("approved") else ""))
+        if not card.get("mc_uuid"):
+            led.append("*Matched on name only - no UUID resolved, so this is weaker than usual.*")
     if len(card["linked"]) > 1:
         names = sorted({str(r.get("mc_name")) for r in card["linked"]
                         if r.get("mc_name")})

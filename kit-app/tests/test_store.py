@@ -155,6 +155,131 @@ class StoreCase(unittest.TestCase):
         self.st.record_kit(GUILD, None, 100, "Alice", UUID_A)
         self.assertFalse(self.st.cooldown(GUILD, 21)["blocked"])
 
+    # ------------------------------------------- the per-identity request clock
+    #
+    # Keyed on the Discord id and on the REQUEST, not on a grant: one request per window per
+    # identity, whatever it was for and whatever came of it.
+
+    def test_a_declined_request_still_starts_the_clock(self):
+        """The whole point of this clock. Being turned down is not a free retry."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(tid, 500, store_mod.STATUS_DECLINED, "no")
+        rq = self.st.request_cooldown(GUILD, 180, 100)
+        self.assertTrue(rq["blocked"])
+        self.assertEqual(rq["days_left"], 180)
+        self.assertEqual(rq["last_status"], store_mod.STATUS_DECLINED)
+        self.assertEqual(rq["last_ticket_id"], tid)
+
+    def test_an_approved_request_starts_it_too(self):
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(tid, 500, store_mod.STATUS_APPROVED)
+        self.assertTrue(self.st.request_cooldown(GUILD, 180, 100)["blocked"])
+
+    def test_an_open_request_starts_it(self):
+        """An abandoned open ticket is still a request that was made."""
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertTrue(self.st.request_cooldown(GUILD, 180, 100)["blocked"])
+
+    def test_a_cancelled_request_does_not_start_it(self):
+        """The bot cancels tickets ITSELF when it cannot post a reviewer card, precisely so the
+        applicant can retry at once. Counting that would lock somebody out for half a year over
+        our own bug."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(tid, 500, store_mod.STATUS_CANCELLED, "auto-closed")
+        self.assertFalse(self.st.request_cooldown(GUILD, 180, 100)["blocked"])
+
+    def test_a_new_minecraft_name_does_not_reset_the_clock(self):
+        """Unlike the kit cooldown this is keyed on the Discord id ALONE, so typing a different
+        username is not a way around it."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(tid, 500, store_mod.STATUS_DECLINED, "no")
+        self.st.create_ticket(GUILD, 100, "Bob", UUID_B, None)
+        self.assertTrue(self.st.request_cooldown(GUILD, 180, 100)["blocked"])
+
+    def test_a_different_discord_account_has_its_own_clock(self):
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertFalse(self.st.request_cooldown(GUILD, 180, 999)["blocked"])
+
+    def test_the_request_clock_clears_after_the_window(self):
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        later = int(time.time()) + 180 * DAY + 1
+        rq = self.st.request_cooldown(GUILD, 180, 100, now=later)
+        self.assertFalse(rq["blocked"])
+        self.assertEqual(rq["days_left"], 0)
+
+    def test_zero_disables_the_request_clock(self):
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertFalse(self.st.request_cooldown(GUILD, 0, 100)["blocked"])
+
+    def test_a_ticket_does_not_block_itself(self):
+        """`gather` runs after the row is written, so the applicant's own request is the most
+        recent one by definition. Without the exclusion every card would report its own ticket
+        as the blocker."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertFalse(self.st.request_cooldown(
+            GUILD, 180, 100, exclude_ticket_id=tid)["blocked"])
+
+    def test_the_request_clock_is_per_guild(self):
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertFalse(self.st.request_cooldown(GUILD + 1, 180, 100)["blocked"])
+
+    # --------------------------------------------------- the kit-farm direction
+
+    def test_another_discord_account_on_the_same_mc_account_is_listed(self):
+        first = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(first, 500, store_mod.STATUS_APPROVED)
+        self.st.create_ticket(GUILD, 200, "Alice", UUID_A, None)
+        rows = self.st.other_requesters(GUILD, mc_uuid=UUID_A, exclude_user_id=200)
+        self.assertEqual([int(r["discord_user_id"]) for r in rows], [100])
+        self.assertEqual(int(rows[0]["approved"]), 1)
+
+    def test_the_farm_list_excludes_the_asker(self):
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertEqual(
+            self.st.other_requesters(GUILD, mc_uuid=UUID_A, exclude_user_id=100), [])
+
+    def test_the_farm_list_is_the_opposite_direction_from_linked_accounts(self):
+        """linked_accounts asks which MC names sit behind one Discord account (an alt);
+        this asks which Discord accounts sit in front of one MC account (a farm)."""
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.create_ticket(GUILD, 100, "Bob", UUID_B, None)
+        # One Discord account, two MC names -> nothing for the farm list.
+        self.assertEqual(self.st.other_requesters(GUILD, mc_uuid=UUID_A,
+                                                  exclude_user_id=100), [])
+        self.assertGreater(len(self.st.linked_accounts(GUILD, discord_user_id=100)), 1)
+
+    def test_the_farm_list_counts_tickets_per_account(self):
+        for _ in range(3):
+            tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+            self.st.record_decision(tid, 500, store_mod.STATUS_DECLINED, "no")
+        rows = self.st.other_requesters(GUILD, mc_uuid=UUID_A, exclude_user_id=200)
+        self.assertEqual(int(rows[0]["tickets"]), 3)
+        self.assertEqual(int(rows[0]["declined"]), 3)
+        self.assertEqual(int(rows[0]["approved"]), 0)
+
+    def test_the_farm_list_includes_cancelled_attempts_as_evidence(self):
+        """Unlike the request clock: for evidence, an attempt that never reached a reviewer
+        still shows somebody tried."""
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(tid, 500, store_mod.STATUS_CANCELLED, "auto-closed")
+        rows = self.st.other_requesters(GUILD, mc_uuid=UUID_A, exclude_user_id=200)
+        self.assertEqual(int(rows[0]["tickets"]), 1)
+
+    def test_the_farm_list_falls_back_to_the_name_when_there_is_no_uuid(self):
+        self.st.create_ticket(GUILD, 100, "Alice", None, None)
+        rows = self.st.other_requesters(GUILD, mc_name="alice", exclude_user_id=200)
+        self.assertEqual([int(r["discord_user_id"]) for r in rows], [100])
+
+    def test_a_name_match_does_not_pick_up_rows_that_have_a_uuid(self):
+        """A resolved row is matched by uuid or not at all -- otherwise a rename would let one
+        MC account count twice, once under each spelling."""
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertEqual(self.st.other_requesters(GUILD, mc_name="alice"), [])
+
+    def test_the_farm_list_is_per_guild(self):
+        self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.assertEqual(self.st.other_requesters(GUILD + 1, mc_uuid=UUID_A), [])
+
     def test_unrelated_accounts_are_unaffected(self):
         self.st.record_kit(GUILD, None, 100, "Alice", UUID_A)
         self.assertFalse(

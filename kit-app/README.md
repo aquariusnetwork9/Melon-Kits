@@ -302,8 +302,15 @@ verified" line is suppressed.
 
 Above all of it sits a one-line call — **Nothing against them** / **Worth a closer look** /
 **Blocked** — and every rule that fired with the evidence it read. Chat for that is swept over
-the last 365 days, page-walked to a cap; the trace states whether it read the whole year or only
-a sample, because "nothing found" in 12 lines and in 12 of 2,595 are different claims.
+the last 999 days, page-walked to a cap; the trace states whether it read the whole window or
+only a sample, because "nothing found" in 12 lines and in 12 of 2,595 are different claims. The
+window is that wide because a year missed the point: two of the worst-behaved accounts in the
+2025 bulk dump read completely clean over the last twelve months, having gone quiet.
+
+The ledger is read in both directions. Other MC names behind one Discord account is what an
+**alt** looks like, and asks for a look. Other Discord accounts in front of one MC account is
+what a **farm** looks like — and if one of those earlier requests was granted, that is a Blocked,
+because somebody already collected on this account under another identity.
 
 Three things it will not do:
 

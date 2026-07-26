@@ -406,6 +406,117 @@ class CardCase(unittest.TestCase):
         self.assertNotIn("not shown", text)
         self.assertLessEqual(len(text), card_mod.RULES_TEXT_BUDGET)
 
+    # -------------------------------------- the request clock and the farm list
+
+    def clean_client(self):
+        return FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                          deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}])
+
+    def test_a_previous_declined_request_denies(self):
+        """Chat aside, this is the one that catches somebody re-asking after a no."""
+        old = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(old, 500, store_mod.STATUS_DECLINED, "no")
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE)
+        rec = card_mod.recommend(card)
+        self.assertEqual(rec["call"], card_mod.CALL_DENY)
+        fired = [r for r in rec["rules"] if "one request per" in r["rule"]]
+        self.assertTrue(fired)
+        self.assertIn("declined", fired[0]["because"])
+
+    def test_the_applicants_own_ticket_does_not_deny_them(self):
+        """`gather` runs after the row is written, so without the exclusion every single card
+        would report its own ticket as the blocker and deny everyone."""
+        mine = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE, ticket_id=mine)
+        self.assertEqual(card_mod.recommend(card)["call"], card_mod.CALL_APPROVE)
+
+    def test_a_lookup_never_reports_the_reviewers_own_request_history(self):
+        """/lookup passes the REVIEWER's Discord id -- there is no applicant -- so a request
+        clock computed there would put the reviewer's own history on the card as the subject's."""
+        mine = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(mine, 500, store_mod.STATUS_DECLINED, "no")
+        card = card_mod.gather(GUILD, "Zed", None, 100, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}))          # no request_type
+        self.assertFalse(card["request_cooldown"]["blocked"])
+        self.assertFalse([r for r in card_mod.recommend(card)["rules"]
+                          if "one request per" in r["rule"]])
+
+    def test_a_second_discord_account_on_a_helped_mc_account_denies(self):
+        """The kit farm: somebody was granted a kit on this MC account under a different
+        Discord identity."""
+        first = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(first, 500, store_mod.STATUS_APPROVED)
+        self.st.record_kit(GUILD, first, 100, "Alice", UUID_A)
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 200, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE)
+        rec = card_mod.recommend(card)
+        self.assertEqual(rec["call"], card_mod.CALL_DENY)
+        self.assertTrue([r for r in rec["rules"] if r["rule"] == "kit farming"])
+
+    def test_a_second_discord_account_with_no_grant_only_asks_for_a_look(self):
+        """A farm, a friend asking on someone's behalf, and an account that changed hands all
+        look identical until one of them collects."""
+        first = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(first, 500, store_mod.STATUS_DECLINED, "no")
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 200, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE)
+        rec = card_mod.recommend(card)
+        fired = [r for r in rec["rules"]
+                 if r["rule"] == "same MC account, different Discord"]
+        self.assertTrue(fired)
+        self.assertEqual(fired[0]["says"], card_mod.CALL_LOOK)
+        self.assertFalse([r for r in rec["rules"] if r["rule"] == "kit farming"])
+
+    def test_the_farm_signal_says_when_it_matched_on_a_name_only(self):
+        self.st.create_ticket(GUILD, 100, "Alice", None, None)
+        card = card_mod.gather(GUILD, "Alice", None, 200, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE)
+        fired = [r for r in card_mod.recommend(card)["rules"]
+                 if "different Discord" in r["rule"] or r["rule"] == "kit farming"]
+        self.assertTrue(fired)
+        self.assertIn("name only", fired[0]["because"])
+
+    def test_one_persons_own_repeat_requests_are_not_a_farm(self):
+        """Their own history is the request clock's business. Reporting it as other accounts
+        farming them would be a plain lie on the card."""
+        old = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(old, 500, store_mod.STATUS_DECLINED, "no")
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE)
+        self.assertEqual(card["other_requesters"], [])
+        self.assertFalse([r for r in card_mod.recommend(card)["rules"]
+                          if r["rule"] == "kit farming"])
+
+    def test_a_worst_case_card_still_fits_discords_limits(self):
+        """The ledger section grew a request clock and a farm list. rules_text already learned
+        this lesson the hard way; nothing else on the card has a budget of its own, so the size
+        is asserted here instead."""
+        for uid in (101, 102, 103, 104, 105):
+            t = self.st.create_ticket(GUILD, uid, "Alice", UUID_A, None)
+            self.st.record_decision(t, 500, store_mod.STATUS_APPROVED)
+            self.st.record_kit(GUILD, t, uid, "Alice", UUID_A)
+        for name in ("Bob", "Carol", "Dave", "Eve", "Frank"):
+            self.st.create_ticket(GUILD, 200, name, "u-" + name, None)
+        old = self.st.create_ticket(GUILD, 200, "Alice", UUID_A, None)
+        self.st.record_decision(old, 500, store_mod.STATUS_DECLINED, "no")
+        self.st.set_flag(GUILD, "deny", 500, mc_uuid=UUID_A, note="ban evading, third account")
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 200, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE)
+        total = 0
+        for section in card_mod.sections(card):
+            self.assertLessEqual(len(section["value"]), 1024, section["name"])
+            total += len(section["name"]) + len(section["value"])
+        self.assertLessEqual(total + len(card_mod.headline(card)), 6000)
+
     def test_every_deny_threshold_names_a_category_that_can_fire(self):
         """A CHAT_DENY entry for a category the loop never consults would be dead config that
         looks live."""
@@ -484,7 +595,9 @@ class CardCase(unittest.TestCase):
                        chats=self.chats_saying(*(["hello"] * 12)))
         card = self.build(c)
         self.assertTrue(card["chat_complete"])
-        self.assertEqual(card["chat_window_days"], 365)
+        # Whatever the configured window is -- pinning the number here made this test fail for
+        # the one reason that is not a bug, somebody changing the policy on purpose.
+        self.assertEqual(card["chat_window_days"], self.cfg["policy"]["chat_window_days"])
         self.assertIn("read all 12", card_mod.chat_coverage_phrase(card))
         self.assertEqual(card_mod.recommend(card)["call"], card_mod.CALL_APPROVE)
 

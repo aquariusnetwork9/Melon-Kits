@@ -643,6 +643,95 @@ class Store(object):
         return list(self._db.execute(
             sql + " ORDER BY created_at DESC LIMIT ?", args))
 
+    # Statuses that start the per-identity request clock. Cancelled is absent on purpose: the bot
+    # cancels a ticket itself when it cannot post the reviewer card, precisely so the applicant
+    # can retry at once, and counting that would lock somebody out for half a year over our bug.
+    # Open counts -- an abandoned open ticket is still a request that was made.
+    REQUEST_CLOCK_STATUSES = (STATUS_OPEN, STATUS_APPROVED, STATUS_DECLINED)
+
+    def last_request(self, guild_id: int, discord_user_id: int,
+                     exclude_ticket_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+        """This Discord identity's most recent ticket in this guild, whatever came of it.
+
+        Keyed on the Discord id alone, unlike `last_kit`, which also matches the MC account.
+        That is deliberate and it is the difference between the two clocks: this one asks "has
+        this person asked recently", and letting a different MC name reset it would make the
+        answer "no" for anyone who typed a new username.
+        """
+        marks = ",".join("?" * len(self.REQUEST_CLOCK_STATUSES))
+        sql = ("SELECT * FROM tickets WHERE guild_id=? AND discord_user_id=? "
+               "AND status IN (%s)" % marks)
+        args: List[Any] = [int(guild_id), int(discord_user_id)]
+        args.extend(self.REQUEST_CLOCK_STATUSES)
+        if exclude_ticket_id is not None:
+            sql += " AND id<>?"
+            args.append(int(exclude_ticket_id))
+        return self._db.execute(
+            sql + " ORDER BY created_at DESC, id DESC LIMIT 1", args).fetchone()
+
+    def request_cooldown(self, guild_id: int, cooldown_days: int, discord_user_id: int,
+                         now: Optional[int] = None,
+                         exclude_ticket_id: Optional[int] = None) -> Dict[str, Any]:
+        """``{'blocked', 'days_left', 'last_at', 'last_ticket_id', 'last_status'}``
+
+        `exclude_ticket_id` exists because the card for ticket N must not report that ticket N
+        blocks itself: `gather` runs after the row is written, so the applicant's own request is
+        the most recent one by definition.
+        """
+        empty = {"blocked": False, "days_left": 0, "last_at": None,
+                 "last_ticket_id": None, "last_status": None}
+        if cooldown_days <= 0:
+            return empty
+        row = self.last_request(guild_id, discord_user_id, exclude_ticket_id)
+        if row is None:
+            return empty
+        now = _now() if now is None else int(now)
+        elapsed = now - int(row["created_at"])
+        window = int(cooldown_days) * 86400
+        out = {"blocked": elapsed < window,
+               # Ceiling, so "1 day left" never means "come back in 40 minutes".
+               "days_left": int(-(-(window - elapsed) // 86400)) if elapsed < window else 0,
+               "last_at": int(row["created_at"]),
+               "last_ticket_id": int(row["id"]),
+               "last_status": str(row["status"])}
+        return out
+
+    def other_requesters(self, guild_id: int, mc_uuid: Optional[str] = None,
+                         mc_name: Optional[str] = None,
+                         exclude_user_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Other Discord identities that have opened a ticket for THIS Minecraft account.
+
+        The kit-farm shape, and the opposite direction from `linked_accounts`: that one asks
+        which MC names sit behind one Discord account (an alt), this one asks which Discord
+        accounts sit in front of one MC account (a farm). A second Discord identity asking for an
+        account somebody was already helped on is the pattern worth naming.
+
+        Matched on uuid when there is one and on name only as a fallback, because a rename would
+        otherwise split one MC account's history -- and a name match alone is weak enough that
+        the card says which of the two it was.
+
+        Cancelled tickets are included here, unlike the request clock: for evidence, an attempt
+        that never reached a reviewer still shows somebody tried.
+        """
+        if not mc_uuid and not mc_name:
+            return []
+        if mc_uuid:
+            where, args = "mc_uuid=?", [mc_uuid]
+        else:
+            where, args = "mc_uuid IS NULL AND LOWER(mc_name)=?", [str(mc_name).lower()]
+        sql = ("SELECT discord_user_id, mc_name, mc_uuid, COUNT(*) AS tickets, "
+               "MAX(created_at) AS newest, "
+               "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS approved, "
+               "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS declined "
+               "FROM tickets WHERE guild_id=? AND %s" % where)
+        params: List[Any] = [STATUS_APPROVED, STATUS_DECLINED, int(guild_id)]
+        params.extend(args)
+        if exclude_user_id is not None:
+            sql += " AND discord_user_id<>?"
+            params.append(int(exclude_user_id))
+        return list(self._db.execute(
+            sql + " GROUP BY discord_user_id ORDER BY newest DESC LIMIT 25", params))
+
     def linked_accounts(self, guild_id: int, discord_user_id: Optional[int] = None,
                         mc_uuid: Optional[str] = None) -> List[sqlite3.Row]:
         """Other identities that have shared a ticket with these -- the ledger fan-out.

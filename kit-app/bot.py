@@ -1088,6 +1088,23 @@ class KitBot(discord.Client):
                     "still be open to you."), ephemeral=True)
             return
 
+        # The per-identity request clock, checked LAST of the three because it is the broadest:
+        # not per kind and not per outcome, so it is the one most likely to be the real answer
+        # and the least useful thing to say first if a narrower rule also applies.
+        rq = self.store.request_cooldown(gid, int(g["request_cooldown_days"]), user_id)
+        if rq["blocked"]:
+            await interaction.response.send_message(
+                "You've already made a request here - #%d, %s. It's **one request per %d "
+                "days** per Discord account, so there's about %d day(s) to go.\n\n"
+                "That applies whether a request was approved or turned down, and it isn't "
+                "personal: help here is voluntary and this is how it gets spread around."
+                % (rq["last_ticket_id"],
+                   "approved" if rq["last_status"] == store_mod.STATUS_APPROVED
+                   else "turned down" if rq["last_status"] == store_mod.STATUS_DECLINED
+                   else "still open",
+                   int(g["request_cooldown_days"]), rq["days_left"]), ephemeral=True)
+            return
+
         await interaction.response.send_modal(
             FundingModal(self) if kind == store_mod.KIND_FUNDING else RequestModal(self))
 
@@ -1149,7 +1166,7 @@ class KitBot(discord.Client):
 
         built = await loop.run_in_executor(None, lambda: card_mod.gather(
             gid, canonical, mc_uuid, user.id, self.cfg, self.vc, self.store, self.lex, LOG,
-            request_type=kind, details=details))
+            request_type=kind, details=details, ticket_id=ticket_id))
 
         # Instrumentation: the lines shown, stored redacted. Impossible to backfill.
         try:

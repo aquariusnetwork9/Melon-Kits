@@ -71,6 +71,13 @@ DEFAULTS: Dict[str, Any] = {
     },
     "policy": {
         "cooldown_days": 21,
+        # How long a Discord identity waits after ANY ticket it opened -- approved or declined
+        # alike. Distinct from `cooldown_days`, which starts at a *grant* and runs per request
+        # type: this one starts at the request and does not care what came of it, so being
+        # declined is not a free retry. Cancelled tickets are excluded, because the bot cancels
+        # tickets itself when it cannot post a card and nobody may be locked out by our own bug.
+        # 0 disables it.
+        "request_cooldown_days": 180,
         "max_open_tickets_per_user": 1,
         # How much recent chat to put in front of a reviewer.
         "recent_chats": 100,
@@ -84,7 +91,14 @@ DEFAULTS: Dict[str, Any] = {
         # exists for the tail: p99 is 2,595 lines (26 requests) and the busiest account of 2025
         # said 109,220 (1,093 requests) -- which no single ticket may spend against a bucket
         # shared with every other caller of the API.
-        "chat_window_days": 365,
+        #
+        # 999 days rather than 365 because a year turned out to miss the thing it was for:
+        # accounts with hundreds of slur lines in the 2025 dump read completely clean over the
+        # last twelve months, having gone quiet. The page cap is unchanged and still binds first
+        # for the talkative -- a 999-day sweep of a busy account is 500 of its most recent lines,
+        # not more history -- so widening the window trades coverage of the loud for reach on
+        # everyone else. That is the intended trade and the trace states which one happened.
+        "chat_window_days": 999,
         "chat_max_pages": 5,
         "recent_deaths": 3,
         # A death inside this window is treated as supporting "I just lost everything".
@@ -290,6 +304,8 @@ def _validate(cfg: Dict[str, Any]) -> None:
     pol, vc = cfg["policy"], cfg["vc"]
     if pol["cooldown_days"] < 0:
         raise ConfigError("policy.cooldown_days must be >= 0")
+    if pol["request_cooldown_days"] < 0:
+        raise ConfigError("policy.request_cooldown_days must be >= 0 (0 disables it)")
     if not 1 <= pol["recent_chats"] <= 100:
         # /chats caps pageSize at 100 and page-walking a live player is not worth the
         # global rate-limit budget for a review that a human reads in one screen.

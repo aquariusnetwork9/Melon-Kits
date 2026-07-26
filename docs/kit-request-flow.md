@@ -41,6 +41,22 @@ and for the cooldown *first*, and reply ephemerally if either blocks. Making som
 form and then telling them they were never eligible is the one avoidable bad experience in
 this flow.
 
+There are now **three** gates, checked narrowest-first so the most specific reason is the one
+given:
+
+1. **One open ticket.** Not per type — two open tickets is two threads and two cards for one
+   person, and being stuck open is the most expensive failure this app has.
+2. **The kit cooldown** (`cooldown_days`, 21). Starts at a **grant**, runs **per request type**,
+   and matches on the Discord id *or* the MC account.
+3. **The request cooldown** (`request_cooldown_days`, 180). Starts at the **request**, ignores
+   the type, ignores the outcome, and matches on the **Discord id alone**. Being declined is not
+   a free retry, and typing a different username is not a way around it.
+
+Cancelled tickets do not start the request clock. The bot cancels tickets itself when it cannot
+post a reviewer card — specifically so the applicant can retry at once — and counting that would
+lock somebody out for half a year over our own bug. The farm list below *does* count them,
+because for evidence an attempt that never reached a reviewer still shows somebody tried.
+
 ## 2. The ticket
 
 A rescue modal collects the Minecraft username and a free-text note; the funding modal collects

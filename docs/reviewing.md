@@ -53,14 +53,39 @@ turned out to be an advertising fleet whose ad copy contained the word "doxxing"
 shipped lexicon carries **directed forms only** (`dox you`, never bare `doxxing`), and why the
 trace always names which line numbers to read.
 
+### Kit farming
+
+The ledger is checked in both directions, and they answer different questions:
+
+- **Other MC names behind one Discord account** — what an alt looks like, and also a rename, a
+  sibling, or a borrowed account. Asks for a look, never more.
+- **Other Discord accounts in front of one MC account** — what a *farm* looks like. If any of
+  those earlier requests was **granted**, that is a **Blocked**: somebody already collected on
+  this Minecraft account under a different identity, which is a fact about the ledger rather
+  than an inference about a person. If none was granted it only asks for a look — a farm, a
+  friend asking on someone's behalf, and an account that changed hands are indistinguishable
+  until one of them collects.
+
+Matched on UUID whenever one resolved, so a rename cannot split one account's history into two
+innocent halves. When no UUID resolved it falls back to the name and **says so on the card**,
+because a name match alone is much weaker.
+
 ### How much chat it actually read
 
 The trace ends with what it looked at, and this matters more than it sounds. Chat is swept over
-the **last 365 days**, page-walked up to a cap. Most of the time it reads the whole year — the
-median 2b2t player says **twelve lines in a year**, and the cap covers ~94% of players
-completely. For the talkative minority it stops early and says so:
+the **last 999 days**, page-walked up to a cap. Most of the time it reads the whole window — the
+median 2b2t player says **twelve lines in a year** — and for the talkative minority it stops
+early and says so:
 
-> read the most recent 500 line(s) of 2595 in the last 365 days - the rest was not examined
+> read the most recent 500 line(s) of 2595 in the last 999 days - the rest was not examined
+
+**Why 999 and not a year.** A year missed the thing it was for. Accounts with hundreds of slur
+lines in the 2025 bulk dump read completely clean over the last twelve months, having simply gone
+quiet — two of the worst offenders on the whole server came back as *nothing found* on 12 and 42
+lines. The page cap is unchanged and still binds first for heavy talkers, so a wider window buys
+reach on the quiet and sampling on the loud. That is a deliberate trade: someone who says 500
+lines a week is not who this list is protecting anyone from, and the trace always states which
+of the two happened.
 
 Treat that exactly like "could not retrieve deaths". Nothing found in a sample is not the same
 claim as nothing found in a year, and the card will not pretend otherwise.
