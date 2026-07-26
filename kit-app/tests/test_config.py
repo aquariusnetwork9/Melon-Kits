@@ -125,6 +125,25 @@ class ConfigCase(unittest.TestCase):
             config.load_config(path, env={})
         self.assertIn("dispatch_channel_id", str(ctx.exception))
 
+    def test_channels_may_not_collide(self):
+        """A privacy failure, not a typo: the panel channel is public while the queue and
+        transcript channels are staff-only, so sharing one publishes reviewer cards to
+        applicants -- and nothing at runtime would look wrong."""
+        for a, b in (("panel_channel_id", "queue_channel_id"),
+                     ("panel_channel_id", "transcript_channel_id"),
+                     ("queue_channel_id", "transcript_channel_id")):
+            path = self.cfg_file({"discord": {a: 555, b: 555}})
+            with self.assertRaises(config.ConfigError) as ctx:
+                config.load_config(path, env={})
+            self.assertIn("same channel", str(ctx.exception))
+
+    def test_distinct_channels_are_fine_and_zero_is_not_a_collision(self):
+        path = self.cfg_file({"discord": {"panel_channel_id": 1,
+                                          "queue_channel_id": 2,
+                                          "transcript_channel_id": 0}})
+        cfg = config.load_config(path, env={})
+        self.assertEqual(cfg["discord"]["transcript_channel_id"], 0)
+
     def test_env_name_mapping(self):
         self.assertEqual(config.env_name("vc.min_interval_s"),
                          "MELONKIT_VC_MIN_INTERVAL_S")

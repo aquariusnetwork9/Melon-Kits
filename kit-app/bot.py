@@ -295,16 +295,15 @@ async def _safe_followup(interaction: discord.Interaction, text: str) -> None:
 
 class KitBot(discord.Client):
     def __init__(self, cfg: Dict[str, Any], post_panel_to: int = 0) -> None:
-        # No privileged intents are needed for the request flow itself. MESSAGE_CONTENT is
-        # only required by the optional Discord-history lookup, so it is not demanded here:
-        # a bot that cannot start without a privileged intent it barely uses is a bot that
-        # does not start.
-        intents = discord.Intents.default()
-        if cfg["discord"]["capture_thread_messages"]:
-            # Privileged. Without it Discord returns empty content and a transcript would
-            # quietly record an empty conversation, which is worse than not recording one.
-            intents.message_content = True
-        super().__init__(intents=intents)
+        # NO privileged intents, ever -- including for transcript conversation capture.
+        #
+        # MESSAGE_CONTENT gates message content in *gateway events*. It does NOT gate REST
+        # history fetches, which are governed by Read Message History. Transcripts read the
+        # thread over REST at archive time, so they get full content without it. Verified
+        # against real messages, because the docs read as though the intent covers both and
+        # requesting it here would have meant the bot refusing to start until someone
+        # enabled it in the Developer Portal -- a hard failure in exchange for nothing.
+        super().__init__(intents=discord.Intents.default())
         self.cfg = cfg
         # One-shot deploy mode: post the panel to this channel, then exit. Lets a deployment
         # finish without a human having to run /panel in a client.
@@ -323,10 +322,31 @@ class KitBot(discord.Client):
                 LOG.error("lexicon at %s could not be loaded (%s); continuing with none - "
                           "chat will still be listed, just not counted", path, exc)
 
+    async def on_error(self, event: str, *args, **kwargs) -> None:
+        """Never let an unhandled listener exception die silently in the library's logger."""
+        LOG.exception("unhandled exception in event=%s", event)
+
+    async def _on_app_command_error(self, interaction: discord.Interaction,
+                                    error: Exception) -> None:
+        """Without this a crashing slash command leaves the user staring at a spinner.
+
+        Discord shows "the application did not respond" and the traceback goes only to
+        discord.py's logger, so the operator learns nothing and the user learns less. The
+        message is deliberately vague about the cause -- an exception string can contain a
+        row body -- and points at the log instead.
+        """
+        cmd = getattr(interaction.command, "name", "?")
+        LOG.exception("slash command failed command=%s user=%s", cmd, interaction.user.id)
+        await _safe_followup(
+            interaction,
+            "That didn't work. Nothing was changed - the error is in the bot log "
+            "(`journalctl -u melonkit-bot`).")
+
     async def setup_hook(self) -> None:
         self.add_view(PanelView())
         for item in (ApproveButton, DeclineButton, ClaimButton, DeliveredButton):
             self.add_dynamic_items(item)
+        self.tree.on_error = self._on_app_command_error
         register_commands(self)
         guild_id = int(self.cfg["discord"]["guild_id"] or 0)
         if guild_id:
@@ -499,10 +519,18 @@ class KitBot(discord.Client):
 
         posted = await self._post_queue_card(ticket_id, canonical, user, built, thread)
         if not posted:
+            # No reviewer will ever see this ticket, and leaving it `open` would bar the
+            # applicant from trying again -- the lockout, reached by a third route. Close it
+            # so they can immediately retry; nothing was reviewed, so nothing is lost.
+            self.store.record_decision(
+                ticket_id, self.user.id, store_mod.STATUS_CANCELLED,
+                "auto-closed: the reviewer card could not be posted to the queue")
+            LOG.error("ticket auto-closed, queue card failed ticket=%d", ticket_id)
             await interaction.followup.send(
-                "Your request was recorded as **#%d**, but I couldn't post it to the review "
-                "queue - a reviewer will have to pick it up by hand. Nothing you need to do."
-                % ticket_id, ephemeral=True)
+                "Something went wrong on our side posting your request to the reviewers, so "
+                "**#%d has been cancelled rather than left stuck** - please press the button "
+                "again and it should go through. Sorry about that." % ticket_id,
+                ephemeral=True)
             return
 
         where = "<#%d>" % thread.id if thread is not None else "a reviewer thread"
@@ -611,19 +639,30 @@ class KitBot(discord.Client):
             await _safe_followup(interaction, "Only reviewers can decide a request.")
             return
 
+        # Acknowledge BEFORE any network work. Everything below can involve a round trip --
+        # _queue_post may fetch_channel, then there are message edits and thread edits -- and
+        # the initial response deadline is 3 seconds. Blowing it makes Discord show "This
+        # interaction failed" *after* the decision has already been recorded, which invites
+        # the reviewer to press again; combined with a non-atomic decision that used to mean
+        # two kits for one request.
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
         ticket = self.store.get_ticket(ticket_id)
         if ticket is None:
             await _safe_followup(interaction, "Ticket #%d no longer exists." % ticket_id)
             return
-        if ticket["status"] != store_mod.STATUS_OPEN:
-            await _safe_followup(
-                interaction,
-                "Ticket #%d was already **%s** - two reviewers probably opened it at once."
-                % (ticket_id, ticket["status"]))
-            return
 
         outcome = store_mod.STATUS_APPROVED if approve else store_mod.STATUS_DECLINED
-        self.store.record_decision(ticket_id, interaction.user.id, outcome, reason)
+        # Conditional at the database, not a read-then-write: this is what actually stops two
+        # simultaneous reviewers both winning.
+        if not self.store.record_decision(ticket_id, interaction.user.id, outcome, reason):
+            fresh = self.store.get_ticket(ticket_id)
+            await _safe_followup(
+                interaction,
+                "Ticket #%d was already **%s** - somebody got there first, so nothing "
+                "changed." % (ticket_id, fresh["status"] if fresh else "decided"))
+            return
         LOG.info("ticket decided ticket=%d outcome=%s reviewer=%s",
                  ticket_id, outcome, interaction.user.id)
 
@@ -633,10 +672,9 @@ class KitBot(discord.Client):
         qthread, qmsg = await self._queue_post(ticket)
 
         if not approve:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "Ticket #%d declined. Reason recorded in the ledger." % ticket_id,
-                    ephemeral=True)
+            await _safe_followup(
+                interaction,
+                "Ticket #%d declined. Reason recorded in the ledger." % ticket_id)
             if qmsg is not None:
                 try:
                     await qmsg.edit(
@@ -725,17 +763,36 @@ class KitBot(discord.Client):
         if not isinstance(ch, discord.Thread):
             return None
         lines = []
+        human_msgs = 0
+        human_with_text = 0
         try:
             async for msg in ch.history(limit=500, oldest_first=True):
                 stamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%SZ")
-                body = (msg.content or "").replace("\n", "\n" + " " * 30)
+                text = msg.content or ""
+                if not msg.author.bot:
+                    human_msgs += 1
+                    if text:
+                        human_with_text += 1
+                body = text.replace("\n", "\n" + " " * 30)
                 lines.append("%s  %-18s %s" % (stamp, msg.author.display_name[:18], body))
                 for att in msg.attachments:
                     lines.append("%s  %-18s [attachment: %s]"
                                  % (" " * 20, "", att.filename))
         except discord.HTTPException:
             return None
-        return "\n".join(lines) if lines else None
+        if not lines:
+            return None
+        # Defensive: if every human message came back with empty content, we are being
+        # redacted rather than reading a genuinely silent thread. Recording a wall of blank
+        # lines would look like the applicant said nothing, which is a worse lie than
+        # admitting we could not read it -- and it is how a future Discord change extending
+        # MESSAGE_CONTENT to REST would show up.
+        if human_msgs and not human_with_text:
+            LOG.warning("thread history returned empty content for all %d human message(s) "
+                        "in thread=%s: message content appears to be gated now",
+                        human_msgs, ch.id)
+            return None
+        return "\n".join(lines)
 
     async def _post_transcript(self, ticket_id: int) -> None:
         """One self-contained record of a finished ticket, in the staff archive.
@@ -756,9 +813,10 @@ class KitBot(discord.Client):
         if t is None:
             return
         decisions = self.store.decisions_for(ticket_id)
-        kits = [k for k in self.store.kit_history(
-            discord_user_id=int(t["discord_user_id"]), mc_uuid=t["mc_uuid"], limit=20)
-            if k["ticket_id"] == ticket_id]
+        # Queried by ticket, not filtered out of kit_history: that is capped and ordered by
+        # recency, so for a heavy repeat applicant this ticket's kit could fall off the end
+        # and the transcript would quietly report no delivery.
+        kits = self.store.kits_for_ticket(ticket_id)
         shown = self.store.shown_chats(ticket_id)
         flagged = [r for r in shown if r["flagged"]]
 
@@ -846,10 +904,10 @@ class KitBot(discord.Client):
         if convo:
             parts.append(convo)
         elif self.cfg["discord"]["capture_thread_messages"]:
-            parts.append("  (unavailable - thread already deleted)")
+            parts.append("  (unavailable - the thread was already deleted, or its content "
+                         "could not be read; see the bot log)")
         else:
-            parts.append("  (not captured - set discord.capture_thread_messages and enable "
-                         "the MESSAGE_CONTENT intent)")
+            parts.append("  (not captured - discord.capture_thread_messages is off)")
 
         data = ("\n".join(parts) + "\n").encode("utf-8")
         try:

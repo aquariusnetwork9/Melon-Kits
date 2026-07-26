@@ -57,6 +57,49 @@ class StoreCase(unittest.TestCase):
         self.assertEqual(rows[0]["reason"], "known alt of Bob")
         self.assertEqual(rows[0]["reviewer_id"], 500)
 
+    def test_only_one_reviewer_can_decide_a_ticket(self):
+        """Two reviewers pressing Approve at the same instant.
+
+        The old read-then-write let both pass an `if status == open` check, both record a
+        kit, and the applicant's cooldown get burned twice for one request. The status change
+        is now a conditional UPDATE, so the second caller gets False.
+        """
+        tid = self.st.create_ticket(100, "Alice", UUID_A)
+        self.assertTrue(self.st.record_decision(tid, 500, store_mod.STATUS_APPROVED))
+        self.assertFalse(self.st.record_decision(tid, 600, store_mod.STATUS_APPROVED))
+        self.assertFalse(self.st.record_decision(tid, 600, store_mod.STATUS_DECLINED))
+        # Exactly one decision on record, by the winner.
+        rows = self.st.decisions_for(tid)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reviewer_id"], 500)
+
+    def test_concurrent_decisions_produce_exactly_one_winner(self):
+        import concurrent.futures
+        tid = self.st.create_ticket(100, "Alice", UUID_A)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = [f.result(timeout=30) for f in [
+                pool.submit(self.st.record_decision, tid, 500 + n,
+                            store_mod.STATUS_APPROVED) for n in range(8)]]
+        self.assertEqual(sum(1 for r in results if r), 1, "more than one reviewer won")
+        self.assertEqual(len(self.st.decisions_for(tid)), 1)
+
+    def test_kits_for_ticket_is_not_limited_by_recency(self):
+        """Transcripts used to filter kit_history, which is capped and recency-ordered, so a
+        heavy repeat applicant's older ticket reported no delivery."""
+        target = self.st.create_ticket(100, "Alice", UUID_A)
+        kit = self.st.record_kit(target, 100, "Alice", UUID_A)
+        # Force it to be genuinely oldest. record_kit stamps time.time(), so 31 rows created
+        # in the same second share a created_at and ORDER BY created_at DESC does not
+        # actually bury anything -- the fixture has to be explicit or it proves nothing.
+        self.st._db.execute("UPDATE kits SET created_at=1 WHERE id=?", (kit,))
+        for _ in range(30):
+            self.st.record_kit(None, 100, "Alice", UUID_A)
+
+        self.assertNotIn(kit, [r["id"] for r in self.st.kit_history(
+            discord_user_id=100, limit=10)], "fixture failed to bury the kit")
+        found = self.st.kits_for_ticket(target)
+        self.assertEqual([r["id"] for r in found], [kit])
+
     def test_unknown_outcome_is_rejected(self):
         tid = self.st.create_ticket(100, "Alice", UUID_A)
         with self.assertRaises(ValueError):

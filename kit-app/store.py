@@ -252,22 +252,45 @@ class Store(object):
     # ---------------------------------------------------------------- decisions
 
     def record_decision(self, ticket_id: int, reviewer_id: int, outcome: str,
-                        reason: Optional[str] = None) -> None:
+                        reason: Optional[str] = None) -> bool:
+        """Decide a ticket. Returns False if it was **already** decided.
+
+        The status change is a conditional UPDATE inside the transaction, not a separate
+        read-then-write, so two reviewers pressing Approve at the same instant cannot both
+        win. That is not a hypothetical: without it both callers pass an `if status == open`
+        check, both record a kit, and the applicant's 21-day cooldown is burned twice for one
+        request. The loser gets False and is told, exactly like the Claim button.
+        """
         if outcome not in (STATUS_APPROVED, STATUS_DECLINED, STATUS_CANCELLED):
             raise ValueError("unknown outcome %r" % (outcome,))
         now = _now()
-        self._db.execute("BEGIN")
+        self._db.execute("BEGIN IMMEDIATE")
         try:
+            cur = self._db.execute(
+                "UPDATE tickets SET status=?, closed_at=? WHERE id=? AND status=?",
+                (outcome, now, int(ticket_id), STATUS_OPEN))
+            if cur.rowcount == 0:
+                self._db.execute("ROLLBACK")
+                return False
             self._db.execute(
                 "INSERT INTO decisions(ticket_id, reviewer_id, outcome, reason, decided_at)"
                 " VALUES(?,?,?,?,?)",
                 (int(ticket_id), int(reviewer_id), outcome, reason, now))
-            self._db.execute("UPDATE tickets SET status=?, closed_at=? WHERE id=?",
-                             (outcome, now, int(ticket_id)))
             self._db.execute("COMMIT")
+            return True
         except Exception:
             self._db.execute("ROLLBACK")
             raise
+
+    def kits_for_ticket(self, ticket_id: int) -> List[sqlite3.Row]:
+        """Kits belonging to one ticket.
+
+        Used instead of filtering kit_history, which is capped at a row limit and ordered by
+        recency -- for a heavy repeat applicant the relevant kit could fall off the end and
+        the transcript would silently report no delivery.
+        """
+        return list(self._db.execute(
+            "SELECT * FROM kits WHERE ticket_id=? ORDER BY id", (int(ticket_id),)))
 
     def decisions_for(self, ticket_id: int) -> List[sqlite3.Row]:
         return list(self._db.execute(

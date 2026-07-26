@@ -34,12 +34,15 @@ DEFAULTS: Dict[str, Any] = {
         # one self-contained summary posted here, with the chat log attached, so the record
         # survives the thread and the queue post being deleted. 0 disables it.
         "transcript_channel_id": 0,
-        # Include the applicant<->staff conversation in the transcript. Requires the
-        # MESSAGE_CONTENT privileged intent (Developer Portal > Bot > Message Content
-        # Intent); without it Discord returns empty strings for message content and the
-        # transcript would silently record an empty conversation, so this stays off unless
-        # you turn the intent on.
-        "capture_thread_messages": False,
+        # Include the applicant<->staff conversation in the transcript.
+        #
+        # This needs NO privileged intent. MESSAGE_CONTENT gates content in gateway events,
+        # not in REST history fetches -- those only need Read Message History, which the bot
+        # already has in its own ticket threads. Verified against real messages.
+        #
+        # Default off purely because it is a judgement call about recording people's
+        # conversations, not because of a technical obstacle.
+        "capture_thread_messages": True,
         # May approve/decline and see reviewer cards.
         "reviewer_role_id": 0,
         # May claim a dispatch. 0 means "anyone in the dispatch channel".
@@ -254,3 +257,22 @@ def _validate(cfg: Dict[str, Any]) -> None:
         raise ConfigError(
             "screening.redact_coords must stay true: chat excerpts routinely contain third "
             "parties' base coordinates and a Discord thread is not the place for them")
+
+    # Channel collisions are a privacy failure, not a typo. panel_channel_id is PUBLIC;
+    # queue and transcript are staff-only. Point two of them at one channel and reviewer
+    # cards -- chat logs, reviewer flags, the ledger fan-out -- become world-readable, and
+    # nothing at runtime would look wrong.
+    ids = {"panel_channel_id": int(cfg["discord"]["panel_channel_id"] or 0),
+           "queue_channel_id": int(cfg["discord"]["queue_channel_id"] or 0),
+           "transcript_channel_id": int(cfg["discord"]["transcript_channel_id"] or 0)}
+    seen = {}
+    for key, val in ids.items():
+        if not val:
+            continue
+        if val in seen:
+            raise ConfigError(
+                "discord.%s and discord.%s are the same channel (%d). The panel channel is "
+                "public while the queue and transcript channels are staff-only, so sharing "
+                "one would publish reviewer cards to applicants."
+                % (seen[val], key, val))
+        seen[val] = key

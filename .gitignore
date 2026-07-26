@@ -28,6 +28,10 @@ lexicon.json
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+# Backups taken by deploy/reset_tickets.py. A trailing suffix means *.sqlite3 does NOT
+# match these, and they are a full copy of a ledger containing chat.
+*.sqlite3.bak-*
+*.sqlite3.bak
 
 # A bot token must never reach a commit. It is read from the environment, not from config,
 # but an .env written by hand is the obvious way round that.
