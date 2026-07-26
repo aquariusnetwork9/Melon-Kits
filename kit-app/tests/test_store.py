@@ -142,6 +142,34 @@ class StoreCase(unittest.TestCase):
         self.assertTrue(self.st.mark_delivered(kit))
         self.assertFalse(self.st.mark_delivered(kit))
 
+    def test_reviewer_can_release_a_claim_held_by_someone_else(self):
+        """A runner goes quiet holding a delivery. unclaim_kit deliberately refuses that, so
+        there is a separate release_kit for the reviewer override."""
+        kit = self.st.record_kit(None, 100, "Alice", UUID_A)
+        self.st.claim_kit(kit, 700)
+        self.assertFalse(self.st.unclaim_kit(kit, 900))   # not the holder
+        self.assertTrue(self.st.release_kit(kit))
+        self.assertIsNone(self.st.get_kit(kit)["claimed_by"])
+        self.assertTrue(self.st.claim_kit(kit, 900))
+
+    def test_release_will_not_reopen_a_delivered_kit(self):
+        kit = self.st.record_kit(None, 100, "Alice", UUID_A)
+        self.st.claim_kit(kit, 700)
+        self.st.mark_delivered(kit)
+        self.assertFalse(self.st.release_kit(kit))
+
+    def test_cancelling_a_ticket_frees_the_applicants_slot(self):
+        """The lockout this exists to prevent: the panel pre-check counts OPEN tickets, so an
+        undecided ticket with no way to close it bars the applicant from ever asking again."""
+        tid = self.st.create_ticket(100, "Alice", UUID_A)
+        self.assertEqual(self.st.open_ticket_count(100), 1)
+        self.st.record_decision(tid, 500, store_mod.STATUS_CANCELLED, "no reply in a week")
+        self.assertEqual(self.st.open_ticket_count(100), 0)
+        self.assertEqual(self.st.get_ticket(tid)["status"], store_mod.STATUS_CANCELLED)
+        # ...and closing does NOT record a kit, so the cooldown is untouched.
+        self.assertFalse(self.st.cooldown(21, discord_user_id=100)["blocked"])
+        self.assertIsNotNone(self.st.create_ticket(100, "Alice", UUID_A))
+
     def test_delivered_kit_cannot_be_unclaimed(self):
         kit = self.st.record_kit(None, 100, "Alice", UUID_A)
         self.st.claim_kit(kit, 700)

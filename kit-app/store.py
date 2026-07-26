@@ -264,10 +264,24 @@ class Store(object):
         return cur.rowcount > 0
 
     def unclaim_kit(self, kit_id: int, actor_id: int) -> bool:
+        """Hand a delivery back, but only by whoever took it."""
         cur = self._db.execute(
             "UPDATE kits SET claimed_by=NULL, claimed_at=NULL "
             "WHERE id=? AND claimed_by=? AND delivered_at IS NULL",
             (int(kit_id), int(actor_id)))
+        return cur.rowcount > 0
+
+    def release_kit(self, kit_id: int) -> bool:
+        """Force a delivery back into the pool regardless of who holds it.
+
+        Separate from `unclaim_kit` rather than an `actor_id=None` special case: a reviewer
+        prising a stale claim off someone who has gone quiet is a different act from a runner
+        handing back their own, and a flag on one function would make the two indis-
+        tinguishable at the call site.
+        """
+        cur = self._db.execute(
+            "UPDATE kits SET claimed_by=NULL, claimed_at=NULL "
+            "WHERE id=? AND delivered_at IS NULL", (int(kit_id),))
         return cur.rowcount > 0
 
     def mark_delivered(self, kit_id: int) -> bool:

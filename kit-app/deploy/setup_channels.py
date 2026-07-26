@@ -50,6 +50,7 @@ TAGS = [
     ("declined", "\U0001F6AB"),
     ("claimed", "\U0001F91D"),
     ("delivered", "\U0001F348"),
+    ("closed", "\U0001F5C3"),
 ]
 
 

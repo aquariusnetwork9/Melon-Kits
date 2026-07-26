@@ -82,10 +82,19 @@ Fill in `melonkit.json`:
 | `/flag <name> <kind> <note>` | reviewer | mark an account: known alt, do not serve, or a note. Resolves to a UUID so it survives a rename |
 | `/unflag <id>` | reviewer | clear one |
 | `/ledger <name>` | reviewer | kit history, cooldown state and flags for an account |
+| `/close <ticket> <reason>` | reviewer **or the applicant** | close a ticket with no decision — the applicant went quiet, withdrew, or it was a duplicate |
+| `/unclaim <kit>` | the claimer **or** a reviewer | hand a delivery back to the pool. The ticket stays approved; the kit is still owed |
 | `/flagline <ticket> <lines>` | reviewer | label chat lines you objected to, e.g. `3,7,12` |
 
 `/flagline` looks like a nicety and is the most valuable command here. See
 **Instrumentation** below.
+
+**`/close` is not optional housekeeping.** The panel's pre-check counts *open* tickets, so an
+undecided ticket bars its applicant from ever requesting again. Without a way to close one
+that is a silent, permanent lockout — and given the kits are disposable, under-helping is the
+expensive direction. It is open to the applicant as well as to reviewers, because someone
+withdrawing their own request only frees their own slot and shouldn't need to find staff.
+Closing records no kit, so it never burns the 21-day cooldown.
 
 ---
 

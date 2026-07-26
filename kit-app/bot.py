@@ -82,7 +82,7 @@ def may_claim(member: Any, cfg: Dict[str, Any]) -> bool:
 # matched case-insensitively against whatever the channel already has, so they can be renamed
 # or restyled without touching code -- a missing tag is skipped rather than being an error,
 # because a forum with no tags configured must still work.
-QUEUE_TAGS = ("awaiting review", "approved", "declined", "claimed", "delivered")
+QUEUE_TAGS = ("awaiting review", "approved", "declined", "claimed", "delivered", "closed")
 
 
 def _state_tags(forum: "discord.ForumChannel", state: str) -> list:
@@ -845,6 +845,139 @@ def register_commands(app: KitBot) -> None:
             "Labelled %d of %d line(s) on ticket #%d. This is the only labelled screening "
             "data that exists, so thank you - it can't be reconstructed later."
             % (done, len(positions), ticket), ephemeral=True)
+
+    @tree.command(name="close",
+                  description="Close a ticket without approving or declining it.")
+    @app_commands.describe(ticket="Ticket number",
+                           reason="Why - goes in the ledger, not to the applicant")
+    async def close(interaction: discord.Interaction, ticket: int, reason: str) -> None:
+        """The escape hatch for a ticket that will never get a decision.
+
+        Without this an undecided ticket stays `open` forever, and because the panel's
+        pre-check counts open tickets, **the applicant can never request again** -- a silent
+        permanent lockout, which is the most expensive failure this app has given that the
+        kits are disposable and under-helping is the costly direction.
+
+        Open to the applicant as well as to reviewers: someone withdrawing their own request
+        only frees their own slot, and needing to find a staff member to do it is friction
+        with no upside.
+        """
+        row = app.store.get_ticket(ticket)
+        if row is None:
+            await interaction.response.send_message(
+                "There's no ticket #%d." % ticket, ephemeral=True)
+            return
+        mine = int(row["discord_user_id"]) == interaction.user.id
+        if not (mine or is_reviewer(interaction.user, app.cfg)):
+            await interaction.response.send_message(
+                "Only reviewers, or the person who opened it, can close a ticket.",
+                ephemeral=True)
+            return
+        if row["status"] != store_mod.STATUS_OPEN:
+            await interaction.response.send_message(
+                "Ticket #%d is already **%s** - nothing to close." % (ticket, row["status"]),
+                ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        app.store.record_decision(ticket, interaction.user.id,
+                                  store_mod.STATUS_CANCELLED, reason)
+        LOG.info("ticket closed ticket=%d by=%s self=%s",
+                 ticket, interaction.user.id, mine)
+
+        row = app.store.get_ticket(ticket) or row
+        qthread, qmsg = await app._queue_post(row)
+        if qmsg is not None:
+            try:
+                await qmsg.edit(
+                    content="Ticket #%d - **closed** by %s (no decision)\n> %s"
+                            % (ticket, interaction.user.mention, reason),
+                    view=None, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                LOG.warning("could not update closed queue post ticket=%d", ticket)
+        await _set_queue_state(qthread, "closed", archive=True)
+
+        await app._notify_thread(
+            row,
+            "This request was **withdrawn**." if mine else
+            "This request has been **closed** without a decision. That isn't a no forever - "
+            "you're welcome to open a new one whenever you like.")
+        if row["thread_id"]:
+            ch = app.get_channel(int(row["thread_id"]))
+            if isinstance(ch, discord.Thread):
+                try:
+                    await ch.edit(archived=True)
+                except discord.HTTPException:
+                    pass
+
+        await interaction.followup.send(
+            "Ticket #%d closed. %s can open a new request straight away."
+            % (ticket, "You" if mine else "The applicant"), ephemeral=True)
+
+    @tree.command(name="unclaim",
+                  description="Hand a delivery back to the pool.")
+    @app_commands.describe(kit="Dispatch number from the queue post")
+    async def unclaim(interaction: discord.Interaction, kit: int) -> None:
+        """For a runner who said they'd do it and can't, or a reviewer prising a stale claim
+        off someone who has gone quiet. Leaves the ticket approved -- the kit is still owed,
+        it just needs somebody else."""
+        row = app.store.get_kit(kit)
+        if row is None:
+            await interaction.response.send_message(
+                "There's no dispatch #%d." % kit, ephemeral=True)
+            return
+        if row["delivered_at"]:
+            await interaction.response.send_message(
+                "Dispatch #%d is already marked delivered." % kit, ephemeral=True)
+            return
+        if row["claimed_by"] is None:
+            await interaction.response.send_message(
+                "Dispatch #%d isn't claimed by anyone." % kit, ephemeral=True)
+            return
+
+        holder = int(row["claimed_by"])
+        reviewer = is_reviewer(interaction.user, app.cfg)
+        if holder == interaction.user.id:
+            ok = app.store.unclaim_kit(kit, interaction.user.id)
+        elif reviewer:
+            ok = app.store.release_kit(kit)
+        else:
+            await interaction.response.send_message(
+                "<@%d> claimed this one - they or a reviewer can hand it back." % holder,
+                ephemeral=True)
+            return
+        if not ok:
+            await interaction.response.send_message(
+                "Couldn't release dispatch #%d - someone changed it just now." % kit,
+                ephemeral=True)
+            return
+
+        LOG.info("dispatch released kit=%d by=%s was_held_by=%s",
+                 kit, interaction.user.id, holder)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # Put the Claim button back on the queue post and return it to `approved`.
+        ticket = app.store.get_ticket(int(row["ticket_id"])) if row["ticket_id"] else None
+        if ticket is not None:
+            qthread, qmsg = await app._queue_post(ticket)
+            if qmsg is not None:
+                view = discord.ui.View(timeout=None)
+                view.add_item(ClaimButton(kit))
+                try:
+                    await qmsg.edit(
+                        content="Dispatch #%d - back in the pool, unclaimed." % kit,
+                        view=view, allowed_mentions=discord.AllowedMentions.none())
+                except discord.HTTPException:
+                    LOG.warning("could not restore claim button kit=%d", kit)
+            if qthread is not None:
+                try:
+                    await qthread.edit(archived=False)
+                except discord.HTTPException:
+                    pass
+            await _set_queue_state(qthread, "approved")
+
+        await interaction.followup.send(
+            "Dispatch #%d is claimable again." % kit, ephemeral=True)
 
     @tree.command(name="ledger", description="Kit history and flags for an account.")
     async def ledger(interaction: discord.Interaction, mc_name: str) -> None:
