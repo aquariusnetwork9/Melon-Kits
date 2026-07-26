@@ -54,6 +54,29 @@ TAGS = [
 ]
 
 
+async def sync_existing(channel, topic, overwrites, label):
+    """Re-sync an existing channel, treating topic and overwrites as separate operations.
+
+    They need **different** permissions, and bundling them means the one you cannot do blocks
+    the one you can. Editing permission overwrites requires **Manage Roles** (shown as "Manage
+    Permissions" on a channel) -- Manage Channels is not enough, even though creating a channel
+    *with* overwrites is allowed. So a rerun that only wants to add a forum tag would 403 on
+    the overwrite sync and never reach the tag.
+    """
+    try:
+        await channel.edit(topic=topic, reason="Melon Kits: sync topic")
+        sys.stderr.write("  reused #%s (topic synced)\n" % label)
+    except discord.Forbidden:
+        sys.stderr.write("  reused #%s (topic unchanged: needs Manage Channels)\n" % label)
+    try:
+        await channel.edit(overwrites=overwrites, reason="Melon Kits: sync overwrites")
+        sys.stderr.write("    overwrites synced\n")
+    except discord.Forbidden:
+        sys.stderr.write("    overwrites NOT synced: editing them needs Manage Roles "
+                         "(\"Manage Permissions\"), which is separate from Manage Channels. "
+                         "Existing overwrites are left as they are.\n")
+
+
 def find_channel(guild, name, cls):
     for ch in guild.channels:
         if ch.name == name and isinstance(ch, cls):
@@ -119,9 +142,7 @@ async def run(cfg, token):
                     reason="Melon Kits: public request channel")
                 sys.stderr.write("  created #%s\n" % REQUESTS_NAME)
             else:
-                await ch.edit(topic=REQUESTS_TOPIC, overwrites=ow,
-                              reason="Melon Kits: sync overwrites")
-                sys.stderr.write("  reused #%s\n" % REQUESTS_NAME)
+                await sync_existing(ch, REQUESTS_TOPIC, ow, REQUESTS_NAME)
             out["panel_channel_id"] = ch.id
 
             # ------------------------------------------------------------- queue
@@ -146,8 +167,7 @@ async def run(cfg, token):
                     reason="Melon Kits: staff review + dispatch queue")
                 sys.stderr.write("  created #%s with %d tags\n" % (QUEUE_NAME, len(TAGS)))
             else:
-                await forum.edit(topic=QUEUE_TOPIC, overwrites=qow,
-                                 reason="Melon Kits: sync overwrites")
+                await sync_existing(forum, QUEUE_TOPIC, qow, QUEUE_NAME)
                 have = {t.name.casefold() for t in forum.available_tags}
                 for name, emoji in TAGS:
                     if name.casefold() not in have:
