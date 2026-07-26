@@ -89,6 +89,10 @@ def duration(seconds: Optional[int]) -> str:
     if not seconds:
         return "none recorded"
     secs = int(seconds)
+    if secs < 60:
+        # Integer-dividing a sub-minute span rendered as "0 minutes", which showed up in the
+        # archive on any ticket handled quickly -- exactly the ones worth noticing.
+        return "%d seconds" % secs
     if secs < 3600:
         return "%d minutes" % (secs // 60)
     if secs < 86400 * 2:

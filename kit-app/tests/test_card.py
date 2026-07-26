@@ -248,6 +248,11 @@ class CardCase(unittest.TestCase):
     def test_duration_formatting(self):
         self.assertEqual(card_mod.duration(0), "none recorded")
         self.assertEqual(card_mod.duration(None), "none recorded")
+        # Sub-minute spans must not floor to "0 minutes": a ticket closed in seconds is
+        # exactly the kind the archive should show honestly.
+        self.assertEqual(card_mod.duration(20), "20 seconds")
+        self.assertEqual(card_mod.duration(59), "59 seconds")
+        self.assertEqual(card_mod.duration(60), "1 minutes")
         self.assertIn("minutes", card_mod.duration(600))
         self.assertIn("hours", card_mod.duration(15001))
         self.assertIn("days", card_mod.duration(400000))
