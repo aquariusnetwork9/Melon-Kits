@@ -18,11 +18,13 @@ cut.
 
 | component | state |
 |---|---|
-| [`chat-corpus/`](chat-corpus/) — passive 2b2t chat collector | **built, tested, verified against the live feed.** Not yet running unattended (see its README for the one outstanding test) |
-| Discord app — ticket → review → dispatch | **scoped, not built** |
-| Chat screening lexicon | **not started.** Blocked on nothing; wants an afternoon against the 2025 bulk dump |
+| [`chat-corpus/`](chat-corpus/) — passive 2b2t chat collector | **built and tested.** 249 tests, verified against the live feed, both SPEC §13 crash-safety tests in place |
+| [`kit-app/`](kit-app/) — Discord ticket → review → dispatch | **built and tested.** 108 tests; API client, identity resolution and redaction verified against the live API |
+| Chat screening lexicon | **scaffolded, empty.** The mechanism works and is tested; the terms need an afternoon of mining against the 2025 bulk dump |
 
-Nothing here has served a real kit request yet.
+**Nothing here has served a real kit request yet**, and the bot has never been run against a
+live guild — the flow is verified at the unit level and through the library's own component
+round-tripping, not end to end in Discord.
 
 ---
 
@@ -30,11 +32,19 @@ Nothing here has served a real kit request yet.
 
 ```
 docs/                 project documentation (see below)
+kit-app/              the Discord app: panel, ticket, reviewer card, dispatch
+  bot.py              the ONLY file that imports discord.py
+  card.py             reviewer card assembly — Discord-free, so it is testable
+  redact.py           coordinate redaction, applied at the display boundary
+  screening.py        normalisation + keyword counts (no score, by design)
+  store.py            SQLite ledger: cooldowns, flags, decisions, instrumentation
+  vc.py identity.py   api.2b2t.vc client; Mojang + laby.net name resolution
+  tests/              108 tests, no network, and no discord.py needed
 chat-corpus/          the collector: SSE feed → append-only JSONL, stdlib only, crash-safe
   docs/SPEC.md        full behavioural spec
   docs/INTERFACES.md  binding module API
   tools/              export / dedupe-audit / gap-injection / stats
-  tests/              244 tests, no network, no third-party deps
+  tests/              249 tests, no network, no third-party deps
 ```
 
 | document | what it covers |
@@ -43,24 +53,28 @@ chat-corpus/          the collector: SSE feed → append-only JSONL, stdlib only
 | [docs/reviewing.md](docs/reviewing.md) | the reviewer card line by line, and what each signal is actually worth |
 | [docs/chat-screening.md](docs/chat-screening.md) | the keyword list, why it isn't a model, and the DuckDB queries that make it good |
 | [docs/external-apis.md](docs/external-apis.md) | verified findings on `api.2b2t.vc`, Minecraft identity, and Discord — the counter-intuitive ones only |
+| [kit-app/README.md](kit-app/README.md) | running the bot: install, Discord setup, commands, rate limits |
 | [chat-corpus/README.md](chat-corpus/README.md) | running the collector: quickstart, runbook, health states, disk |
 
-The Discord app will land alongside it. The collector is deliberately standalone — it has no
-dependency on the app and the app has no runtime dependency on it, so either can be run,
-moved or replaced without touching the other.
+The collector and the app share no code and no runtime dependency in either direction, so
+either can be run, moved or replaced without touching the other. The app needs one package
+(`discord.py`) and confines it to `bot.py`; the collector needs none at all, ever.
 
 ---
 
 ## How the pieces fit
 
-**The review card is five API calls and about five seconds**, all against the public
-`api.2b2t.vc`. No job queue, no gateway connection, no privileged intents beyond Discord
-message-content, and no model:
+**The review card is four requests and a few seconds.** No job queue, **no privileged Discord
+intents at all**, and no model. It was scoped as five calls against `api.2b2t.vc`; building it
+made one redundant, because `/stats/player` turns out to return first-seen, last-seen,
+playtime *and* all four counts in a single request, which matters against a rate limit shared
+with the whole internet:
 
-- `/seen` and `/stats/player` — first seen on 2b2t, last seen, playtime. **First-seen is the
-  substitute for a Minecraft account creation date**, which is genuinely unobtainable for
-  arbitrary accounts and always has been; it is also the more meaningful number here, and
-  unlike an account age it cannot be bought.
+- Mojang — name to UUID, so the ledger and any flag survive a rename.
+- `/stats/player` — first seen, last seen, playtime, counts. **First-seen is the substitute
+  for a Minecraft account creation date**, which is genuinely unobtainable for arbitrary
+  accounts and always has been; it is also the more meaningful number here, and unlike an
+  account age it cannot be bought.
 - `/deaths` — the highest-value call in the set. A death from eleven minutes ago, with the
   death message and the killer's name attached, **is the "I lost everything" claim, already
   verified**. Most approvals can be made on that line alone.

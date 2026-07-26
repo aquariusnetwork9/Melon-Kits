@@ -1,0 +1,8 @@
+# The bot layer needs exactly one dependency. Everything else in this directory is
+# standard library only, which is what lets the logic be tested without a Discord
+# connection -- `python -m unittest discover -s tests -t .` needs nothing installed.
+#
+# 2.4 is the floor because DynamicItem (the template-matched custom_id routing that keeps
+# buttons alive across restarts) arrived there. Pinned below 3 because a major bump will
+# move the UI API.
+discord.py>=2.4,<3

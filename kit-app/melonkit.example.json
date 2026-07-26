@@ -1,0 +1,29 @@
+{
+  "discord": {
+    "guild_id": 0,
+    "panel_channel_id": 0,
+    "dispatch_channel_id": 0,
+    "reviewer_role_id": 0,
+    "runner_role_id": 0
+  },
+  "policy": {
+    "cooldown_days": 21,
+    "recent_chats": 100,
+    "recent_deaths": 3,
+    "wipe_window_hours": 48,
+    "new_player_days": 30
+  },
+  "vc": {
+    "user_agent": "melon-kits/1.0 (+contact: you@example.com)"
+  },
+  "screening": {
+    "enabled": true,
+    "lexicon_path": null
+  },
+  "store": {
+    "path": "./melonkit.sqlite3"
+  },
+  "ops": {
+    "log_level": "INFO"
+  }
+}

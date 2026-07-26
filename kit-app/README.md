@@ -1,0 +1,185 @@
+# kit-app
+
+The Discord app: a pinned panel with a button, a private thread per request, a reviewer card
+built from public 2b2t history, and a dispatch ember somebody claims.
+
+Design and rationale live in [../docs/kit-request-flow.md](../docs/kit-request-flow.md) and
+[../docs/reviewing.md](../docs/reviewing.md). This file is how to run it.
+
+---
+
+## Install
+
+```bash
+python -m venv .venv
+.venv/Scripts/pip install -r requirements.txt      # Linux: .venv/bin/pip
+cp melonkit.example.json melonkit.json             # then fill in the ids
+export MELONKIT_DISCORD_TOKEN='...'                # Windows: $env:MELONKIT_DISCORD_TOKEN
+python bot.py --config melonkit.json --print-config   # check it before connecting
+python bot.py --config melonkit.json
+```
+
+**One dependency, `discord.py>=2.4`, and only `bot.py` imports it.** Every other module here
+is standard library only, so the whole test suite runs with nothing installed:
+
+```bash
+python -m unittest discover -s tests -t .          # 108 tests, no network, no discord.py
+```
+
+That split is deliberate. The logic worth testing — cooldowns, redaction, screening, card
+assembly — has no Discord in it, so none of it needs a mocked gateway to test.
+
+---
+
+## Discord setup
+
+In the [developer portal](https://discord.com/developers/applications): create an
+application, add a bot, copy the token into `MELONKIT_DISCORD_TOKEN`.
+
+**No privileged intents are required.** `MESSAGE_CONTENT` is only needed if you later add the
+Discord-history lookup; the request flow uses interactions, which need nothing special. A bot
+that refuses to start without an intent it barely uses is a bot that does not start.
+
+Invite it with `bot` + `applications.commands` and these permissions: View Channels, Send
+Messages, Send Messages in Threads, Create Private Threads, Manage Threads, Embed Links,
+Attach Files.
+
+Then, as a reviewer, in your read-only requests channel:
+
+```
+/panel
+```
+
+**Pin the message it posts and never think about it again.** The button's `custom_id` is
+static, so it keeps working across restarts, redeploys and version bumps indefinitely — the
+panel only needs posting once.
+
+Fill in `melonkit.json`:
+
+| key | what it is |
+|---|---|
+| `discord.guild_id` | your server. Setting it makes slash-command updates appear instantly instead of taking up to an hour |
+| `discord.panel_channel_id` | the read-only channel the panel lives in; threads hang off it |
+| `discord.dispatch_channel_id` | where approvals post a claimable ember |
+| `discord.reviewer_role_id` | may approve, decline, flag, and run `/lookup`. Falls back to Manage Server if unset |
+| `discord.runner_role_id` | may claim a delivery. `0` means anyone who can see the channel |
+
+---
+
+## Commands
+
+| command | who | what |
+|---|---|---|
+| `/panel` | reviewer | post the request panel. Once, ever |
+| `/lookup <name>` | reviewer | a reviewer card with no ticket attached — for answering "would this even pass" |
+| `/flag <name> <kind> <note>` | reviewer | mark an account: known alt, do not serve, or a note. Resolves to a UUID so it survives a rename |
+| `/unflag <id>` | reviewer | clear one |
+| `/ledger <name>` | reviewer | kit history, cooldown state and flags for an account |
+| `/flagline <ticket> <lines>` | reviewer | label chat lines you objected to, e.g. `3,7,12` |
+
+`/flagline` looks like a nicety and is the most valuable command here. See
+**Instrumentation** below.
+
+---
+
+## The flow, and why it is in this order
+
+1. **Button press → pre-checks → *then* the form.** Open-ticket and cooldown checks run
+   before the modal opens, against local SQLite, comfortably inside Discord's 3-second
+   deadline. Making somebody fill in a form and only then telling them they were never
+   eligible is the one avoidable bad experience in this flow.
+2. **Modal submit → deferred.** Name resolution plus three API calls takes a few seconds, so
+   the interaction is acknowledged immediately and the work continues behind the 15-minute
+   follow-up token.
+3. **A private thread** with the applicant and the reviewer role, and the card posted into it.
+   If thread creation fails — the guild's ~1000 active-thread ceiling, or missing permissions
+   — the card goes to the channel instead. Losing the request would be worse than posting it
+   in the wrong place.
+4. **Approve / Decline.** Decline requires a reason; it is what makes the ledger legible a
+   year later, and an optional field is an empty field.
+5. **Approval posts a dispatch ember** with a Claim button, then Mark delivered. Claiming is a
+   conditional `UPDATE`, so two runners pressing at the same instant is resolved by the
+   database rather than by whichever callback ran second — the loser gets told who beat them.
+
+Nothing about dispatch is automated. The ember is a claim board, not a queue.
+
+---
+
+## What the card says, and what it refuses to say
+
+Ordered by what settles a decision fastest — see
+[../docs/reviewing.md](../docs/reviewing.md) for the reasoning:
+
+1. **Recent deaths.** A death from eleven minutes ago with its message and killer attached
+   *is* the "I lost everything" claim, already verified. Most approvals need nothing else.
+2. **Time on 2b2t.** First seen, last seen, playtime, counts. First-seen substitutes for a
+   Minecraft account creation date, which is genuinely unobtainable for anyone but the
+   account's owner — and is the better number here anyway, since it cannot be bought.
+3. **Kit ledger.** Cooldown checked against the Discord id **and** the UUID independently,
+   because either alone is trivially sidestepped.
+4. **Reviewer flags.**
+5. **Recent chat**, attached as a file, with lexicon counts beside it.
+
+Three things it will not do:
+
+- **No score, anywhere.** Not on chat, not on the account. A number gets read as the answer
+  to a question counts cannot answer. There is a test asserting no card field is named
+  `score`, `confidence`, `risk` or `verdict`.
+- **No "probable alt" badge.** Low playtime on an old account describes an alt *and* a
+  returning lapsed player identically. The card says exactly that, in those words, instead of
+  leaning. "Known alt" is a reviewer-maintained flag, never a computation.
+- **A missing section never renders as an empty one.** "Could not retrieve deaths" and "no
+  deaths" mean opposite things, and collapsing the first into the second would decline people
+  for having a clean record. Failures say so and land in an `Incomplete` field.
+
+---
+
+## Privacy
+
+**Chat reaches Discord only as the attached, already-redacted log.** Coordinate redaction
+happens inside `card.gather`, at the boundary, so no display path can be the one that forgot
+— and `screening.redact_coords` cannot be set false while screening is on, because a config
+file is not a good place to be able to turn a privacy control off.
+
+The reason is that the coordinates in someone's chat are usually **somebody else's**: a base
+leaked in an argument, a stash traded in public, a location someone is being hunted to. The
+applicant consented to review; the third party in their log did not, and a Discord thread is
+durable, searchable and screenshot-able.
+
+Redaction is heuristic and biased toward over-redacting. A reviewer reading `[coords]` where
+two large numbers used to be loses nothing that matters to the decision; a leaked base costs
+someone their base. The card reports how many values were hidden rather than pretending the
+line always read that way.
+
+Nothing here logs chat. Log records carry ticket ids, user ids, counts and status codes.
+
+---
+
+## Instrumentation
+
+`/flagline` and the `shown_chats` table exist because **production is the only source of
+labelled screening data, and it cannot be backfilled.** Which lines a reviewer saw, and which
+ones they objected to, is a judgement that exists at the moment it is made and nowhere else.
+
+Every ticket stores the lines that were shown (redacted). Every `/flagline` adds a label.
+Every decision stores its reason. After a few months that is a real evaluation set — the thing
+that turns "is our lexicon any good" from an opinion into a measurement. Without it you are
+still guessing, and no amount of later effort recovers it.
+
+---
+
+## Rate limits
+
+`api.2b2t.vc` allows **5 requests per second across every caller on the internet**, not per
+IP, and its 429s carry no `Retry-After`. So:
+
+- The pacer is **module-level, shared by every client in the process** — per-instance pacing
+  would let two concurrent reviews double the rate.
+- `vc.min_interval_s` will not go below 0.2; the config refuses it.
+- A 429 backs off and retries. If it gives up, the card renders with that section marked
+  failed rather than blank.
+- `/stats/player` is one request for first-seen, last-seen, playtime and all four counts,
+  which is why the card is three calls and not seven.
+
+A card costs about four requests and a few seconds. There is no job queue and does not need
+to be one.

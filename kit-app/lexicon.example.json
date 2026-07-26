@@ -1,0 +1,47 @@
+{
+  "_readme": [
+    "Copy to lexicon.json and point screening.lexicon_path at it. This file ships almost",
+    "empty on purpose -- the terms that matter are the ones your own community actually",
+    "sees, and a lexicon written from imagination is a lexicon of spellings nobody uses.",
+    "",
+    "Populate it by MINING, not guessing. Against the 2025 bulk dump (see",
+    "docs/chat-screening.md): normalise the corpus, group by normalised form, then read",
+    "back the ORIGINAL spellings ranked by frequency. Nobody guesses the top twenty",
+    "variants correctly. You do not need to list evasion spellings here -- the normaliser",
+    "already folds case, accents, separators, repeated characters and digit/symbol",
+    "substitutions, so one entry covers its whole family. 'badword' matches 'b4dw0rd',",
+    "'B-A-D W0RD' and 'baaadwooord' on its own.",
+    "",
+    "'exceptions' is how you kill a substring collision: the innocent word is blanked out",
+    "before anything looks for a term inside it, so 'grapefruit' can suppress 'grape'",
+    "cleanly. Find the ones you need by running a candidate term across the 6.7M lines of",
+    "the dump and reading what it catches.",
+    "",
+    "There is no weight or severity field, deliberately. A weight is a score with extra",
+    "steps, and a score gets read as the verdict. The output is counts; the reviewer reads",
+    "the lines."
+  ],
+
+  "categories": {
+    "off_game": {
+      "note": "Leaves the game. This is the category that should actually change a decision -- targeting someone as a person rather than as a player.",
+      "terms": ["doxx", "dox you", "swat you", "ip grab", "ip logger", "irl threat"],
+      "exceptions": []
+    },
+    "slur": {
+      "note": "Add your own. Intentionally empty in the repository -- a public checkout is not the place for a slur list, and yours should come from what your community actually sees.",
+      "terms": [],
+      "exceptions": []
+    },
+    "profanity": {
+      "note": "Present so the count is visible, NOT so it counts against anyone. Profanity is 2b2t's ambient register: flagging it flags practically everyone, including the people handing out the kits. Expect this number to be high and to mean nothing.",
+      "terms": [],
+      "exceptions": []
+    },
+    "scam": {
+      "note": "Kit-relevant: someone running stash scams is a different question from someone swearing.",
+      "terms": ["free stash", "double your", "trust trade"],
+      "exceptions": []
+    }
+  }
+}

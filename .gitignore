@@ -20,6 +20,19 @@ status.json*
 collector.json
 *.lock
 
+# Kit app. The ledger holds chat (redacted, but still chat) plus every decision and its
+# reason, and the config holds guild/channel/role ids. The *.example.json files are the
+# committed templates; the real ones never are.
+melonkit.json
+lexicon.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# A bot token must never reach a commit. It is read from the environment, not from config,
+# but an .env written by hand is the obvious way round that.
+.env
+
 # Python
 *.pyc
 __pycache__/
