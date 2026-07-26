@@ -77,6 +77,36 @@ One post is therefore the entire record of a ticket — request, card, decision,
 
 Nothing about dispatch is automated. The queue is a claim board, not a work assigner.
 
+## 5. The archive
+
+Whenever a ticket finishes — delivered, declined, closed, or auto-closed because its thread was
+deleted — one transcript is posted to a **staff-only archive channel**: a compact embed plus an
+attachment with the full decision history, every chat line shown to the reviewer, and the
+applicant ↔ staff conversation.
+
+It is assembled **from the ledger, not by reading Discord back**, so it survives the thread and
+the queue post being deleted. That is the point: a ticket's record should outlive the places it
+happened in.
+
+## 6. Getting rid of a ticket
+
+The panel's pre-check counts *open* tickets, so **anything that leaves a ticket open forever
+silently bars that person from ever requesting again.** Given the kits are disposable and
+under-helping is the expensive direction, that is the worst failure this design can have, so
+there are three separate ways it cannot happen:
+
+- **`/close <ticket> <reason>`** for a ticket nobody will decide — the applicant went quiet,
+  withdrew, or it was a duplicate. Open to the **applicant** as well as to reviewers: closing
+  your own request only frees your own slot, and needing to find staff for that is friction with
+  no upside. It records no kit, so it never burns the cooldown.
+- **A deleted thread** closes the ticket automatically, both on the delete event and by
+  re-checking on every button press, since a deletion while the bot is offline fires no event.
+- **A queue post that fails to send** auto-closes, because no reviewer would ever see it.
+
+**`/unclaim <kit>`** is the delivery-side equivalent: a runner handing back a job, or a reviewer
+prising a stale claim off someone who has gone quiet. The ticket stays approved — the kit is
+still owed, it just needs somebody else.
+
 ---
 
 ## What this deliberately does not have

@@ -23,6 +23,18 @@ Two separations that are deliberate:
   cannot read it off disk and it cannot be committed. Same pattern as
   `highway-discord-bot`.
 
+## The scripts in here
+
+| script | what it does |
+|---|---|
+| `melonkit-bot.service` | the systemd unit, mirrored from what is installed |
+| `setup_channels.py` | creates the three channels with the right overwrites and the six forum tags. Idempotent; prints the ids as JSON |
+| `smoke_ticket.py` | drives a real ticket without a button press, for testing after a change. `--cleanup <id>` removes it |
+| `reset_tickets.py` | clears ticket history for a test reset. Backs the ledger up first |
+
+All three need the token, so run them through the `systemd-run --uid=ubuntu` wrapper below —
+never under plain `sudo`, for the reason in the next section.
+
 ## Updating
 
 ```bash

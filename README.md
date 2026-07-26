@@ -18,13 +18,15 @@ cut.
 
 | component | state |
 |---|---|
-| [`chat-corpus/`](chat-corpus/) — passive 2b2t chat collector | **built and tested.** 249 tests, verified against the live feed, both SPEC §13 crash-safety tests in place |
-| [`kit-app/`](kit-app/) — Discord ticket → review → dispatch | **built and tested.** 108 tests; API client, identity resolution and redaction verified against the live API |
+| [`kit-app/`](kit-app/) — Discord ticket → review → dispatch | **live and exercised end to end.** 121 tests. Deployed on ovh-2; a full request → review → approve → claim → deliver → archive lifecycle has been run through real Discord component presses |
+| [`chat-corpus/`](chat-corpus/) — passive 2b2t chat collector | **built and tested, not yet running unattended.** 249 tests, green on Windows/3.9 and Linux/3.13, verified against the live feed, both SPEC §13 crash-safety tests in place |
 | Chat screening lexicon | **scaffolded, empty.** The mechanism works and is tested; the terms need an afternoon of mining against the 2025 bulk dump |
 
-**Nothing here has served a real kit request yet**, and the bot has never been run against a
-live guild — the flow is verified at the unit level and through the library's own component
-round-tripping, not end to end in Discord.
+**No real applicant has used it yet** — every ticket so far has been a test on a test server.
+Two things in the panel copy are stated intent rather than enforced behaviour: the 24–48 hour
+response time is not tracked or alerted on, and "die with your kit and you get no other" needs
+a reviewer to set a `deny` flag, since the automatic cooldown is 21 days for everyone
+regardless of how the last kit ended.
 
 ---
 
@@ -32,14 +34,15 @@ round-tripping, not end to end in Discord.
 
 ```
 docs/                 project documentation (see below)
-kit-app/              the Discord app: panel, ticket, reviewer card, dispatch
+kit-app/              the Discord app: panel, ticket, reviewer card, dispatch, archive
   bot.py              the ONLY file that imports discord.py
   card.py             reviewer card assembly — Discord-free, so it is testable
   redact.py           coordinate redaction, applied at the display boundary
   screening.py        normalisation + keyword counts (no score, by design)
   store.py            SQLite ledger: cooldowns, flags, decisions, instrumentation
   vc.py identity.py   api.2b2t.vc client; Mojang + laby.net name resolution
-  tests/              108 tests, no network, and no discord.py needed
+  deploy/             systemd unit, channel setup, ticket reset, smoke test, runbook
+  tests/              121 tests, no network, and no discord.py needed
 chat-corpus/          the collector: SSE feed → append-only JSONL, stdlib only, crash-safe
   docs/SPEC.md        full behavioural spec
   docs/INTERFACES.md  binding module API
@@ -49,11 +52,13 @@ chat-corpus/          the collector: SSE feed → append-only JSONL, stdlib only
 
 | document | what it covers |
 |---|---|
-| [docs/kit-request-flow.md](docs/kit-request-flow.md) | panel → ticket → decision → dispatch, and what the design deliberately omits |
+| **[docs/operations.md](docs/operations.md)** | **running it: everyday tasks, symptom→fix table, and every trap that cost real time.** Start here if something is broken |
+| [docs/kit-request-flow.md](docs/kit-request-flow.md) | panel → ticket → decision → dispatch → archive, and what the design deliberately omits |
 | [docs/reviewing.md](docs/reviewing.md) | the reviewer card line by line, and what each signal is actually worth |
 | [docs/chat-screening.md](docs/chat-screening.md) | the keyword list, why it isn't a model, and the DuckDB queries that make it good |
 | [docs/external-apis.md](docs/external-apis.md) | verified findings on `api.2b2t.vc`, Minecraft identity, and Discord — the counter-intuitive ones only |
-| [kit-app/README.md](kit-app/README.md) | running the bot: install, Discord setup, commands, rate limits |
+| [kit-app/README.md](kit-app/README.md) | the bot itself: install, Discord setup, the eight commands, the three channels |
+| [kit-app/deploy/DEPLOY.md](kit-app/deploy/DEPLOY.md) | how the ovh-2 deployment is built, and how to rebuild it |
 | [chat-corpus/README.md](chat-corpus/README.md) | running the collector: quickstart, runbook, health states, disk |
 
 The collector and the app share no code and no runtime dependency in either direction, so
@@ -65,10 +70,11 @@ either can be run, moved or replaced without touching the other. The app needs o
 ## How the pieces fit
 
 **The review card is four requests and a few seconds.** No job queue, **no privileged Discord
-intents at all**, and no model. It was scoped as five calls against `api.2b2t.vc`; building it
-made one redundant, because `/stats/player` turns out to return first-seen, last-seen,
-playtime *and* all four counts in a single request, which matters against a rate limit shared
-with the whole internet:
+intents at all** — not even for transcript conversation capture, which reads history over REST
+where `MESSAGE_CONTENT` does not apply — and no model. It was scoped as five calls against
+`api.2b2t.vc`; building it made one redundant, because `/stats/player` turns out to return
+first-seen, last-seen, playtime *and* all four counts in a single request, which matters
+against a rate limit shared with the whole internet:
 
 - Mojang — name to UUID, so the ledger and any flag survive a rename.
 - `/stats/player` — first seen, last seen, playtime, counts. **First-seen is the substitute
@@ -119,11 +125,32 @@ orthography, which is the part that matters here.
 
 ## Privacy
 
-2b2t public chat routinely carries other people's base coordinates. Per a standing operator
-rule, **chat content lives in exactly one place — the corpus JSONL files.** It never reaches
-a log, a status file, an alert, a traceback or a terminal, and every example in this
-repository uses synthetic text, names and UUIDs. The collector's README documents how that is
-enforced and which single tool is allowed to emit chat text at all.
+2b2t public chat routinely carries **other people's** base coordinates — a base leaked in an
+argument, a stash traded in public, a location someone is being hunted to. The applicant
+consented to their chat being reviewed; the third party in their log did not. Both halves of
+this repository are built around that.
+
+**Nothing anywhere logs chat.** Log records carry ids, counts, status codes, byte offsets and
+file basenames. An exception message that would interpolate a record body is treated as a
+defect, so exception text is assembled from metadata instead. Every example in this repository
+— READMEs, docstrings, tests — uses synthetic text, names and UUIDs, and any coordinate that
+appears is fabricated inside 20k of the origin.
+
+**In the collector**, chat lives in exactly one place: the corpus JSONL files. One tool
+(`export_csv.py`) is allowed to emit chat text, because writing it to a file you asked for is
+its entire job — and it refuses to write to a terminal.
+
+**In the app**, coordinate redaction happens inside `card.gather`, at the boundary, so no
+display path can be the one that forgot; the config refuses to let it be switched off while
+screening is on; and the ledger stores the already-redacted text, so the database is not a
+back door round the display rule. Redaction is biased toward over-redacting: a reviewer
+reading `[coords]` where two large numbers were loses nothing that changes a decision, and a
+leaked base costs someone their base.
+
+**Applicants are told.** The request panel states that public 2b2t history — first seen, recent
+deaths, public chat — is checked, and that nothing private is looked at. Applicants never see a
+reviewer card, and a decline gives them the outcome without the internal reason, which is
+written for whoever reads the ledger in a year rather than for its subject.
 
 The applicant-facing request panel carries the vetting disclosure directly — that help is
 voluntary and best-effort, that a kit is never guaranteed, and the three reasons a request

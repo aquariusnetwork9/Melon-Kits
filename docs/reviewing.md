@@ -79,4 +79,26 @@ The card will never show a confident "probable alt" badge, because
 The reason field is required. Write it for someone reading the ledger a year from now with no
 memory of this ticket — "known alt of \<name\>" is useful, "no" is not.
 
-The applicant sees a decline. They do not see the card, the flag list, or the reasoning.
+**The applicant sees only the outcome.** Not the card, not the flag list, not your reason — that
+text is for whoever reads the ledger later, and it names criteria and sometimes other accounts.
+If you want to say something to them, type it in their thread.
+
+## Not deciding
+
+A ticket you cannot decide should be **closed, not left**: `/close <ticket> <reason>`. The
+panel's pre-check counts open tickets, so one left open forever quietly stops that person from
+ever asking again. "No reply in a week" is a perfectly good reason, and closing records no kit,
+so it never burns anyone's cooldown.
+
+If a delivery stalls — somebody claimed it and went quiet — `/unclaim <kit>` puts it back in the
+pool without touching the approval. The kit is still owed; it just needs another runner.
+
+## Where finished tickets go
+
+Everything that closes writes a transcript to the staff archive: the decision and its reason,
+the chat that was shown, and the applicant conversation. It is assembled from the ledger, so it
+survives the thread being deleted — you can clean threads up freely without losing the record.
+
+The one thing that **cannot** be reconstructed later is which chat lines you objected to. That
+is what `/flagline <ticket> <lines>` captures, and it is the only labelled screening data this
+project will ever get. See [chat-screening.md](chat-screening.md).

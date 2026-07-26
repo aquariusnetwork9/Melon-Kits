@@ -1,10 +1,13 @@
 # kit-app
 
 The Discord app: a pinned panel with a button, a private thread per request, a reviewer card
-built from public 2b2t history, and a dispatch ember somebody claims.
+built from public 2b2t history, a claimable dispatch, and an archived transcript when it is
+done.
 
-Design and rationale live in [../docs/kit-request-flow.md](../docs/kit-request-flow.md) and
-[../docs/reviewing.md](../docs/reviewing.md). This file is how to run it.
+This file is how to set it up. For **running** it — everyday tasks, a symptom→fix table, and
+every trap that cost real time — see [../docs/operations.md](../docs/operations.md). Design and
+rationale are in [../docs/kit-request-flow.md](../docs/kit-request-flow.md) and
+[../docs/reviewing.md](../docs/reviewing.md).
 
 ---
 
@@ -23,11 +26,17 @@ python bot.py --config melonkit.json
 is standard library only, so the whole test suite runs with nothing installed:
 
 ```bash
-python -m unittest discover -s tests -t .          # 108 tests, no network, no discord.py
+python -m unittest discover -s tests -t .          # 121 tests, no network, no discord.py
 ```
 
 That split is deliberate. The logic worth testing — cooldowns, redaction, screening, card
 assembly — has no Discord in it, so none of it needs a mocked gateway to test.
+
+It has one sharp edge, though, and it bit for real: a test that does not reproduce the
+*threading* shape of the handler proves nothing about it. The card builder runs in
+`run_in_executor`, and a smoke test that called it on the main thread stayed green while every
+real button press died on a cross-thread SQLite error. `deploy/smoke_ticket.py` now goes through
+an executor deliberately.
 
 ---
 
@@ -36,9 +45,10 @@ assembly — has no Discord in it, so none of it needs a mocked gateway to test.
 In the [developer portal](https://discord.com/developers/applications): create an
 application, add a bot, copy the token into `MELONKIT_DISCORD_TOKEN`.
 
-**No privileged intents are required.** `MESSAGE_CONTENT` is only needed if you later add the
-Discord-history lookup; the request flow uses interactions, which need nothing special. A bot
-that refuses to start without an intent it barely uses is a bot that does not start.
+**No privileged intents are required — none, for anything.** Do not enable anything on the Bot
+page. That includes transcript conversation capture: `MESSAGE_CONTENT` gates content in
+*gateway events*, not in REST history fetches, which only need Read Message History. Verified
+against real messages, because the docs read as though it covers both.
 
 Invite it with `bot` + `applications.commands`. Permissions integer **2252194950925312** for
 normal running, or **2252194950933520** if you want the bot to create its own channels via
@@ -51,25 +61,45 @@ tries to pin — the permission check passes and the API refuses anyway. It is o
 `@everyone` cannot post in the requests channel, so the panel stays the newest message
 permanently whether or not it is pinned.
 
-Then, as a reviewer, in your read-only requests channel:
+### Channels
+
+Let the bot build them — `deploy/setup_channels.py` creates all three with the right
+permission overwrites and the six lifecycle tags, is idempotent, and prints the ids as JSON:
+
+```bash
+python deploy/setup_channels.py --config melonkit.json
+```
+
+It needs Manage Channels, which is **setup-only** — nothing at runtime uses it, so you can
+remove it afterwards. If you would rather make the channels by hand, the shapes are in
+[../docs/operations.md](../docs/operations.md).
+
+Then fill in `melonkit.json`:
+
+| key | what it is |
+|---|---|
+| `discord.guild_id` | your server. Setting it makes slash-command updates appear instantly instead of taking up to an hour |
+| `discord.panel_channel_id` | **public text** channel for the panel; private ticket threads hang off it. **Cannot be a forum** — see below |
+| `discord.queue_channel_id` | **staff-only forum.** One post per ticket: card, decision, claim, delivery |
+| `discord.transcript_channel_id` | **staff-only text** channel. One transcript per finished ticket. `0` disables archiving |
+| `discord.reviewer_role_id` | may approve, decline, flag, and run `/lookup`. Falls back to Manage Server if unset |
+| `discord.runner_role_id` | may claim a delivery. `0` means anyone who can see the channel |
+| `panel.rescued_count`, `panel.rescued_as_of`, `panel.response_time` | the numbers in the panel copy, so updating them is a config edit plus `/panel` |
+
+**The config refuses two channels sharing an id.** The panel channel is public while the other
+two are staff-only, so a collision would publish reviewer cards — chat logs, reviewer flags,
+the ledger fan-out — to applicants, and nothing at runtime would look wrong.
+
+Finally, in the requests channel:
 
 ```
 /panel
 ```
 
-**Pin the message it posts and never think about it again.** The button's `custom_id` is
-static, so it keeps working across restarts, redeploys and version bumps indefinitely — the
-panel only needs posting once.
-
-Fill in `melonkit.json`:
-
-| key | what it is |
-|---|---|
-| `discord.guild_id` | your server. Setting it makes slash-command updates appear instantly instead of taking up to an hour |
-| `discord.panel_channel_id` | the read-only **text** channel the panel lives in; private ticket threads hang off it. Cannot be a forum — see below |
-| `discord.queue_channel_id` | the **staff-only forum**. One post per ticket: card, decision, claim, delivery |
-| `discord.reviewer_role_id` | may approve, decline, flag, and run `/lookup`. Falls back to Manage Server if unset |
-| `discord.runner_role_id` | may claim a delivery. `0` means anyone who can see the channel |
+**Pin the message it posts.** The button's `custom_id` is static, so it keeps working across
+restarts, redeploys and version bumps indefinitely. Running `/panel` again **edits that
+message in place** rather than posting a second one, so changing the copy or the rescued
+counter keeps the pin and the position — you never need to delete and re-post.
 
 ---
 
@@ -98,12 +128,13 @@ Closing records no kit, so it never burns the 21-day cooldown.
 
 ---
 
-## Two channels, split by audience
+## Three channels, split by audience
 
 | channel | type | who can see it | holds |
 |---|---|---|---|
 | `#kit-requests` | **text**, public | everyone | the pinned panel, and a **private thread per ticket** — the applicant ↔ staff conversation |
 | `#kit-queue` | **forum**, staff only | reviewer + delivery | one post per ticket: the reviewer card, the decision, the claim, the delivery. Tags carry the state |
+| `#kit-archive` | **text**, staff only, read-only | reviewer + delivery | one transcript per finished ticket, with the chat log attached |
 
 **The applicant never sees the reviewer card.** Their thread gets a receipt, the outcome, and
 delivery coordination — nothing else. The card carries the ledger fan-out, the reviewer flag
@@ -120,9 +151,31 @@ thread's visibility strictly follows its parent channel. There is therefore no w
 applicant into one post without letting them read every other ticket. `--post-panel` refuses
 a forum with that explanation rather than posting something broken.
 
-The queue forum wants three to five tags, matched case-insensitively:
-`awaiting review`, `approved`, `declined`, `claimed`, `delivered`. Missing ones are skipped,
-so a forum with no tags still works — you just lose the filtering.
+The queue forum uses six tags, matched case-insensitively: `awaiting review`, `approved`,
+`declined`, `claimed`, `delivered`, `closed`. Missing ones are skipped, so a forum with no tags
+still works — you just lose the filtering. Rename or restyle them freely; only the names are
+matched.
+
+## The archive
+
+Every ticket that finishes — delivered, declined, closed, or auto-closed because its thread was
+deleted — posts one transcript to `#kit-archive`: a compact three-line embed plus a `.txt`
+attachment holding the full decision history, every chat line shown to the reviewer
+(coordinate-redacted), and the applicant ↔ staff conversation.
+
+Two design points worth knowing:
+
+- **It is built from the ledger, not by scraping Discord**, so it still works after the thread
+  and the queue post have been deleted — which is exactly the situation it exists for.
+- **The embed is deliberately three dense lines, not stacked fields.** Discord gives every
+  non-inline field its own row plus a heading, which ran to ~18 rendered lines per ticket and
+  made the archive unscrollable. The attachment is the authoritative copy; the message only has
+  to be enough to scan and to search. The colour stripe stays because green/red/grey is the
+  fastest outcome cue there is and costs no height.
+
+Conversation capture is `discord.capture_thread_messages` (on by default) and needs **no
+privileged intent**. If Discord ever changes that, the transcript will say the conversation was
+unreadable rather than recording a wall of blank lines.
 
 ## The flow, and why it is in this order
 
@@ -136,18 +189,30 @@ so a forum with no tags still works — you just lose the filtering.
 3. **A private thread** for the applicant, with a receipt in it. If thread creation fails —
    the guild's ~1000 active-thread ceiling, or missing permissions — the ticket still goes to
    the queue. Losing the request would be worse than losing the thread.
-4. **A queue post** with the card and Approve / Decline, tagged `awaiting review`.
-5. **Approve / Decline.** Decline requires a reason; it is what makes the ledger legible a
-   year later, and an optional field is an empty field.
+4. **A queue post** with the card and Approve / Decline, tagged `awaiting review`. If posting it
+   fails, the ticket is **auto-closed** rather than left open — nobody would ever see it, and an
+   open ticket bars the applicant from trying again.
+5. **Approve / Decline.** Both defer before doing any network work, because the 3-second
+   deadline is shorter than a `fetch_channel` plus two edits, and blowing it shows "interaction
+   failed" *after* the decision was recorded. Decline requires a reason; it is what makes the
+   ledger legible a year later, and an optional field is an empty field.
 6. **Approval turns the same post into the dispatch** — retagged `approved`, Claim button
    attached, card left in place. One post ends up being the entire record of a ticket rather
-   than a card in one channel and an ember in another. Claiming is a conditional `UPDATE`, so
-   two runners pressing at the same instant is resolved by the database rather than by
-   whichever callback ran second, and the loser is told who beat them. Delivery retags and
-   archives the post — archived, not locked, so a delivery that falls through after being
-   marked done can be reopened.
+   than a card in one channel and an ember in another.
+7. **Claim → Mark delivered**, then the post retags, archives, and the **transcript is written
+   to the archive**.
+
+**Every state two people can trigger at once is conditional at the database, not a
+read-then-write.** Approve and Claim both return whether the caller won, and the loser is told
+who beat them. That is not defensive coding: without it, two reviewers approving simultaneously
+recorded two kits and burned the applicant's 21-day cooldown twice for one request.
 
 Nothing about dispatch is automated. The queue is a claim board, not a work assigner.
+
+**A ticket can always be got rid of.** `/close` handles the undecided ones, `on_thread_delete`
+plus a re-check on every button press handles a deleted thread, and a failed queue post
+auto-closes. All three exist because the panel's pre-check counts open tickets, so anything
+that leaves one open forever silently bars that person from ever asking again.
 
 ---
 
