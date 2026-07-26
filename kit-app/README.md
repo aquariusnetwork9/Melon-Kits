@@ -26,7 +26,7 @@ python bot.py --config melonkit.json
 is standard library only, so the whole test suite runs with nothing installed:
 
 ```bash
-python -m unittest discover -s tests -t .          # 121 tests, no network, no discord.py
+python -m unittest discover -s tests -t .          # 132 tests, no network, no discord.py
 ```
 
 That split is deliberate. The logic worth testing — cooldowns, redaction, screening, card
@@ -50,10 +50,10 @@ page. That includes transcript conversation capture: `MESSAGE_CONTENT` gates con
 *gateway events*, not in REST history fetches, which only need Read Message History. Verified
 against real messages, because the docs read as though it covers both.
 
-Invite it with `bot` + `applications.commands`. Permissions integer **2252194950925312** for
-normal running, or **2252194950933520** if you want the bot to create its own channels via
-`deploy/setup_channels.py` (that adds Manage Channels and Manage Messages, both of which can
-be removed again once setup is done).
+Invite it with `bot` + `applications.commands` and permissions **2252194950933520** — that is
+the running set plus **Manage Channels**, which `/setup` needs to create the three channels.
+Once a server is set up you can drop back to **2252194950925312**; nothing at runtime uses
+Manage Channels.
 
 **`Pin Messages` is a separate permission from `Manage Messages`.** Discord split pinning out
 into its own permission bit, so a bot holding Manage Messages still gets `403 / 50013` when it
@@ -61,42 +61,42 @@ tries to pin — the permission check passes and the API refuses anyway. It is o
 `@everyone` cannot post in the requests channel, so the panel stays the newest message
 permanently whether or not it is pinned.
 
-### Channels
+### Installing it on a server
 
-Let the bot build them — `deploy/setup_channels.py` creates all three with the right
-permission overwrites and the six lifecycle tags, is idempotent, and prints the ids as JSON:
+**One bot serves any number of servers.** Invite it, then someone with **Manage Server** runs:
 
-```bash
-python deploy/setup_channels.py --config melonkit.json
+```
+/setup reviewer_role:@reviewer delivery_role:@delivery
 ```
 
-It needs Manage Channels, which is **setup-only** — nothing at runtime uses it, so you can
-remove it afterwards. If you would rather make the channels by hand, the shapes are in
-[../docs/operations.md](../docs/operations.md).
+That is the whole install. It creates `#kit-requests`, `#kit-queue` and `#kit-archive` with
+the right permissions, adds the six lifecycle tags, stores the configuration for that server,
+and posts the panel. It is idempotent — re-run it any time; it reuses whatever exists.
 
-Then fill in `melonkit.json`:
+**Each server's tickets, cooldowns, flags and archive are its own.** Nothing crosses between
+them, including reviewer flags. The one shared resource is the `api.2b2t.vc` rate limit,
+which is 5 requests/second globally across every caller on the internet, so many busy servers
+queue behind each other.
+
+`Manage Channels` is needed **only** by `/setup` and can be removed afterwards.
+`deploy/setup_channels.py` does the same job from the command line if you prefer.
+
+Channel and role ids are **not** in `melonkit.json` — they live in the database, per server.
+The file holds only what is the same everywhere:
 
 | key | what it is |
 |---|---|
-| `discord.guild_id` | your server. Setting it makes slash-command updates appear instantly instead of taking up to an hour |
-| `discord.panel_channel_id` | **public text** channel for the panel; private ticket threads hang off it. **Cannot be a forum** — see below |
-| `discord.queue_channel_id` | **staff-only forum.** One post per ticket: card, decision, claim, delivery |
-| `discord.transcript_channel_id` | **staff-only text** channel. One transcript per finished ticket. `0` disables archiving |
-| `discord.reviewer_role_id` | may approve, decline, flag, and run `/lookup`. Falls back to Manage Server if unset |
-| `discord.runner_role_id` | may claim a delivery. `0` means anyone who can see the channel |
-| `panel.rescued_count`, `panel.rescued_as_of`, `panel.response_time` | the numbers in the panel copy, so updating them is a config edit plus `/panel` |
+| `discord.home_guild_id` | optional. Your own server, which additionally gets a guild-scoped command copy so command edits appear instantly there instead of waiting on Discord's global propagation. It does **not** make the bot single-guild |
+| `discord.capture_thread_messages` | include the applicant conversation in transcripts. Needs no privileged intent |
+| `policy.*` | cooldown days, how much chat to show, what counts as "new" or "just wiped" |
+| `panel.rescued_count`, `panel.rescued_as_of`, `panel.response_time` | the numbers in the panel copy — edit, then `/panel` |
+| `vc.user_agent` | **always set this** to something with a real contact in it |
 
-**The config refuses two channels sharing an id.** The panel channel is public while the other
-two are staff-only, so a collision would publish reviewer cards — chat logs, reviewer flags,
-the ledger fan-out — to applicants, and nothing at runtime would look wrong.
+Upgrading from the single-guild version needs no action: the old `guild_id` key is still
+accepted, and on first start the channel and role ids in the file are adopted into that
+server's stored config and its existing rows are stamped with it.
 
-Finally, in the requests channel:
-
-```
-/panel
-```
-
-**Pin the message it posts.** The button's `custom_id` is static, so it keeps working across
+**Pin the panel that `/setup` posts.** The button's `custom_id` is static, so it keeps working across
 restarts, redeploys and version bumps indefinitely. Running `/panel` again **edits that
 message in place** rather than posting a second one, so changing the copy or the rescued
 counter keeps the pin and the position — you never need to delete and re-post.
@@ -107,7 +107,8 @@ counter keeps the pin and the position — you never need to delete and re-post.
 
 | command | who | what |
 |---|---|---|
-| `/panel` | reviewer | post the request panel. Once, ever |
+| `/setup <reviewer_role> [delivery_role]` | **Manage Server** | install on this server: makes the three channels and the tags, stores the config, posts the panel. Idempotent |
+| `/panel` | reviewer | re-post or update the panel. Edits an existing one in place |
 | `/lookup <name>` | reviewer | a reviewer card with no ticket attached — for answering "would this even pass" |
 | `/flag <name> <kind> <note>` | reviewer | mark an account: known alt, do not serve, or a note. Resolves to a UUID so it survives a rename |
 | `/unflag <id>` | reviewer | clear one |
