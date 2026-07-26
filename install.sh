@@ -307,7 +307,15 @@ fi
 systemctl daemon-reload
 systemctl enable --quiet "$UNIT_NAME"
 say "Starting the bot"
-systemctl restart "$UNIT_NAME"
+# Clear any latched failure first. The unit stops itself after five failed starts in five
+# minutes (deliberately -- a crash-loop against Discord's auth endpoint gets the application
+# rate-limited), and systemd then REFUSES a plain restart until the counter is reset. Without
+# this, the single most likely recovery path -- mistype the token, re-run with the right one --
+# fails with "control process exited with error code" and never gets as far as the new token.
+systemctl reset-failed "$UNIT_NAME" 2>/dev/null || true
+# Not fatal: a failure here is the interesting case, and the diagnostic block below explains it
+# far better than `set -e` killing the script silently would.
+systemctl restart "$UNIT_NAME" || true
 
 # --------------------------------------------------------------------- did it work
 
