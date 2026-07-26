@@ -109,6 +109,18 @@ It prints the three channel ids as JSON. It will report that overwrites could no
 unless the bot holds Manage Roles; that is expected and harmless once the channels exist —
 see [Manage Roles is not Manage Channels](#manage-roles-is-not-manage-channels).
 
+**Check the Discord layer before deploying** — the unit suite is stdlib-only and therefore
+cannot import `bot.py` at all, so nothing else covers modals, buttons, custom_id templates or
+the `/setup` pickers. This does, without connecting:
+
+```bash
+MELONKIT_DISCORD_TOKEN=x $KA/.venv/bin/python deploy/verify_components.py
+```
+
+Exits non-zero on the first problem. It has caught a real one already: `/setup`'s channel picker
+offered **media** channels for the reviewer queue, where Discord requires an attachment on every
+post — so every ticket would have failed to post and auto-cancelled.
+
 **Reset ticket history** (test data only — it takes a backup first):
 
 ```bash
@@ -253,6 +265,21 @@ a `fetch_channel`, then message and thread edits, before responding. Blowing the
 reviewer to press again.
 
 Combined with the race below, a second press meant a second kit. Always `defer()` first.
+
+### A channel-type annotation is wider than it reads
+
+`Optional[discord.TextChannel]` on a slash-command parameter makes Discord offer **text and
+announcement** channels; `discord.ForumChannel` offers **forum and media**. Neither extra is
+something an admin would notice picking.
+
+They are not equivalent. An announcement channel supports only announcement threads, which are
+public — so the private-thread-per-ticket design silently degrades to no thread at all. A media
+channel **requires an attachment on every post**, and the reviewer card is an embed, so every
+ticket would fail to post and get auto-cancelled. `/setup` warns about the first and refuses the
+second.
+
+Check what a picker will really offer with `deploy/verify_components.py` rather than reading the
+annotation and assuming.
 
 ### A modal has no deadline, but discord.py gives it one anyway
 

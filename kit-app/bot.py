@@ -32,7 +32,7 @@ import os
 import re
 import sys
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import discord
 from discord import app_commands
@@ -1776,30 +1776,97 @@ SETUP_TAGS = [
 ]
 
 
+def _adoption_warnings(channel: Any, me: Any, *, public: bool) -> list:
+    """What an adopted channel cannot do, phrased as what will happen rather than as a bit.
+
+    Adopted channels keep their own permissions -- see `build_channels` -- so the honest thing
+    is to name the consequence up front instead of letting the first real ticket find it.
+    """
+    perms = channel.permissions_for(me)
+    out = []
+    need = [("view_channel", "I can't see it, so nothing will appear there at all"),
+            ("send_messages", "I can't post in it"),
+            ("embed_links", "cards and transcripts will not render"),
+            ("attach_files", "the chat download will fail"),
+            ("read_message_history", "I can't find an existing panel to update")]
+    if public:
+        need += [
+            ("create_private_threads", "applicants get no private thread -- their ticket "
+                                       "still reaches reviewers, but there is nowhere for "
+                                       "them to talk or set a meeting point"),
+            ("send_messages_in_threads", "I can't post the receipt inside a ticket thread"),
+            ("manage_threads", "finished ticket threads will not archive themselves"),
+        ]
+    for bit, consequence in need:
+        if not getattr(perms, bit, False):
+            out.append("missing `%s` in %s - %s"
+                       % (bit.replace("_", " "), channel.mention, consequence))
+    if public and channel.permissions_for(channel.guild.default_role).send_messages:
+        out.append("%s lets everyone post, so the panel will get pushed up the channel as "
+                   "people talk. It stays pinned, and `/panel` re-posts it whenever you want "
+                   "it back at the bottom." % channel.mention)
+    # An announcement channel is a TextChannel as far as the picker is concerned, but it only
+    # supports announcement threads, which are public. So a ticket thread there would be
+    # readable by everyone who can see the channel -- and the whole design rests on the
+    # applicant's thread being private. The bot degrades to no thread at all rather than an
+    # open one, which is the safe direction but worth saying out loud.
+    if public and getattr(channel, "is_news", None) and channel.is_news():
+        out.append("%s is an **announcement** channel, which cannot have private threads. "
+                   "Tickets will still reach reviewers, but applicants get no private thread "
+                   "to talk in or set a meeting point from. A normal text channel is a much "
+                   "better fit." % channel.mention)
+    return out
+
+
 async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
-                         runner: Optional[discord.Role]) -> Dict[str, Any]:
+                         runner: Optional[discord.Role],
+                         category: Optional[discord.CategoryChannel] = None,
+                         requests: Optional[discord.TextChannel] = None,
+                         queue: Optional[Any] = None,
+                         archive: Optional[discord.TextChannel] = None) -> Dict[str, Any]:
     """Create (or adopt) the three channels. Returns their ids plus a readable report.
 
     Idempotent: a channel with the expected name is reused rather than duplicated, so a
     second /setup after a partial failure finishes the job instead of making a mess.
 
-    Overwrites are only set **at creation**. Editing them afterwards needs Manage Roles
-    ("Manage Permissions"), a different permission from Manage Channels and one this bot
-    deliberately does not ask for -- so an adopted channel keeps whatever permissions it
-    already has, and the report says so rather than implying it was configured.
+    `requests`, `queue` and `archive` let an admin hand over channels the server already has --
+    a help or ticket channel that people already know to go to, rather than a fourth one nobody
+    looks at. Anything not named is created as before. `category` is where the created ones go,
+    so a server with a support category ends up with them in it instead of loose at the bottom
+    of the channel list.
+
+    Overwrites are only set **at creation**, and an adopted channel therefore keeps whatever
+    permissions it already has. That is partly a choice and partly a constraint: editing
+    overwrites needs Manage Roles ("Manage Permissions"), a different permission from Manage
+    Channels and one this bot deliberately does not ask for. So adoption never silently
+    reconfigures a channel that is in use for something else -- it reports what it found and
+    what will follow from it, which is what `_adoption_warnings` is for.
+
+    Placing a created channel in a category is safe even when the category's own permissions
+    are wrong for it: every channel here is created **with** explicit overwrites, and a channel
+    overwrite beats an inherited category one. A public requests channel in a staff-only
+    category is still public, and a staff-only queue in a public category is still staff-only.
     """
     me = guild.me
     everyone = guild.default_role
     notes: list = []
+    warnings: list = []
     out: Dict[str, Any] = {}
 
     def find(name, cls):
         return next((c for c in guild.channels
                      if c.name == name and isinstance(c, cls)), None)
 
+    where = {"category": category} if category is not None else {}
+    if category is not None:
+        notes.append("putting anything new in **%s**" % category.name)
+
     # --- public requests channel: readable by all, postable by none ----------
-    ch = find("kit-requests", discord.TextChannel)
-    if ch is None:
+    ch = requests or find("kit-requests", discord.TextChannel)
+    if ch is not None and requests is not None:
+        notes.append("adopted %s for the panel (permissions left as they are)" % ch.mention)
+        warnings += _adoption_warnings(ch, me, public=True)
+    elif ch is None:
         ow = {
             everyone: discord.PermissionOverwrite(
                 view_channel=True, read_message_history=True, send_messages=False,
@@ -1818,15 +1885,46 @@ async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
         ch = await guild.create_text_channel(
             "kit-requests", overwrites=ow, reason="Melon Kits setup",
             topic="Ask for a kit. Press the button on the pinned panel - each request "
-                  "opens a private thread just for you.")
+                  "opens a private thread just for you.",
+            **where)
         notes.append("created %s" % ch.mention)
     else:
         notes.append("reused %s (existing permissions left alone)" % ch.mention)
+        warnings += _adoption_warnings(ch, me, public=True)
     out["panel_channel_id"] = ch.id
 
     # --- staff queue: a forum, invisible to @everyone ------------------------
-    forum = find("kit-queue", discord.ForumChannel)
-    if forum is None:
+    forum = queue or find("kit-queue", discord.ForumChannel) or find("kit-queue",
+                                                                     discord.TextChannel)
+    if forum is not None and queue is not None:
+        notes.append("adopted %s for the reviewer queue (permissions left as they are)"
+                     % forum.mention)
+        warnings += _adoption_warnings(forum, me, public=False)
+        if not isinstance(forum, discord.ForumChannel):
+            warnings.append(
+                "%s is a text channel, not a forum. Everything still works -- one message per "
+                "ticket instead of one post -- but there are no lifecycle or request-type tags "
+                "to filter by, and cards will be interleaved with anything else posted there."
+                % forum.mention)
+        else:
+            have = {t.name.casefold() for t in forum.available_tags}
+            added, failed = 0, False
+            for name, emoji in SETUP_TAGS:
+                if name.casefold() not in have:
+                    try:
+                        await forum.create_tag(name=name, emoji=emoji)
+                        added += 1
+                    except discord.HTTPException:
+                        failed = True
+                        break
+            if added:
+                notes.append("added %d tag(s) to %s" % (added, forum.mention))
+            if failed:
+                warnings.append(
+                    "couldn't finish adding tags to %s. Tags are cosmetic -- the request type "
+                    "is in every post's title and on every card -- so this is safe to ignore "
+                    "or fix by hand." % forum.mention)
+    elif forum is None:
         qow = {
             everyone: discord.PermissionOverwrite(view_channel=False),
             me: discord.PermissionOverwrite(
@@ -1843,25 +1941,32 @@ async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
             "kit-queue", overwrites=qow, reason="Melon Kits setup",
             available_tags=[discord.ForumTag(name=n, emoji=e) for n, e in SETUP_TAGS],
             topic="Staff only. One post per request: the reviewer card, the decision and "
-                  "the delivery claim. Filter by tag.")
+                  "the delivery claim. Filter by tag.",
+            **where)
         notes.append("created %s with %d tags" % (forum.mention, len(SETUP_TAGS)))
     else:
-        have = {t.name.casefold() for t in forum.available_tags}
         added = 0
-        for name, emoji in SETUP_TAGS:
-            if name.casefold() not in have:
-                try:
-                    await forum.create_tag(name=name, emoji=emoji)
-                    added += 1
-                except discord.HTTPException:
-                    break
+        if isinstance(forum, discord.ForumChannel):
+            have = {t.name.casefold() for t in forum.available_tags}
+            for name, emoji in SETUP_TAGS:
+                if name.casefold() not in have:
+                    try:
+                        await forum.create_tag(name=name, emoji=emoji)
+                        added += 1
+                    except discord.HTTPException:
+                        break
         notes.append("reused %s%s" % (forum.mention,
                                       " (+%d tags)" % added if added else ""))
+        warnings += _adoption_warnings(forum, me, public=False)
     out["queue_channel_id"] = forum.id
 
     # --- staff archive: text, read-only for humans ---------------------------
-    arch = find("kit-archive", discord.TextChannel)
-    if arch is None:
+    arch = archive or find("kit-archive", discord.TextChannel)
+    if arch is not None and archive is not None:
+        notes.append("adopted %s for transcripts (permissions left as they are)"
+                     % arch.mention)
+        warnings += _adoption_warnings(arch, me, public=False)
+    elif arch is None:
         aow = {
             everyone: discord.PermissionOverwrite(view_channel=False),
             me: discord.PermissionOverwrite(
@@ -1876,13 +1981,16 @@ async def build_channels(guild: discord.Guild, reviewer: Optional[discord.Role],
         arch = await guild.create_text_channel(
             "kit-archive", overwrites=aow, reason="Melon Kits setup",
             topic="Staff only, append-only. One transcript per finished ticket, with the "
-                  "chat log attached, so the record outlives the thread and the post.")
+                  "chat log attached, so the record outlives the thread and the post.",
+            **where)
         notes.append("created %s" % arch.mention)
     else:
         notes.append("reused %s" % arch.mention)
+        warnings += _adoption_warnings(arch, me, public=False)
     out["transcript_channel_id"] = arch.id
 
     out["notes"] = notes
+    out["warnings"] = warnings
     return out
 
 
@@ -1894,15 +2002,30 @@ def register_commands(app: KitBot) -> None:
                               "posts the panel.")
     @app_commands.describe(
         reviewer_role="Who may approve, decline and see reviewer cards",
-        delivery_role="Who may claim a delivery (defaults to the reviewer role)")
+        delivery_role="Who may claim a delivery (defaults to the reviewer role)",
+        category="Put any channels I create in this category",
+        requests_channel="Use this channel for the panel instead of making one - e.g. your "
+                         "existing help channel",
+        queue_channel="Use this staff channel for reviewer cards instead of making one",
+        archive_channel="Use this staff channel for finished-ticket transcripts")
     async def setup(interaction: discord.Interaction,
                     reviewer_role: discord.Role,
-                    delivery_role: Optional[discord.Role] = None) -> None:
+                    delivery_role: Optional[discord.Role] = None,
+                    category: Optional[discord.CategoryChannel] = None,
+                    requests_channel: Optional[discord.TextChannel] = None,
+                    queue_channel: Optional[
+                        Union[discord.ForumChannel, discord.TextChannel]] = None,
+                    archive_channel: Optional[discord.TextChannel] = None) -> None:
         """The whole install: three channels, the tags, the config, the panel.
 
         Gated on Manage Server rather than the reviewer role, because at this point there is
         no reviewer role configured -- gating setup on the thing setup creates would be a
         chicken-and-egg lockout.
+
+        Every argument past the reviewer role is optional, so the one-argument install still
+        works exactly as it did. The rest exist for a server that already has somewhere for
+        this to live: hand over the help channel people already know about, and put anything
+        new in the category the rest of the support channels are in.
         """
         if interaction.guild is None:
             await interaction.response.send_message("Run this in a server.", ephemeral=True)
@@ -1913,9 +2036,17 @@ def register_commands(app: KitBot) -> None:
             return
 
         me = interaction.guild.me
-        missing = [n for n in ("manage_channels", "send_messages", "embed_links",
-                               "attach_files", "create_private_threads", "manage_threads")
-                   if not getattr(me.guild_permissions, n)]
+        # Manage Channels is only needed to *make* one. An admin who hands over all three
+        # existing channels should not be told to re-invite the bot with a permission it is
+        # never going to use -- except that adding forum tags needs it too, so a forum queue
+        # still asks for it.
+        needs_creating = not (requests_channel and archive_channel and queue_channel)
+        wants_tags = isinstance(queue_channel, discord.ForumChannel)
+        need = ["send_messages", "embed_links", "attach_files", "create_private_threads",
+                "manage_threads"]
+        if needs_creating or wants_tags:
+            need.insert(0, "manage_channels")
+        missing = [n for n in need if not getattr(me.guild_permissions, n)]
         if missing:
             # Checked up front: a half-finished setup is worse than one that refuses.
             await interaction.response.send_message(
@@ -1926,10 +2057,38 @@ def register_commands(app: KitBot) -> None:
                 ephemeral=True)
             return
 
+        # Discord's channel picker is derived from the annotation, and it offers more than the
+        # obvious two: `TextChannel` also matches an **announcement** channel, `ForumChannel`
+        # also matches a **media** channel. Neither is a typo an admin can be expected to
+        # notice, and one of them breaks the app outright.
+        if queue_channel is not None and isinstance(queue_channel, discord.ForumChannel) \
+                and queue_channel.is_media():
+            # A media channel REQUIRES an attachment on every post. The reviewer card is an
+            # embed, so every single ticket would fail to post and be auto-cancelled.
+            await interaction.response.send_message(
+                "**%s** is a media channel, and Discord requires every post in one to have a "
+                "file attached. The reviewer card is an embed, so no ticket could ever be "
+                "posted there. Pick a forum or a normal text channel for the queue."
+                % queue_channel.name, ephemeral=True)
+            return
+
+        if category is not None and needs_creating \
+                and not category.permissions_for(me).manage_channels:
+            # A category overwrite can deny what the server-wide permission grants, and the
+            # failure otherwise arrives as a bare 403 halfway through.
+            await interaction.response.send_message(
+                "I can't create channels inside **%s** - that category denies me Manage "
+                "Channels even though I have it server-wide. Either fix the override on the "
+                "category, or leave `category` blank and drag the channels in afterwards."
+                % category.name, ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            built = await build_channels(interaction.guild, reviewer_role,
-                                         delivery_role or reviewer_role)
+            built = await build_channels(
+                interaction.guild, reviewer_role, delivery_role or reviewer_role,
+                category=category, requests=requests_channel, queue=queue_channel,
+                archive=archive_channel)
         except discord.Forbidden:
             await interaction.followup.send(
                 "Discord refused to create a channel. That is usually my role sitting below "
@@ -1937,7 +2096,7 @@ def register_commands(app: KitBot) -> None:
                 ephemeral=True)
             return
 
-        values = {k: v for k, v in built.items() if k != "notes"}
+        values = {k: v for k, v in built.items() if k not in ("notes", "warnings")}
         values["reviewer_role_id"] = reviewer_role.id
         values["runner_role_id"] = (delivery_role or reviewer_role).id
         app.store.set_guild_config(interaction.guild.id, values)
@@ -1966,25 +2125,40 @@ def register_commands(app: KitBot) -> None:
             panel_note = ("couldn't post the panel - run `/panel` in %s once I can post "
                           "there" % panel_channel.mention)
 
+        warnings = built.get("warnings") or []
         embed = discord.Embed(
             title="\U0001F348 Melon Kits is set up",
             description="\n".join("- %s" % n for n in built["notes"] + [panel_note]),
-            colour=discord.Colour.from_str("#2E6B3F"))
+            # Amber when something adopted needs attention. Still set up, still usable -- the
+            # colour is there so the admin does not read past a line that matters.
+            colour=discord.Colour.from_str("#8A6D1F" if warnings else "#2E6B3F"))
         embed.add_field(
             name="Roles",
             value="Reviewers: %s\nDelivery: %s"
                   % (reviewer_role.mention, (delivery_role or reviewer_role).mention),
             inline=False)
+        if warnings:
+            body = "\n".join("- %s" % w for w in warnings)
+            embed.add_field(
+                name="Worth knowing about the channels you handed over",
+                value=body if len(body) <= 1024 else body[:1000].rsplit("\n", 1)[0]
+                + "\n- ... (more, see the bot log)",
+                inline=False)
         embed.add_field(
             name="What happens now",
-            value="People press the button in %s. Reviewers get a card in the queue with "
+            value="People press a button in %s. Reviewers get a card in the queue with "
                   "Approve and Decline, and finished tickets archive themselves.\n\n"
-                  "`/setup` is safe to re-run - it reuses whatever already exists. "
-                  "**Manage Channels was only needed for setup and can be removed now.**"
-                  % panel_channel.mention,
+                  "`/setup` is safe to re-run - it reuses whatever already exists, and naming "
+                  "a channel again just re-points at it.%s"
+                  % (panel_channel.mention,
+                     "\n\n**Manage Channels was only needed for setup and can be removed "
+                     "now.**" if needs_creating or wants_tags else ""),
             inline=False)
         embed.set_footer(text="This server's tickets, cooldowns and flags are its own.")
         await interaction.followup.send(embed=embed, ephemeral=True)
+        if warnings:
+            LOG.info("setup finished with %d adoption warning(s) guild=%s",
+                     len(warnings), interaction.guild.id)
 
     @tree.command(name="panel", description="Post the kit-request panel in this channel.")
     async def panel(interaction: discord.Interaction) -> None:

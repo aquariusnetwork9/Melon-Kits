@@ -107,7 +107,7 @@ counter keeps the pin and the position — you never need to delete and re-post.
 
 | command | who | what |
 |---|---|---|
-| `/setup <reviewer_role> [delivery_role]` | **Manage Server** | install on this server: makes the three channels and the tags, stores the config, posts the panel. Idempotent |
+| `/setup <reviewer_role> [delivery_role] [category] [requests_channel] [queue_channel] [archive_channel]` | **Manage Server** | install on this server: makes the three channels and the tags, stores the config, posts the panel. Idempotent |
 | `/panel` | reviewer | re-post or update the panel. Edits an existing one in place |
 | `/lookup <name>` | reviewer | a reviewer card with no ticket attached — for answering "would this even pass" |
 | `/flag <name> <kind> <note>` | reviewer | mark an account: known alt, do not serve, or a note. Resolves to a UUID so it survives a rename |
@@ -136,6 +136,36 @@ Closing records no kit, so it never burns the 21-day cooldown.
 | `#kit-requests` | **text**, public | everyone | the pinned panel, and a **private thread per ticket** — the applicant ↔ staff conversation |
 | `#kit-queue` | **forum**, staff only | reviewer + delivery | one post per ticket: the reviewer card, the decision, the claim, the delivery. Tags carry the state |
 | `#kit-archive` | **text**, staff only, read-only | reviewer + delivery | one transcript per finished ticket, with the chat log attached |
+
+**Names are the default, not a requirement.** `/setup` will use channels the server already has
+if you name them, which is the point on a server with a help channel people already know to go
+to:
+
+```
+/setup reviewer_role:@Staff delivery_role:@Couriers
+       category:Support                    ← anything I create goes in here
+       requests_channel:#support-tickets   ← the panel goes here instead of a new channel
+       queue_channel:#staff-review         ← optional; a forum, or a text channel
+       archive_channel:#ticket-logs
+```
+
+Everything past `reviewer_role` is optional, so the one-argument install is unchanged. Two
+things follow from adopting rather than creating:
+
+- **An adopted channel keeps its own permissions.** Setup does not touch them — partly because
+  reconfiguring a channel that is in use for something else is rude, and partly because editing
+  overwrites needs Manage Roles, which this bot deliberately never asks for. Instead the reply
+  reports what it found and what will follow: if the channel lets everyone post, it says the
+  panel will get pushed up as people talk (it stays pinned; `/panel` puts it back at the
+  bottom); if the bot can't create private threads there, it says applicants will get no thread.
+- **Manage Channels is only needed to make one.** Hand over all three and setup no longer asks
+  for it at all — unless the queue is a forum, since adding tags needs it too.
+
+The channel picker Discord builds from those options is wider than it looks: it offers
+**announcement** channels wherever a text channel is accepted, and **media** channels wherever a
+forum is. An announcement channel cannot have private threads, so setup warns. A media channel
+requires an attachment on every post, so a reviewer card could never post there at all — setup
+refuses that one outright rather than letting every ticket auto-cancel.
 
 **The applicant never sees the reviewer card.** Their thread gets a receipt, the outcome, and
 delivery coordination — nothing else. The card carries the ledger fan-out, the reviewer flag
