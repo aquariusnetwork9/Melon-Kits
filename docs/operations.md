@@ -265,6 +265,29 @@ owners hold all permissions unconditionally, so `permissions_for(owner).view_cha
 `True`. The meaningful evidence is `@everyone → False` plus the overwrite rows. A real check
 needs a second, non-staff account.
 
+### Don't hold an SSH session open waiting for a long job
+
+A full mining pass over the 6.7M-row dump takes about thirteen minutes. Wrapping it in a
+watcher —
+
+```bash
+ssh ovh-2 'nohup python3 tools/mine.py test ... &
+           until [ -s report.txt ]; do sleep 15; done; cat report.txt'
+```
+
+— reliably dies with `Connection reset by peer` and **exit 255**. The job itself is fine: it is
+detached under `nohup` and always finishes. What dies is the watching client, and the exit code
+you get back is the watcher's, not the work's. It reads like a failed job and is not one.
+
+Start it and come back instead:
+
+```bash
+ssh ovh-2 'cd ~/melon-kits/kit-app && nohup python3 tools/mine.py test ... > mine.log 2>&1 &'
+# ...later, a separate short connection:
+ssh ovh-2 'tr "\r" "\n" < ~/vcdb-2025/mine.log | tail -1'   # progress
+ssh ovh-2 'sed -n "1,12p" ~/vcdb-2025/report.txt'           # result
+```
+
 ### Host quirks on ovh-2
 
 - **`python3-venv` is not installed by default on Ubuntu 25.04, and `python3 -c "import venv"`
