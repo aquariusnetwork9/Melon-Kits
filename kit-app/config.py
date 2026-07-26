@@ -21,7 +21,15 @@ DEFAULTS: Dict[str, Any] = {
     "discord": {
         # Name of the environment variable holding the bot token -- never the token itself.
         "token_env": "MELONKIT_DISCORD_TOKEN",
-        "guild_id": 0,
+        # The bot is multi-guild: channels and roles live in the database per server, set by
+        # /setup, not here. The five ids below are ONLY a bootstrap for the original
+        # single-guild deployment -- on first start they are adopted into that guild's stored
+        # config and then ignored forever. Leave them 0 on a fresh install.
+        #
+        # home_guild_id additionally gets a guild-scoped command copy so command edits appear
+        # instantly there rather than waiting on Discord's global propagation. Harmless to set
+        # on any install; it does not make the bot single-guild.
+        "home_guild_id": 0,
         # Read-only TEXT channel holding the pinned request panel. Private ticket threads
         # hang off it. It cannot be a forum: forum posts can only be public threads, so
         # every applicant would be able to read every other applicant's ticket.

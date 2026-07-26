@@ -68,18 +68,30 @@ PANEL_BODY = (
 
 # --------------------------------------------------------------------------- helpers
 
-def is_reviewer(member: Any, cfg: Dict[str, Any]) -> bool:
-    role_id = int(cfg["discord"]["reviewer_role_id"] or 0)
+def is_admin(member: Any) -> bool:
+    """Who may run /setup. Manage Server, i.e. whoever could have invited the bot."""
+    perms = getattr(member, "guild_permissions", None)
+    return bool(getattr(perms, "manage_guild", False) or
+                getattr(perms, "administrator", False))
+
+
+def is_reviewer(member: Any, g: Dict[str, Any]) -> bool:
+    """`g` is a merged per-guild config, not the file config -- roles differ per server."""
+    role_id = int(g.get("reviewer_role_id") or 0)
     if not role_id:
-        return bool(getattr(getattr(member, "guild_permissions", None), "manage_guild", False))
+        return is_admin(member)
     return any(r.id == role_id for r in getattr(member, "roles", []))
 
 
-def may_claim(member: Any, cfg: Dict[str, Any]) -> bool:
-    role_id = int(cfg["discord"]["runner_role_id"] or 0)
+def may_claim(member: Any, g: Dict[str, Any]) -> bool:
+    role_id = int(g.get("runner_role_id") or 0)
     if not role_id:
         return True
-    return any(r.id == role_id for r in getattr(member, "roles", []))
+    if any(r.id == role_id for r in getattr(member, "roles", [])):
+        return True
+    # A reviewer can always pick up a delivery; requiring a second role to do the thing you
+    # just approved is friction with no purpose.
+    return is_reviewer(member, g)
 
 
 # A ticket's whole lifecycle, expressed as forum tags on its queue post. Tag names are
@@ -351,6 +363,73 @@ class KitBot(discord.Client):
                 LOG.error("lexicon at %s could not be loaded (%s); continuing with none - "
                           "chat will still be listed, just not counted", path, exc)
 
+    # ------------------------------------------------------------- guild config
+
+    def gcfg(self, guild_id: Optional[int]) -> Dict[str, Any]:
+        """This guild's settings, over the file's defaults.
+
+        The file supplies things that are the same everywhere -- the token variable, the 2b2t
+        client, screening, the store path -- plus starting values for the per-guild policy.
+        Channel and role ids only ever come from the database, because they are meaningless
+        across servers.
+        """
+        merged: Dict[str, Any] = {
+            "panel_channel_id": 0,
+            "queue_channel_id": 0,
+            "transcript_channel_id": 0,
+            "reviewer_role_id": 0,
+            "runner_role_id": 0,
+            "capture_thread_messages": self.cfg["discord"]["capture_thread_messages"],
+        }
+        merged.update(self.cfg["policy"])
+        merged.update(self.cfg["panel"])
+        if guild_id:
+            merged.update(self.store.get_guild_config(int(guild_id)))
+        return merged
+
+    def is_configured(self, guild_id: Optional[int]) -> bool:
+        g = self.gcfg(guild_id)
+        return bool(g.get("panel_channel_id") and g.get("queue_channel_id"))
+
+    async def require_setup(self, interaction: discord.Interaction) -> Optional[Dict[str, Any]]:
+        """Merged config, or None after telling the caller to run /setup."""
+        if interaction.guild_id is None:
+            await _safe_followup(interaction, "This only works inside a server.")
+            return None
+        if not self.is_configured(interaction.guild_id):
+            await _safe_followup(
+                interaction,
+                "This server hasn't been set up yet. Someone with **Manage Server** needs to "
+                "run **/setup** first — it makes the channels and posts the panel.")
+            return None
+        return self.gcfg(interaction.guild_id)
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        LOG.info("joined guild=%s (%s) members=%s", guild.id, guild.name,
+                 guild.member_count)
+        if self.is_configured(guild.id):
+            return
+        # Point whoever added it at the one command that matters. Best effort: many guilds
+        # have no system channel, or deny the bot there.
+        target = guild.system_channel
+        if target is None or not target.permissions_for(guild.me).send_messages:
+            target = next((c for c in guild.text_channels
+                           if c.permissions_for(guild.me).send_messages), None)
+        if target is None:
+            return
+        try:
+            await target.send(embed=discord.Embed(
+                title="\U0001F348 Melon Kits",
+                description=(
+                    "Thanks for adding me. Someone with **Manage Server** should run "
+                    "**/setup** to get started.\n\n"
+                    "It creates three channels — a public one for requests, a staff-only "
+                    "queue, and a staff-only archive — and posts the request panel. Takes "
+                    "about five seconds and asks you nothing."),
+                colour=discord.Colour.from_str("#2E6B3F")))
+        except discord.HTTPException:
+            pass
+
     async def on_error(self, event: str, *args, **kwargs) -> None:
         """Never let an unhandled listener exception die silently in the library's logger."""
         LOG.exception("unhandled exception in event=%s", event)
@@ -377,15 +456,43 @@ class KitBot(discord.Client):
             self.add_dynamic_items(item)
         self.tree.on_error = self._on_app_command_error
         register_commands(self)
-        guild_id = int(self.cfg["discord"]["guild_id"] or 0)
-        if guild_id:
-            guild = discord.Object(id=guild_id)
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            LOG.info("commands synced to guild=%d", guild_id)
-        else:
-            await self.tree.sync()
-            LOG.info("commands synced globally (set discord.guild_id for instant updates)")
+        self._adopt_legacy_config()
+
+        # ALWAYS sync globally: the bot has to work in servers it has not met yet, and a
+        # guild-scoped sync only reaches the guilds named at startup.
+        await self.tree.sync()
+        LOG.info("commands synced globally")
+
+        # A home guild additionally gets a guild-scoped copy, purely so command edits show up
+        # instantly there instead of waiting on Discord's global propagation.
+        home = int(self.cfg["discord"]["home_guild_id"] or 0)
+        if home:
+            obj = discord.Object(id=home)
+            self.tree.copy_global_to(guild=obj)
+            await self.tree.sync(guild=obj)
+            LOG.info("commands also synced to home guild=%d for instant updates", home)
+
+    def _adopt_legacy_config(self) -> None:
+        """Move a single-guild file config into the database, once.
+
+        Without this, upgrading the existing deployment would look exactly like the ledger
+        having been wiped: every query is guild-scoped now, and the old rows carry no guild,
+        so cooldowns would reset and flags would vanish. Runs only when the home guild has no
+        stored config yet, so it never overwrites anything /setup has done.
+        """
+        home = int(self.cfg["discord"]["home_guild_id"] or 0)
+        if not home or self.store.get_guild_config(home):
+            return
+        legacy = {k: self.cfg["discord"].get(k) for k in
+                  ("panel_channel_id", "queue_channel_id", "transcript_channel_id",
+                   "reviewer_role_id", "runner_role_id")}
+        legacy = {k: v for k, v in legacy.items() if v}
+        if not legacy:
+            return
+        self.store.set_guild_config(home, legacy)
+        adopted = self.store.adopt_legacy_rows(home)
+        LOG.info("adopted legacy config into guild=%d keys=%s and stamped %d pre-existing "
+                 "row(s) with that guild", home, sorted(legacy), adopted)
 
     async def on_ready(self) -> None:
         LOG.info("connected as %s (%s)", self.user, getattr(self.user, "id", "?"))
@@ -427,7 +534,7 @@ class KitBot(discord.Client):
 
     # ------------------------------------------------------------- panel -> modal
 
-    async def _heal_orphaned_ticket(self, user_id: int) -> None:
+    async def _heal_orphaned_ticket(self, guild_id: int, user_id: int) -> None:
         """Close an open ticket whose applicant thread no longer exists.
 
         Deleting the thread in Discord does nothing to the ledger, so the row stays `open`
@@ -436,7 +543,7 @@ class KitBot(discord.Client):
         runs on every button press rather than relying only on the on_thread_delete event,
         because a thread deleted while the bot was down generates no event to catch.
         """
-        row = self.store.open_ticket_for(user_id)
+        row = self.store.open_ticket_for(guild_id, user_id)
         if row is None or not row["thread_id"]:
             # No thread recorded is not the same as a deleted thread: the queue post may
             # still be live and awaiting review, so leave it alone.
@@ -460,13 +567,20 @@ class KitBot(discord.Client):
 
     async def handle_panel_click(self, interaction: discord.Interaction) -> None:
         """Pre-check, THEN show the form. Never the other way round."""
+        gid = interaction.guild_id
+        if gid is None or not self.is_configured(gid):
+            # A panel can outlive a /setup being undone, so the button has to cope.
+            await interaction.response.send_message(
+                "This server isn't set up for kit requests right now. Someone with Manage "
+                "Server needs to run **/setup**.", ephemeral=True)
+            return
+        g = self.gcfg(gid)
         user_id = interaction.user.id
-        pol = self.cfg["policy"]
 
-        await self._heal_orphaned_ticket(user_id)
-        open_n = self.store.open_ticket_count(user_id)
-        if open_n >= int(pol["max_open_tickets_per_user"]):
-            existing = self.store.open_ticket_for(user_id)
+        await self._heal_orphaned_ticket(gid, user_id)
+        open_n = self.store.open_ticket_count(gid, user_id)
+        if open_n >= int(g["max_open_tickets_per_user"]):
+            existing = self.store.open_ticket_for(gid, user_id)
             where = ""
             if existing and existing["thread_id"]:
                 where = " Here: <#%d>" % int(existing["thread_id"])
@@ -475,12 +589,12 @@ class KitBot(discord.Client):
                 % where, ephemeral=True)
             return
 
-        cd = self.store.cooldown(pol["cooldown_days"], discord_user_id=user_id)
+        cd = self.store.cooldown(gid, g["cooldown_days"], discord_user_id=user_id)
         if cd["blocked"]:
             await interaction.response.send_message(
                 "You had a kit from us recently, so you're inside the %d-day cooldown - "
                 "about %d day(s) to go. This is to spread kits around rather than anything "
-                "against you." % (pol["cooldown_days"], cd["days_left"]), ephemeral=True)
+                "against you." % (g["cooldown_days"], cd["days_left"]), ephemeral=True)
             return
 
         await interaction.response.send_modal(RequestModal(self))
@@ -522,16 +636,18 @@ class KitBot(discord.Client):
         mc_uuid = (resolved or {}).get("uuid")
         canonical = (resolved or {}).get("name") or mc_name
 
-        ticket_id = self.store.create_ticket(user.id, canonical, mc_uuid, note or None)
-        LOG.info("ticket opened ticket=%d user=%s uuid=%s", ticket_id, user.id,
+        gid = interaction.guild_id
+        g = self.gcfg(gid)
+        ticket_id = self.store.create_ticket(gid, user.id, canonical, mc_uuid, note or None)
+        LOG.info("ticket opened guild=%s ticket=%d user=%s uuid=%s", gid, ticket_id, user.id,
                  mc_uuid or "unresolved")
 
-        thread = await self._open_thread(interaction, ticket_id, canonical)
+        thread = await self._open_thread(interaction, g, ticket_id, canonical)
         if thread is not None:
             self.store.set_ticket_thread(ticket_id, thread.id)
 
         built = await loop.run_in_executor(None, lambda: card_mod.gather(
-            canonical, mc_uuid, user.id, self.cfg, self.vc, self.store, self.lex, LOG))
+            gid, canonical, mc_uuid, user.id, self.cfg, self.vc, self.store, self.lex, LOG))
 
         # Instrumentation: the lines shown, stored redacted. Impossible to backfill.
         try:
@@ -555,7 +671,7 @@ class KitBot(discord.Client):
             except discord.HTTPException:
                 LOG.warning("could not post receipt to applicant thread ticket=%d", ticket_id)
 
-        posted = await self._post_queue_card(ticket_id, canonical, user, built, thread)
+        posted = await self._post_queue_card(g, ticket_id, canonical, user, built, thread)
         if not posted:
             # No reviewer will ever see this ticket, and leaving it `open` would bar the
             # applicant from trying again -- the lockout, reached by a third route. Close it
