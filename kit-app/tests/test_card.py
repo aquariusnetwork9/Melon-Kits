@@ -263,10 +263,11 @@ class CardCase(unittest.TestCase):
 
     # ---------------------------------------------------------- recommendation
     #
-    # The two limits below are what make a recommendation defensible at all in this app, and
-    # they are asserted rather than documented because both are load-bearing:
-    #   1. profanity and slur counts never move the call
-    #   2. chat can never produce a deny
+    # Chat decides here, slurs included -- that is what reading chat history is for. What is
+    # asserted instead is where the line now sits, because that is the load-bearing part:
+    #   1. profanity still never moves the call (ambient register, and no target)
+    #   2. chat denies on VOLUME, not on one hit, so the heading stays worth reading
+    #   3. it counts flagged lines, never hits, so one sentence cannot look like a pattern
 
     def lex_with(self, **cats):
         return screening.Lexicon(
@@ -274,6 +275,10 @@ class CardCase(unittest.TestCase):
 
     def chats_saying(self, *texts):
         return [{"time": ago_ts(days=1 + i), "chat": t} for i, t in enumerate(texts)]
+
+    def clean(self, n):
+        """`n` unremarkable lines, to pad a rate denominator."""
+        return ["hello there friend"] * n
 
     def test_profanity_never_moves_the_call(self):
         """Measured against the 2025 dump, the tuned lexicon still flags 3.7% of ALL 2b2t chat.
@@ -290,31 +295,134 @@ class CardCase(unittest.TestCase):
         self.assertEqual(rec["call"], card_mod.CALL_APPROVE)
         self.assertFalse([r for r in rec["rules"] if "profanity" in r["rule"]])
 
-    def test_slur_counts_never_move_the_call_either(self):
+    def test_a_few_slurs_ask_for_a_look(self):
+        """Below the deny threshold a slur is still worth surfacing -- just not worth a Blocked
+        heading, which is the difference between a useful recommendation and one reviewers
+        learn to skip."""
         c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
                        deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
-                       chats=self.chats_saying("badword", "badword"))
+                       chats=self.chats_saying(*(["badword"] * 2 + self.clean(200))))
         card = self.build(c, lex=self.lex_with(slur=["badword"]))
         rec = card_mod.recommend(card)
-        self.assertEqual(rec["call"], card_mod.CALL_APPROVE)
-        self.assertFalse([r for r in rec["rules"] if "slur" in r["rule"]])
+        said = [r for r in rec["rules"] if r["rule"] == "chat: slur"]
+        self.assertTrue(said, "a slur hit did not even appear in the trace")
+        self.assertEqual(said[0]["says"], card_mod.CALL_LOOK)
+        self.assertNotEqual(rec["call"], card_mod.CALL_DENY)
 
-    def test_off_game_chat_asks_for_a_look_but_never_denies(self):
-        """The one category whose own note says it should change a decision -- and still only
-        as far as "read these lines". Whether a matched phrase is a real threat or somebody
-        asking for a delivery address is exactly what a keyword list cannot see, and a false
-        deny costs more here than a false approve."""
+    def test_enough_slurs_deny(self):
+        """The change the whole rewrite is for: chat alone can now say deny."""
+        n = card_mod.CHAT_DENY["slur"]["lines"]
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
+                       chats=self.chats_saying(*(["badword"] * n)))
+        card = self.build(c, lex=self.lex_with(slur=["badword"]))
+        rec = card_mod.recommend(card)
+        self.assertEqual(rec["call"], card_mod.CALL_DENY)
+        said = [r for r in rec["rules"] if r["rule"] == "chat: slur"]
+        # A deny has to show its own arithmetic, or a reviewer cannot argue with it.
+        self.assertIn(str(n), said[0]["because"])
+
+    def test_a_high_rate_denies_below_the_line_count(self):
+        """Someone whose every other line is a slur, but who has said little, still denies --
+        that is what the rate arm is for."""
+        rate = card_mod.CHAT_DENY["slur"]["rate"]
+        read = card_mod.CHAT_DENY_MIN_READ + 10
+        bad = int(read * rate) + 1
+        self.assertLess(bad, card_mod.CHAT_DENY["slur"]["lines"], "the count arm would fire")
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
+                       chats=self.chats_saying(*(["badword"] * bad + self.clean(read - bad))))
+        card = self.build(c, lex=self.lex_with(slur=["badword"]))
+        self.assertEqual(card_mod.recommend(card)["call"], card_mod.CALL_DENY)
+
+    def test_a_rate_off_a_handful_of_lines_does_not_deny(self):
+        """2 flagged lines out of 3 is 67% and means nothing. Below the floor, only the
+        absolute count may deny."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
+                       chats=self.chats_saying("badword", "badword", "hello there friend"))
+        card = self.build(c, lex=self.lex_with(slur=["badword"]))
+        self.assertLess(len(card["chat_lines"]), card_mod.CHAT_DENY_MIN_READ)
+        self.assertNotEqual(card_mod.recommend(card)["call"], card_mod.CALL_DENY)
+
+    def test_one_line_matching_many_terms_is_one_line(self):
+        """Thresholds are on flagged lines, not hits: "dox your ass" matches two terms, and a
+        single sentence must not be able to look like a pattern."""
+        card = self.build(
+            FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
+                       chats=self.chats_saying("aaaaaa bbbbbb cccccc")),
+            lex=self.lex_with(slur=["aaaaaa", "bbbbbb", "cccccc"]))
+        # Three hits, one line -- and one line is under every threshold there is.
+        self.assertEqual(card["screening"]["per_category"]["slur"], 3)
+        self.assertEqual(len(card["screening"]["category_lines"]["slur"]), 1)
+        self.assertNotEqual(card_mod.recommend(card)["call"], card_mod.CALL_DENY)
+
+    def test_off_game_denies_sooner_than_slur(self):
+        """It is rarer and it is the only category aimed at a person, so it sits lower -- but
+        not at 1, because a keyword list cannot tell a threat from a discussion of one."""
+        self.assertLess(card_mod.CHAT_DENY["off_game"]["lines"],
+                        card_mod.CHAT_DENY["slur"]["lines"])
+        self.assertGreater(card_mod.CHAT_DENY["off_game"]["lines"], 1)
+
+    def test_one_off_game_line_asks_for_a_look(self):
         c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
                        deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
                        chats=self.chats_saying("hello", "im gonna swat you", "bye"))
         card = self.build(c, lex=self.lex_with(off_game=["swat you"]))
         rec = card_mod.recommend(card)
         self.assertEqual(rec["call"], card_mod.CALL_LOOK)
-        self.assertNotEqual(rec["call"], card_mod.CALL_DENY)
         hit = [r for r in rec["rules"] if r["rule"] == "chat: off_game"]
         self.assertTrue(hit)
         # It has to name WHICH line, or it is just a number next to a word.
         self.assertIn("1", hit[0]["because"])
+
+    def test_the_trace_fits_a_discord_field_without_losing_the_caveat(self):
+        """Twelve rules on a heavy talker came to ~1630 characters against Discord's 1024 field
+        cap, and a tail-truncation ate the "this is a recommendation, not the decision" line --
+        on Blocked cards, the one place it has to survive. Adding `slur` is what made a trace
+        that long reachable."""
+        self.st.set_flag(GUILD, "deny", 500, mc_uuid=UUID_A, note="ban evading, third this month")
+        self.st.set_flag(GUILD, "alt", 500, mc_uuid=UUID_A, note="alt")
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       chats=self.chats_saying(*(["badword swatting you"] * 60
+                                                 + self.clean(60))))
+        card = self.build(c, lex=self.lex_with(slur=["badword"], off_game=["swatting you"]))
+        rec = card_mod.recommend(card)
+        text = card_mod.rules_text(rec)
+        self.assertEqual(rec["call"], card_mod.CALL_DENY)
+        self.assertLessEqual(len(text), card_mod.RULES_TEXT_BUDGET)
+        self.assertIn("recommendation, not the decision", text)
+        # Every deny rule survives -- those are the reasons for the heading.
+        self.assertEqual(text.count("✗"), sum(1 for r in rec["rules"] if r["says"] == "deny"))
+        # And what was dropped is stated, not just missing.
+        if len(rec["rules"]) > text.count("**"):
+            self.assertIn("not shown", text)
+
+    def test_a_short_trace_is_left_alone(self):
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}])
+        text = card_mod.rules_text(card_mod.recommend(self.build(c)))
+        self.assertNotIn("not shown", text)
+        self.assertLessEqual(len(text), card_mod.RULES_TEXT_BUDGET)
+
+    def test_every_deny_threshold_names_a_category_that_can_fire(self):
+        """A CHAT_DENY entry for a category the loop never consults would be dead config that
+        looks live."""
+        for category in card_mod.CHAT_DENY:
+            self.assertIn(category, card_mod._DECIDING_CATEGORIES, category)
+
+    def test_discussing_doxxing_is_not_a_hit(self):
+        """The bare noun is out of the shipped lexicon on purpose: with chat able to deny, a
+        term that fires on talking ABOUT the act would deny people for talking about it. The
+        top five accounts by score in the 2025 dump were an ad fleet whose copy contained it."""
+        lex = screening.Lexicon.load(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "lexicon.example.json"))
+        for innocent in ("doxxing is bad", "he got doxxed", "stop doxing people"):
+            self.assertFalse(screening.scan(innocent, lex), innocent)
+        for real in ("im gonna dox you", "i will doxx you", "doxxed you already"):
+            self.assertTrue(screening.scan(real, lex), real)
 
     def test_only_facts_can_deny(self):
         """A reviewer's own do-not-serve flag, and the cooldown. Nothing inferred."""
@@ -417,8 +525,9 @@ class CardCase(unittest.TestCase):
         first = card_mod.sections(card)[0]
         self.assertEqual(first["name"], "Nothing against them")
         # The caveat travels with the recommendation, because that is where it gets read.
-        self.assertIn("profanity", first["value"])
-        self.assertIn("never denies anyone", first["value"])
+        self.assertIn("profanity", first["value"].lower())
+        # It must say which way round it is now: profanity out, slurs in.
+        self.assertIn("slurs", first["value"].lower())
 
     # ------------------------------------------------------------ meeting point
 
@@ -498,7 +607,9 @@ class CardCase(unittest.TestCase):
         self.assertGreater(len(pages), 1)
         last = pages[-1]
         self.assertGreater(last["first"], 0)
-        self.assertIn("%4d" % last["first"], last["lines"][0])
+        # Asserted on the number, not on a column width: the point is that a page which starts
+        # at position 30 prints 30 and not 0.
+        self.assertEqual(last["lines"][0].split()[0], str(last["first"]))
 
     def test_markdown_and_mentions_cannot_escape_the_page(self):
         page = card_mod.chat_pages(self.rows(
@@ -519,7 +630,64 @@ class CardCase(unittest.TestCase):
     def test_flagged_lines_are_marked_and_listed(self):
         pages = card_mod.chat_pages(self.rows("fine", "!not fine", "fine again"))
         self.assertEqual(pages[0]["flagged"], [1])
-        self.assertTrue(any(l.startswith("! ") for l in pages[0]["lines"]))
+        marked = [l for l in pages[0]["lines"] if l.startswith("!")]
+        self.assertEqual(len(marked), 1, pages[0]["lines"])
+        self.assertIn("not fine", marked[0])
+
+    # ------------------------------------------------- how a page is laid out
+    #
+    # Discord gives a code block inside an embed description no horizontal scrollbar, so these
+    # are about the two things that made the list hard to read: a wasted left margin, and a long
+    # line breaking at column 0 underneath the next entry's number.
+
+    def test_a_long_line_wraps_with_a_hanging_indent(self):
+        """Uniform-width tokens, so the wrap lands on a token boundary and the same word starts
+        both lines -- which makes the column comparison below mean what it says."""
+        page = card_mod.chat_pages(self.rows("abcdefg " * 20))[0]
+        self.assertGreater(len(page["lines"]), 1, "did not wrap at all")
+        first, second = page["lines"][0], page["lines"][1]
+        # The continuation starts its text in the same column as the first line's.
+        self.assertEqual(first.index("abcdefg"), second.index("abcdefg"), (first, second))
+        # It still says which position it belongs to, because a wrap can straddle a page...
+        self.assertEqual(first.split()[0], second.split()[0])
+        # ...and it does not repeat the timestamp, which would read as a second message.
+        self.assertIn("07-24", first)
+        self.assertNotIn("07-24", second)
+
+    def test_no_rendered_line_is_wider_than_the_wrap(self):
+        rows = self.rows(*["word " * 40 for _ in range(5)])
+        for page in card_mod.chat_pages(rows):
+            for line in page["lines"]:
+                self.assertLessEqual(len(line), card_mod.CHAT_PAGE_WRAP, line)
+
+    def test_wrapping_drops_no_character_of_what_was_said(self):
+        """A break keeps its space on the line before it. Eating one is still editing the
+        evidence, which is the whole reason `neutralise` exists."""
+        said = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike "
+                "november oscar papa quebec romeo sierra tango uniform victor whiskey")
+        lines = card_mod.chat_pages(self.rows(said))[0]["lines"]
+        self.assertGreater(len(lines), 1, "did not wrap, so this proves nothing")
+        # Every line shares one prefix width -- that IS the hanging indent -- so the text is
+        # recoverable by slicing it off, and what comes back must be what went in.
+        plen = lines[0].index("alpha")
+        self.assertEqual("".join(l[plen:] for l in lines), said)
+
+    def test_the_left_margin_is_not_wasted_on_a_short_log(self):
+        """A 20-line log used to print every entry behind up to five columns of blank space: the
+        position field was fixed at four wide and right-aligned, whatever the numbers were."""
+        page = card_mod.chat_pages(self.rows(*["hi"] * 20))[0]
+        for line in page["lines"]:
+            # One column, and only ever the unflagged rows' empty flag marker.
+            self.assertLessEqual(len(line) - len(line.lstrip()), 1, repr(line))
+
+    def test_the_number_column_does_not_move_between_pages(self):
+        """Width comes from the whole log, not the page: derived per page, position 9 and
+        position 10 would sit in different columns and the text would jump sideways on Next."""
+        rows = self.rows(*["line %d" % i for i in range(45)])
+        pages = card_mod.chat_pages(rows)
+        self.assertGreater(len(pages), 1)
+        stamp_at = [l.index("07-24") for p in pages for l in p["lines"] if "07-24" in l]
+        self.assertEqual(len(set(stamp_at)), 1, "the stamp column moves between pages")
 
     def test_an_empty_log_never_claims_the_applicant_was_silent(self):
         """`chat_lines` is empty both when the player said nothing and when the api.2b2t.vc

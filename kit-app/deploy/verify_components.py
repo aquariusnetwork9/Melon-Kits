@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import discord
 
 import bot as bot_mod
+import card as card_mod
 import config as config_mod
 import store as store_mod
 
@@ -105,6 +106,21 @@ def panel_embed_renders():
 
 
 check("panel_embed", panel_embed_renders)
+
+print("\n-- the card's colour agrees with its heading --")
+
+
+def call_colours():
+    # Every call the recommender can return needs a colour, or a Blocked card silently renders
+    # in the fallback and the stripe stops meaning anything.
+    for call in (card_mod.CALL_APPROVE, card_mod.CALL_LOOK, card_mod.CALL_DENY):
+        assert call in bot_mod._CALL_COLOUR, call
+        discord.Colour.from_str(bot_mod._CALL_COLOUR[call])          # raises if malformed
+    assert len(set(bot_mod._CALL_COLOUR.values())) == 3, "two calls share a colour"
+    print("       %s" % bot_mod._CALL_COLOUR)
+
+
+check("a colour per call", call_colours)
 
 print("\n-- the guides embed links all four channels --")
 

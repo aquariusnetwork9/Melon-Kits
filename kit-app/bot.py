@@ -286,10 +286,20 @@ async def find_existing_panel(channel: Any) -> Optional[discord.Message]:
     return None
 
 
+# The stripe has to agree with the heading. It used to be keyed on cooldown-or-flags, which was
+# the same thing as the call only while chat could not deny: now a card headed **Blocked** because
+# of chat would have rendered the same green as a clean one, and the colour is what a reviewer
+# reads first in a forum list.
+_CALL_COLOUR = {
+    card_mod.CALL_APPROVE: "#2E6B3F",
+    card_mod.CALL_LOOK: "#8A6D1F",
+    card_mod.CALL_DENY: "#8A2F2F",
+}
+
+
 def _embed_for(card: Dict[str, Any], cfg: Dict[str, Any]) -> discord.Embed:
-    colour = discord.Colour.from_str("#2E6B3F")
-    if card["cooldown"]["blocked"] or card["flags"]:
-        colour = discord.Colour.from_str("#8A6D1F")
+    colour = discord.Colour.from_str(
+        _CALL_COLOUR.get(card_mod.recommend(card)["call"], "#8A6D1F"))
     # "Lookup" when there is no request behind the card: /lookup builds one to vet a name, and
     # titling that "Rescue kit - Alice" would invent a request nobody made.
     what = (store_mod.KIND_LABEL[card_mod.kind_of(card)].capitalize()

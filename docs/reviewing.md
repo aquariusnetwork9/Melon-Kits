@@ -22,24 +22,36 @@ substitute for the card: each line tells you where to go and check.
 It is deliberately **not a score.** A score is one number standing in for a judgement nobody can
 audit; a trace names the claim so you can disagree with that specific claim in one glance.
 
-Two limits on it, both measured rather than assumed:
-
-- **Profanity and slur counts never move it.** Run the tuned lexicon over a year of real 2b2t
-  chat and it still matches 3.7% of *everything*. Profanity is the server's register, so a
-  recommendation that moved on it would be recommending against the median player. The counts
-  stay on the card; they stay out of the arithmetic.
-- **Chat can never say Blocked.** Only two rules can, and both are facts rather than inferences:
-  a reviewer's own do-not-serve flag, and the cooldown. The strongest thing chat does is *read
-  these lines first* — because whether a matched phrase is a real threat or somebody asking for
-  a delivery address is exactly what a keyword list cannot see. The kits are disposable, so a
-  false deny costs more than a false approve, and the tie goes to the applicant.
+**Chat can say Blocked, and slurs are one of the things it says it on.** That is what reading
+chat history is for. An earlier version of this app refused both, reasoning that a false deny
+cost more than a false approve — which only held if the recommendation carried weight by itself.
+It doesn't: **a human reviews every ticket**, so a wrong Blocked costs you disagreeing with a
+heading, not somebody going without a kit.
 
 **Blocked is a recommendation, not a decision.** Approve over it if you disagree; the reason you
 type is what the ledger keeps.
 
-The one chat category that *does* move it is `off_game` — statements that leave the game, meaning
-they target a person rather than a player. That is the category's whole purpose, and when it
-fires the trace names which line numbers to read.
+Three limits survive, all measured rather than assumed:
+
+- **Profanity never moves it.** Run the tuned lexicon over a year of real 2b2t chat and it
+  matches 3.7% of *everything*. Profanity is the server's register and it has no target, so a
+  recommendation that moved on it would be recommending against the median player. The counts
+  stay on the card; they stay out of the arithmetic. Slurs and off-game lines are the exception,
+  because they have a target.
+- **A deny needs volume behind it.** 18% of accounts in the 2025 dump have at least one slur or
+  off-game hit somewhere in the year. A heading that fired for a fifth of all applicants would
+  teach you to skip it, so the thresholds sit at percentiles of that dump — see `CHAT_DENY` in
+  `card.py`, which carries the numbers and where each came from. Below the threshold the same
+  hits still show up; they just ask for a look instead.
+- **It counts flagged lines, not hits.** One sentence can match several terms — `dox your ass`
+  matches two — and a single sentence must not be able to look like a pattern.
+
+`off_game` denies sooner than `slur`: it is rarer, and it is the only category aimed at a person
+rather than at the room. Not at one line, though. A keyword list cannot tell a threat from a
+discussion of one, and that is not hypothetical — the top five accounts by score in the 2025 dump
+turned out to be an advertising fleet whose ad copy contained the word "doxxing". That is why the
+shipped lexicon carries **directed forms only** (`dox you`, never bare `doxxing`), and why the
+trace always names which line numbers to read.
 
 ### How much chat it actually read
 

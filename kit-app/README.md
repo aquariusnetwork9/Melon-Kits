@@ -311,10 +311,12 @@ Three things it will not do:
   to a question counts cannot answer. There is a test asserting no card field is named
   `score`, `confidence`, `risk` or `verdict`, and the call above is a **named rule trace**
   rather than a number for exactly that reason: it names the claim so a reviewer can disagree
-  with that claim. Two limits keep it honest, both measured rather than asserted — profanity and
-  slur counts never move it (the tuned lexicon flags 3.7% of *all* 2b2t chat, so it would move
-  against the median player), and chat can never produce a **Blocked**, which only a
-  do-not-serve flag or the cooldown can.
+  with that claim. Chat *can* produce a **Blocked**, slurs included — that is what reading chat
+  history is for — but only with volume behind it: 18% of accounts in the 2025 dump have at least
+  one hit, so a one-hit deny would fire for a fifth of all applicants and teach reviewers to skip
+  the heading. The thresholds are percentiles of that dump (`CHAT_DENY`), they count flagged
+  *lines* rather than hits, and profanity is still excluded outright — it flags 3.7% of *all*
+  2b2t chat and has no target.
 - **No "probable alt" badge.** Low playtime on an old account describes an alt *and* a
   returning lapsed player identically. The card says exactly that, in those words, instead of
   leaning. "Known alt" is a reviewer-maintained flag, never a computation.

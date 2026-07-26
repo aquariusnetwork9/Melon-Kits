@@ -319,18 +319,24 @@ def funding_section(card: Dict[str, Any]) -> Optional[Dict[str, str]]:
 # disagrees with a specific claim in one glance. `docs/reviewing.md` and the test asserting no
 # numeric score anywhere are both about the first thing, and neither is weakened by the second.
 #
-# Two hard limits on what this may do, both measured rather than assumed:
+# **Chat can deny, and slurs are one of the things it denies on.** That is the point of reading
+# chat history at all. An earlier version of this file refused both, on the reasoning that a
+# false deny costs more than a false approve -- which assumed the recommendation carried weight
+# by itself. It does not: a human reviews every ticket and the heading says so, so a wrong
+# "Blocked" costs a reviewer disagreeing, not an applicant going without a kit.
 #
-# 1. **Profanity and slur counts never move the call.** Run the tuned lexicon over the 2025
-#    bulk dump and 3.7% of ALL 2b2t chat still matches. Profanity is the server's ambient
-#    register, so a recommendation that moved on it would be recommending against the median
-#    player. They stay visible as counts and stay out of the arithmetic.
-# 2. **Chat can never produce a deny.** Only the two mechanical rules can -- a reviewer's own
-#    do-not-serve flag, and the cooldown, both of which are facts rather than inferences. The
-#    strongest thing chat can do is "read these lines first", because whether a matched phrase
-#    is a real threat or somebody asking for a delivery address is exactly what a keyword list
-#    cannot see. Given the kits are disposable and under-helping is the expensive direction, a
-#    false deny costs more than a false approve, so the tie goes to the applicant.
+# What survives from that reasoning is a *threshold*, for a different reason. Run the tuned
+# lexicon over the 2025 bulk dump and 3.7% of ALL 2b2t chat matches, with 18% of accounts hitting
+# at least once; a recommendation that said Blocked on one hit would say Blocked for a fifth of
+# all applicants, and a heading that fires for a fifth of everyone teaches reviewers to skip it.
+# So the deny needs volume behind it -- see CHAT_DENY, whose numbers are percentiles of that
+# same dump rather than round guesses.
+#
+# One limit does survive intact: **profanity never moves the call.** It is the server's ambient
+# register rather than a signal, and unlike a slur it has no target. It stays visible as a count.
+#
+# Thresholds are on flagged *lines*, never on hits. One line can match several terms -- "dox your
+# ass" matches two -- so counting hits would let a single sentence look like a pattern.
 
 CALL_APPROVE = "approve"
 CALL_LOOK = "look"
@@ -339,15 +345,72 @@ CALL_DENY = "deny"
 _CALL_RANK = {CALL_APPROVE: 0, CALL_LOOK: 1, CALL_DENY: 2}
 
 # Categories that may influence the call at all, and what each one means when it fires. Any
-# category not named here is counted and displayed but never consulted -- see limit 1 above.
+# category not named here -- profanity -- is counted and displayed but never consulted.
 _DECIDING_CATEGORIES = {
-    "off_game": ("look",
-                 "statements that leave the game -- the one category that should change a "
-                 "decision. Read the lines before deciding."),
-    "scam": ("look",
+    "off_game": (CALL_LOOK,
+                 "statements that leave the game, aimed at a person rather than a player"),
+    "slur": (CALL_LOOK, "slurs, which is what reading chat history is for"),
+    "scam": (CALL_LOOK,
              "scam patterns, which is a different question from swearing and is "
-             "kit-relevant in its own right."),
+             "kit-relevant in its own right"),
 }
+
+# What it takes for chat alone to say deny: this many flagged LINES, or this share of the lines
+# actually read, whichever comes first. Every number is a percentile of the 42,015 accounts in the
+# 2025 bulk dump, so it says "how rare is this on 2b2t" rather than "how bad do I think this is".
+#
+# Measured, per category, as the share of ALL accounts each threshold would fire on -- counting
+# what the card can actually SEE, i.e. the flagged lines expected inside a 500-line read rather
+# than a year's total, because a heavy talker with 800 flagged lines in 13,000 shows the card ~30:
+#
+#             >=1 line    at these thresholds        one notch looser
+#   slur       17.65%     15 lines 1.09% | 15% 1.26%    8 lines 2.71% | 8% 2.82%
+#   off_game    1.73%      3 lines 0.06% |  3% 0.08%    2 lines 0.11% | 2% 0.13%
+#
+# The first column is why there is a threshold at all: nearly a fifth of the server has said
+# something the slur list matches at some point in a year, so a one-hit deny would stamp Blocked
+# on a fifth of all applicants and teach reviewers to skip the heading. ~1% is rare enough to
+# still mean something and common enough to catch the people it is for.
+#
+# off_game sits far lower because it is 10x rarer and is the only category aimed at a person
+# rather than at the room. It is deliberately not 1: a keyword list cannot tell a threat from a
+# discussion of one, which is not hypothetical -- the top five accounts by score in this same dump
+# were an advertising fleet whose ad copy contained the word "doxxing". The shipped lexicon
+# carries directed forms only for that reason, which makes these counts, if anything, generous.
+CHAT_DENY = {
+    "off_game": {"lines": 3, "rate": 0.03},
+    "slur": {"lines": 15, "rate": 0.15},
+}
+
+# A rate needs a denominator worth dividing by. Below this many lines read only the absolute line
+# count can deny -- 2 flagged lines out of 3 is 67% and means nothing. 40 also sets a floor on the
+# evidence: at slur's 15% it takes 6 flagged lines before the rate arm can fire at all.
+#
+# The dump's p75 is 55 lines in a YEAR, so this leaves the rate arm applying to roughly the
+# talkative quarter and the count arm covering everyone else. The gap that leaves is deliberate:
+# 12 flagged lines out of 30 read trips neither arm, and stays a "read these lines" instead.
+CHAT_DENY_MIN_READ = 40
+
+
+def _chat_says(category: str, flagged_lines: int, lines_read: int,
+               floor: str) -> "tuple[str, str]":
+    """What one category's chat hits say, and the clause explaining why.
+
+    `floor` is the category's baseline verdict from _DECIDING_CATEGORIES; this only ever
+    escalates past it, never below.
+    """
+    rule = CHAT_DENY.get(category)
+    if not rule:
+        return floor, ""
+    if rule["lines"] and flagged_lines >= rule["lines"]:
+        return CALL_DENY, " - %d flagged lines is past the %d this denies at" % (
+            flagged_lines, rule["lines"])
+    if rule["rate"] and lines_read >= CHAT_DENY_MIN_READ:
+        share = flagged_lines / float(lines_read)
+        if share >= rule["rate"]:
+            return CALL_DENY, " - %.0f%% of the %d lines read, past the %.0f%% this denies at" % (
+                100 * share, lines_read, 100 * rule["rate"])
+    return floor, ""
 
 
 def recommend(card: Dict[str, Any]) -> Dict[str, Any]:
@@ -363,7 +426,7 @@ def recommend(card: Dict[str, Any]) -> Dict[str, Any]:
     def fires(rule: str, says: str, because: str) -> None:
         rules.append({"rule": rule, "says": says, "because": because})
 
-    # --- the only two rules allowed to say deny, because both are facts ---------
+    # --- the mechanical denies: facts rather than inferences ---------------------
     deny_flags = [f for f in card["flags"] if str(f.get("kind")) == "deny"]
     if deny_flags:
         fires("do-not-serve flag", CALL_DENY,
@@ -375,19 +438,21 @@ def recommend(card: Dict[str, Any]) -> Dict[str, Any]:
               "inside the %d-day cooldown for %s, %d day(s) left"
               % (card.get("cooldown_days", 21), store_mod.KIND_LABEL[kind], cd["days_left"]))
 
-    # --- chat: may only ever ask for a closer look -----------------------------
+    # --- chat: asks for a look, and denies once there is volume behind it -------
     scr = card["screening"]
     if scr:
-        for category, (says, why) in sorted(_DECIDING_CATEGORIES.items()):
+        lines_read = len(card.get("chat_lines") or [])
+        for category, (floor, why) in sorted(_DECIDING_CATEGORIES.items()):
             hits = scr["per_category"].get(category)
             if not hits:
                 continue
             where = (scr.get("category_lines") or {}).get(category) or []
+            says, escalation = _chat_says(category, len(where), lines_read, floor)
             fires("chat: %s" % category, says,
-                  "%d hit(s) on %d line(s)%s - %s"
+                  "%d hit(s) on %d line(s)%s - %s%s"
                   % (hits, len(where),
                      " (lines %s)" % ", ".join(str(w) for w in where[:8]) if where else "",
-                     why))
+                     why, escalation))
 
     # --- incomplete evidence is not clean evidence -----------------------------
     if not card["deaths_ok"]:
@@ -450,22 +515,56 @@ _CALL_HEADING = {
 
 _SAYS_MARK = {CALL_APPROVE: "✓", CALL_LOOK: "?", CALL_DENY: "✗"}
 
+# Discord caps an embed field value at 1024 characters. This text has to fit inside that on its
+# own rather than leaning on the caller to cut it: twelve rules on a heavy talker come to ~1630
+# characters, and a tail-truncation there silently ate the "this is a recommendation, not the
+# decision" caveat -- on Blocked cards specifically, which is the one place it has to survive.
+RULES_TEXT_BUDGET = 1024
+
 
 def rules_text(rec: Dict[str, Any]) -> str:
-    """The rule trace as a reviewer reads it: one line per rule, marked with what it said."""
-    lines = []
-    for r in rec["rules"]:
-        lines.append("%s **%s** - %s" % (_SAYS_MARK[r["says"]], r["rule"], r["because"]))
-    if not lines:
-        lines.append("? Nothing fired either way. Read the card.")
+    """The rule trace as a reviewer reads it: one line per rule, marked with what it said.
+
+    Guaranteed to fit RULES_TEXT_BUDGET. When it cannot, the *least decisive* rules go first --
+    approves, then looks -- because on a Blocked card those are the lines a reviewer needs least,
+    and what gets dropped is stated rather than just missing. Deny rules and the caveat always
+    survive.
+    """
     if rec["call"] == CALL_DENY:
-        lines.append("\n*This is a recommendation, not the decision. Approve anyway if you "
-                     "disagree - the reason you type is what the ledger keeps.*")
+        caveat = ("\n*This is a recommendation, not the decision. Approve anyway if you "
+                  "disagree - the reason you type is what the ledger keeps.*")
     else:
-        lines.append("\n*Counts of profanity and slurs are deliberately **not** part of this "
-                     "-- measured against a year of 2b2t chat they flag everybody. Chat can "
-                     "ask you to read something; it never denies anyone by itself.*")
-    return "\n".join(lines)
+        caveat = ("\n*Profanity counts are deliberately **not** part of this - measured "
+                  "against a year of 2b2t chat they flag everybody. Slurs and off-game "
+                  "lines are, once there are enough of them to be a pattern.*")
+
+    rules = list(rec["rules"])
+    if not rules:
+        return "\n".join(["? Nothing fired either way. Read the card.", caveat])
+
+    def render(keep: "List[Dict[str, str]]", dropped: int) -> str:
+        out = ["%s **%s** - %s" % (_SAYS_MARK[r["says"]], r["rule"], r["because"]) for r in keep]
+        if dropped:
+            out.append("*+%d less decisive rule(s) not shown - the card below has them.*"
+                       % dropped)
+        out.append(caveat)
+        return "\n".join(out)
+
+    # Drop order: least cautious first, and within a tier the last one added, so the earliest
+    # and most decisive rules are the ones that stay.
+    order = sorted(range(len(rules)), key=lambda i: (_CALL_RANK[rules[i]["says"]], -i))
+    text = render(rules, 0)
+    for cut in range(1, len(rules)):
+        if len(text) <= RULES_TEXT_BUDGET:
+            return text
+        drop = set(order[:cut])
+        text = render([r for i, r in enumerate(rules) if i not in drop], cut)
+    if len(text) > RULES_TEXT_BUDGET:
+        # One surviving rule is still too long to fit. Cut the rule, never the caveat.
+        room = RULES_TEXT_BUDGET - len(caveat) - 2
+        head = text[:max(0, room)].rsplit(" ", 1)[0]
+        text = "\n".join([head + " ...", caveat])
+    return text
 
 
 def chat_coverage_phrase(card: Dict[str, Any]) -> str:
@@ -701,27 +800,62 @@ def _stamp(ts: Optional[str]) -> str:
     return "%s %s" % (raw[5:10], raw[11:16]) if len(raw) >= 16 else " " * _STAMP_W
 
 
-def chat_page_chunks(row: Any, budget: int = CHAT_PAGE_BODY_BUDGET) -> List[str]:
-    """One ledger row rendered, split further only if it cannot fit a page by itself.
+# A code block inside an *embed description* gets no horizontal scrollbar -- Discord wraps it at
+# whatever the container width happens to be. So a long chat line broke at column 0 and ran
+# underneath the next entry's number, which is what made the list hard to read. There is no way
+# to make it expand; the fix is to put the break somewhere we choose and indent the continuation
+# to line up under the text. 72 is a compromise: comfortable on desktop, and a narrow client
+# re-wraps only the few lines that are still too long, with the indent already correct.
+CHAT_PAGE_WRAP = 72
 
-    The gutter marks a line a reviewer flagged with `/flagline`. Positions are printed from
+
+def _wrap(body: str, room: int) -> List[str]:
+    """`body` split to `room` columns, at spaces where there is one.
+
+    The space a break lands on is kept on the end of the line before it, so no character of what
+    somebody said is dropped -- the whole point of `neutralise` is that the evidence a reviewer
+    reads is the evidence that exists, and silently eating a space is still an edit. A token
+    longer than `room` (a 9,000-character paste) has nowhere to break and is cut.
+    """
+    room = max(8, room)
+    out: List[str] = []
+    while len(body) > room:
+        cut = body.rfind(" ", 0, room + 1)
+        if cut <= 0:
+            out.append(body[:room])
+            body = body[room:]
+        else:
+            out.append(body[:cut + 1])
+            body = body[cut + 1:]
+    out.append(body)
+    return out
+
+
+def chat_page_chunks(row: Any, budget: int = CHAT_PAGE_BODY_BUDGET,
+                     pos_width: int = 4, wrap: int = CHAT_PAGE_WRAP) -> List[str]:
+    """One ledger row rendered, wrapped to `wrap` columns with a hanging indent.
+
+    The flag column marks a line a reviewer flagged with `/flagline`. Positions are printed from
     ``row["position"]`` and never re-derived from the loop index: `record_shown_chats` numbers
     from zero and `flag_chat` matches that exact integer, so re-numbering per page would offset
-    every `/flagline` by the page offset and mislabel the only screening data that exists.
+    every `/flagline` by the page offset and mislabel the only screening data that exists. They
+    repeat on every continuation line, because a row long enough to be split can be split across
+    a page boundary too, and a continuation that does not say which position it belongs to is
+    unreadable on the page that starts with it.
+
+    `pos_width` comes from the widest position in the whole log rather than being fixed at 4, so
+    a 20-line log does not carry three columns of empty space in front of every entry.
     """
-    gutter = "! " if row["flagged"] else "  "
-    head = "%s%4d %s  " % (gutter, int(row["position"]), _stamp(row["chat_ts"]))
-    cont = "%s%4d %s  " % (gutter, int(row["position"]), " " * _STAMP_W)
-    body = neutralise(row["chat"])
-    room = max(16, budget - len(head) - 1)
-    if len(body) <= room:
-        return ["%s%s" % (head, body)]
-    out, rest = ["%s%s…" % (head, body[:room])], body[room:]
-    while rest:
-        room = max(16, budget - len(cont) - 1)
-        out.append("%s…%s" % (cont, rest[:room]))
-        rest = rest[room:]
-    return out
+    # Left-aligned, so the padding sits to the RIGHT of the number instead of in front of it.
+    # Right-aligning put up to three blank columns before every entry on a short log, which is
+    # the empty left margin this format exists to not have. Every later column still lines up.
+    flag = "!" if row["flagged"] else " "
+    head = "%s%-*d %s " % (flag, pos_width, int(row["position"]), _stamp(row["chat_ts"]))
+    cont = "%s%-*d %s " % (flag, pos_width, int(row["position"]), " " * _STAMP_W)
+    # Never wider than a page can hold, whatever `wrap` says.
+    room = min(max(8, wrap - len(head)), budget - len(head) - 1)
+    parts = _wrap(neutralise(row["chat"]), room)
+    return ["%s%s" % (head if i == 0 else cont, part) for i, part in enumerate(parts)]
 
 
 def chat_pages(rows: List[Any], budget: int = CHAT_PAGE_BODY_BUDGET,
@@ -740,9 +874,13 @@ def chat_pages(rows: List[Any], budget: int = CHAT_PAGE_BODY_BUDGET,
     seen: List[int] = []
     used = 0
 
+    # Widest position in the WHOLE log, not per page: the number column has to sit in the same
+    # place on every page or paging through them makes the text jump sideways.
+    pos_width = max([len(str(int(r["position"]))) for r in rows] or [1])
+
     for row in rows:
         position = int(row["position"])
-        for text in chat_page_chunks(row, budget):
+        for text in chat_page_chunks(row, budget, pos_width):
             need = len(text) + 1                     # the newline that will join it
             if lines and (used + need > budget or len(lines) >= max_lines):
                 pages.append({"lines": lines, "flagged": flagged,

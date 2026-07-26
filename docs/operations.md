@@ -178,6 +178,31 @@ systemctl is-active melonkit-bot && journalctl -u melonkit-bot -n 20 --no-pager
 Every one of these was hit for real. They are recorded because none of them is guessable and
 several failed *silently* or with a misleading error.
 
+### A lexicon term for a thing people discuss ranks the people discussing it
+
+**Symptom:** ranking the whole 2025 bulk dump by weighted score put five accounts on top with
+1,419, 963, 731, 683 and 518 `off_game` hits — and near-zero of anything else. Every one of them
+scored **100% on a single term**, `doxxing`.
+
+**Cause:** the lexicon carried the bare nouns `doxx`, `doxxed`, `doxxing` alongside the directed
+forms. Saying the word is not doing the thing, so the term matched every mention of the topic.
+The five accounts turned out to be one coordinated advertising fleet: 28,686 lines from **26
+distinct messages**, each carrying a `.gg` invite that four or five *other* accounts posted
+verbatim, with the word sitting in the ad copy.
+
+**Why it was not obvious:** the ranking looked *more* convincing for being lopsided — a huge
+count in the category weighted hardest, exactly what a real offender would produce. What
+distinguishes them is **term diversity**, not volume: a genuine pattern spreads across many
+terms, so one term at 100% is the signature of a noisy lexicon entry rather than of a person.
+That check is `tools/offenders.py` plus a distinct-term audit over the top rows, and it should be
+run before any name from a bulk pass is acted on.
+
+**The rule this leaves:** `off_game` takes **directed forms only** — `dox you`, `doxxed you`,
+never bare `doxxing`. This stopped being cosmetic once chat could produce a **Blocked**: a term
+that fires on discussing the act would deny people for discussing it. The normaliser folds
+doubled letters and separators, so `dox you` already covers `doxx you`, `d0x  you` and
+`dox your ass`.
+
 ### SQLite objects are bound to the thread that made them
 
 **Symptom:** a ticket row appears in the ledger, then three seconds later

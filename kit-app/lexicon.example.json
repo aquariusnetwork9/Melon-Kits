@@ -1,12 +1,11 @@
 {
   "categories": {
     "off_game": {
-      "note": "Leaves the game -- targeting a person rather than a player. The only category that should reliably change a decision.",
+      "note": "Leaves the game -- targeting a person rather than a player. Weighted hardest, and the lowest bar for a chat deny. DIRECTED FORMS ONLY: 'dox you', never bare 'doxxing'. The word is discussable and the act is not, and the bare noun proved it -- the top five accounts by score in the 2025 dump were an ad fleet whose copy contained it.",
       "terms": [
-        "doxx",
         "dox you",
-        "doxxed",
-        "doxxing",
+        "doxxing you",
+        "doxxed you",
         "ip grab",
         "ip grabber",
         "ip logger",
