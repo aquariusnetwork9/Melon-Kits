@@ -1031,8 +1031,19 @@ class TestPrivacy(SseReaderTestCase):
         try:
             raise OSError(104, "reset")
         except OSError as caught:
+            # Both of these must happen INSIDE the block: Python 3 deletes the `as` name on
+            # the way out, so touching `caught` afterwards is an UnboundLocalError.
             summary = ssereader._exc_summary(caught)
-        self.assertIn("OSError", summary)
+            caught_name = type(caught).__name__
+            self.assertIsInstance(caught, OSError)
+        # Asserted against the caught exception's own class name rather than a literal.
+        # OSError(errno, ...) auto-promotes to a subclass when the errno is one Python maps,
+        # and the mapping is platform-specific: on Linux 104 is ECONNRESET so this arrives as
+        # ConnectionResetError, while Windows spells that errno 10054 and leaves a plain
+        # OSError. Hardcoding either name makes the suite fail on the other platform, and
+        # this test is about payload bytes never reaching a log, not about which subclass
+        # the interpreter chose.
+        self.assertIn(caught_name, summary)
         self.assertIn("errno=104", summary)
         self.assertIn("test_ssereader.py:", summary)
 
