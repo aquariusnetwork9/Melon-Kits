@@ -303,6 +303,11 @@ def headline(card: Dict[str, Any]) -> str:
     """
     if card["cooldown"]["blocked"]:
         return "INSIDE COOLDOWN - %d day(s) left" % card["cooldown"]["days_left"]
+    rq = card.get("request_cooldown") or {}
+    if rq.get("blocked"):
+        return ("ALREADY REQUESTED - #%s was %s, %d day(s) left on the %d-day limit"
+                % (rq.get("last_ticket_id"), rq.get("last_status"), rq["days_left"],
+                   card.get("request_cooldown_days") or 0))
     if not card["tracked"]:
         return "Not tracked on 2b2t - no history at all under this account"
     bits = []
@@ -320,7 +325,22 @@ def headline(card: Dict[str, Any]) -> str:
             bits.append("first seen %s" % ago(card["first_seen"], card["generated_at"]))
     if card["flags"]:
         bits.append("%d reviewer flag(s)" % len(card["flags"]))
-    return " | ".join(bits) if bits else "Nothing stands out either way - read the card"
+    if card.get("other_requesters"):
+        bits.append("%d other Discord account(s) on this MC account"
+                    % len(card["other_requesters"]))
+    # The chat finding belongs in the one line a reviewer always reads, not only in the trace.
+    scr = card.get("screening") or {}
+    flagged = sum(len(v) for k, v in (scr.get("category_lines") or {}).items()
+                  if k in _DECIDING_CATEGORIES)
+    if flagged:
+        bits.append("%d flagged chat line(s)" % flagged)
+    if bits:
+        return " | ".join(bits)
+    # The fallback has to agree with the call. It used to say "nothing stands out" underneath a
+    # heading that said Blocked, which is the card contradicting itself in the two places a
+    # reviewer looks first.
+    return ("Blocked - see the trace below" if recommend(card)["call"] == CALL_DENY
+            else "Nothing stands out either way - read the card")
 
 
 # The funding form's questions, in the order a reviewer wants them. Kept here rather than in
@@ -718,10 +738,15 @@ def sections(card: Dict[str, Any]) -> List[Dict[str, str]]:
         led.append("Matched on: %s" % cd["matched"])
     elif cd["last_at"]:
         led.append("Last kit: %s (cooldown clear)" % ago(at_epoch(cd["last_at"]), gen))
+    elif card["kit_history"]:
+        # The cooldown is scoped to THIS request type; the history is not. Saying "no kit from
+        # us before" directly above "kits on record: 1" is the card contradicting itself -- both
+        # were true, and neither said which question it was answering.
+        led.append("Nothing of this kind granted before (the cooldown is per request type).")
     else:
         led.append("No kit from us before.")
     if card["kit_history"]:
-        led.append("Kits on record: %d" % len(card["kit_history"]))
+        led.append("Kits on record: %d (all types)" % len(card["kit_history"]))
 
     rq = card.get("request_cooldown") or {}
     days = card.get("request_cooldown_days") or 0

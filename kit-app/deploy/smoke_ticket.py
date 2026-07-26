@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import io
 import os
 import sys
 
@@ -41,7 +40,7 @@ def log(msg):
     sys.stderr.write("  %s\n" % msg)
 
 
-async def drive(cfg, token, mc_name, user_id, cleanup_id):
+async def drive(cfg, token, mc_name, user_id, cleanup_id, kind=store_mod.KIND_RESCUE):
     st = store_mod.open_store(cfg["store"]["path"])
     client = discord.Client(intents=discord.Intents.default())
     result = {"ok": False}
@@ -75,8 +74,9 @@ async def drive(cfg, token, mc_name, user_id, cleanup_id):
 
             # 2. ledger row
             ticket_id = st.create_ticket(guild.id, member.id, canonical, uuid,
-                                         "smoke test")
-            log("ticket #%d created in the ledger" % ticket_id)
+                                         "smoke test", request_type=kind)
+            log("ticket #%d created in the ledger (%s)"
+                % (ticket_id, store_mod.KIND_LABEL[kind]))
 
             # 3. THE RISKY ONE: a private thread, with the requester added
             thread = await panel.create_thread(
@@ -87,9 +87,17 @@ async def drive(cfg, token, mc_name, user_id, cleanup_id):
             st.set_ticket_thread(ticket_id, thread.id)
             log("PRIVATE thread created: #%s (%s) and requester added"
                 % (thread.name, thread.type))
+            # The REAL receipt, wording and all, plus the guides embed a rescue gets. A
+            # placeholder here would have made this the one thing the smoke test could not
+            # actually show: what the applicant reads.
             await thread.send(
-                "Smoke test for request **#%d** (`%s`). This is what an applicant sees - "
-                "a receipt, and nothing from the reviewer card." % (ticket_id, canonical))
+                "Thanks %s - this is request **#%d**, for **%s**, on `%s`.\n\n"
+                "A reviewer will look at it when someone's around. Help here is voluntary, so "
+                "there's no queue position to give you, and it isn't guaranteed. You don't need "
+                "to do anything else - if it's approved, whoever is delivering will message you "
+                "in this thread to sort out where to meet."
+                % (member.mention, ticket_id, store_mod.KIND_LABEL[kind], canonical),
+                embed=bot_mod.guides_embed() if kind == store_mod.KIND_RESCUE else None)
 
             # 4. the card, from live 2b2t data -- and deliberately through
             #    run_in_executor, exactly as the handler does. Calling gather directly on
@@ -98,34 +106,43 @@ async def drive(cfg, token, mc_name, user_id, cleanup_id):
             #    rather than incidental.
             lex = screening.Lexicon.load(cfg["screening"]["lexicon_path"])
             loop = asyncio.get_running_loop()
+            # request_type and ticket_id both matter: without them this builds a LOOKUP card --
+            # no request clock, cooldown scoped to any grant -- which is not what a reviewer
+            # will actually be looking at.
             built = await loop.run_in_executor(None, lambda: card_mod.gather(
-                guild.id, canonical, uuid, member.id, cfg, vc_mod.Client(cfg), st, lex))
+                guild.id, canonical, uuid, member.id, cfg, vc_mod.Client(cfg), st, lex,
+                request_type=kind, ticket_id=ticket_id))
+            rec = card_mod.recommend(built)
             log("card built: tracked=%s deaths=%d chats=%d coords_redacted=%d errors=%d"
                 % (built["tracked"], len(built["deaths"]), len(built["chat_lines"]),
                    built["coords_redacted"], len(built["errors"])))
+            log("recommendation: %s (%d rule(s)) -- %s"
+                % (rec["call"].upper(), len(rec["rules"]),
+                   card_mod.chat_coverage_phrase(built)))
             st.record_shown_chats(ticket_id, built["chat_lines"])
 
             # 5. THE OTHER RISKY ONE: forum post with tags, embed and an attachment
             view = discord.ui.View(timeout=None)
             view.add_item(bot_mod.ApproveButton(ticket_id))
             view.add_item(bot_mod.DeclineButton(ticket_id))
-            files = []
+            # The pager replaced the .txt attachment. Posting a file here would test a path the
+            # handler no longer takes and skip the one it does.
             if built["chat_lines"]:
-                files.append(discord.File(
-                    io.BytesIO(card_mod.chat_dump(built).encode("utf-8")),
-                    filename="chat-%s-ticket%d.txt" % (canonical, ticket_id)))
-            tags = bot_mod._state_tags(queue, "awaiting review") \
-                if isinstance(queue, discord.ForumChannel) else []
+                view.add_item(bot_mod.ChatHistoryButton(ticket_id))
+            tags = []
+            if isinstance(queue, discord.ForumChannel):
+                tags = (bot_mod._state_tags(queue, store_mod.KIND_LABEL[kind])
+                        + bot_mod._state_tags(queue, "awaiting review"))
             created = await queue.create_thread(
-                name="#%d %s" % (ticket_id, canonical),
-                content="Ticket #%d - smoke test, requested by %s\nApplicant thread: <#%d>"
-                        % (ticket_id, member.mention, thread.id),
-                embed=bot_mod._embed_for(built, cfg), view=view, files=files,
+                name="#%d %s - %s" % (ticket_id, canonical, store_mod.KIND_LABEL[kind]),
+                content="Ticket #%d - **%s** requested by %s\nApplicant thread: <#%d>"
+                        % (ticket_id, store_mod.KIND_LABEL[kind], member.mention, thread.id),
+                embed=bot_mod._embed_for(built, cfg), view=view,
                 applied_tags=tags,
                 allowed_mentions=discord.AllowedMentions(users=True))
             st.set_queue_thread(ticket_id, created.thread.id)
-            log("FORUM post created: %s  tags=%s  attachment=%s"
-                % (created.thread.name, [t.name for t in tags], bool(files)))
+            log("FORUM post created: %s  tags=%s  chat button=%s"
+                % (created.thread.name, [t.name for t in tags], bool(built["chat_lines"])))
 
             # 6. verify the applicant genuinely cannot see the queue
             everyone = guild.default_role
@@ -175,6 +192,8 @@ def main(argv=None):
     ap.add_argument("--config", required=True)
     ap.add_argument("--name", help="Minecraft username to build the card from")
     ap.add_argument("--user", type=int, help="Discord user id to treat as the requester")
+    ap.add_argument("--kind", default=store_mod.KIND_RESCUE, choices=list(store_mod.KINDS),
+                    help="which sort of request to file (default rescue)")
     ap.add_argument("--cleanup", type=int, default=0, metavar="TICKET_ID",
                     help="delete a smoke ticket's thread, post and ledger rows")
     args = ap.parse_args(argv)
@@ -191,7 +210,7 @@ def main(argv=None):
         sys.stderr.write("need --name and --user (or --cleanup TICKET_ID)\n")
         return 2
 
-    out = asyncio.run(drive(cfg, token, args.name, args.user, args.cleanup))
+    out = asyncio.run(drive(cfg, token, args.name, args.user, args.cleanup, args.kind))
     if out.get("ok"):
         if out.get("ticket"):
             print("ticket=%s thread=%s post=%s" % (out["ticket"], out["thread"], out["post"]))

@@ -495,6 +495,39 @@ class CardCase(unittest.TestCase):
         self.assertFalse([r for r in card_mod.recommend(card)["rules"]
                           if r["rule"] == "kit farming"])
 
+    def test_the_headline_never_contradicts_the_call(self):
+        """It said "Nothing stands out either way" directly above a heading that said Blocked --
+        the card disagreeing with itself in the two places a reviewer looks first."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       chats=self.chats_saying(*(["badword"] * 40 + self.clean(200))))
+        card = self.build(c, lex=self.lex_with(slur=["badword"]))
+        self.assertEqual(card_mod.recommend(card)["call"], card_mod.CALL_DENY)
+        self.assertNotIn("Nothing stands out", card_mod.headline(card))
+        # And it names the finding rather than only hinting at it.
+        self.assertIn("flagged chat line", card_mod.headline(card))
+
+    def test_the_headline_reports_the_request_clock(self):
+        old = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(old, 500, store_mod.STATUS_DECLINED, "no")
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE)
+        self.assertIn("ALREADY REQUESTED", card_mod.headline(card))
+
+    def test_the_ledger_does_not_say_no_kit_above_a_kit_count(self):
+        """The cooldown is scoped to this request type and the history is not, so "No kit from
+        us before" could sit directly above "Kits on record: 1". Both were true; neither said
+        which question it was answering."""
+        t = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None,
+                                 request_type=store_mod.KIND_FUNDING)
+        self.st.record_kit(GUILD, t, 100, "Alice", UUID_A, kind=store_mod.KIND_FUNDING)
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, self.clean_client(),
+                              self.st, screening.Lexicon({}),
+                              request_type=store_mod.KIND_RESCUE)
+        ledger = [s for s in card_mod.sections(card) if s["name"] == "Kit ledger"][0]["value"]
+        self.assertNotIn("No kit from us before", ledger)
+        self.assertIn("per request type", ledger)
+
     def test_a_worst_case_card_still_fits_discords_limits(self):
         """The ledger section grew a request clock and a farm list. rules_text already learned
         this lesson the hard way; nothing else on the card has a budget of its own, so the size
