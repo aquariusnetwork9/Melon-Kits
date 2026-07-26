@@ -1,0 +1,50 @@
+[Unit]
+Description=Melon Men kit-request bot
+Documentation=https://github.com/aquariusnetwork9/Melon-Kits
+After=network-online.target
+Wants=network-online.target
+# Don't hammer Discord's login endpoint if the token is bad or revoked: five tries in
+# five minutes, then stop and wait for a human. A crash-loop against an auth endpoint is
+# how an application gets rate-limited at the account level.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/melon-kits/kit-app
+# Token only. Root-owned 600, so it is never readable from the repo checkout and cannot
+# be committed by accident.
+EnvironmentFile=/etc/melonkit/env
+ExecStart=/home/ubuntu/melon-kits/kit-app/.venv/bin/python bot.py --config /home/ubuntu/melon-kits/kit-app/melonkit.json
+Restart=on-failure
+RestartSec=10
+
+# The ledger holds redacted chat, every decision and its reason. Default umask would leave
+# it 644 and world-readable; SQLite also creates the -wal and -shm files from the process
+# umask, so setting it here is what covers all three rather than chmod-ing one file that
+# gets recreated.
+UMask=0027
+
+Environment=PYTHONUNBUFFERED=1
+# The code directory is read-only under ProtectHome below, so bytecode caching would fail
+# on every import. Turning it off keeps the logs clean rather than relying on Python
+# silently giving up.
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Sandboxing. The bot needs the network, the read-only checkout, and exactly one writable
+# directory for its ledger.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/melonkit
+
+[Install]
+WantedBy=multi-user.target
