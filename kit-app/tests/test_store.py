@@ -223,6 +223,123 @@ class StoreCase(unittest.TestCase):
         self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
         self.assertFalse(self.st.request_cooldown(GUILD + 1, 180, 100)["blocked"])
 
+    # ------------------------------------------------------------- purging
+    #
+    # Both the applicant thread and the queue post get deleted, so the archive transcript is
+    # the only record left in Discord. Every rule below exists to make sure there IS one.
+
+    def finished(self, user=100, outcome=None, transcribed=True):
+        """A closed ticket with both threads set, ready to be purged."""
+        tid = self.st.create_ticket(GUILD, user, "Alice", UUID_A, None)
+        self.st.set_ticket_thread(tid, 7000 + tid)
+        self.st.set_queue_thread(tid, 8000 + tid)
+        self.st.record_decision(tid, 500, outcome or store_mod.STATUS_DECLINED, "no")
+        if transcribed:
+            self.st.mark_transcribed(tid)
+        return tid
+
+    def test_nothing_is_purged_before_the_grace_period(self):
+        self.finished()
+        self.assertEqual(self.st.tickets_to_purge(24 * 3600), [])
+
+    def test_a_finished_ticket_is_purged_after_the_grace_period(self):
+        tid = self.finished()
+        later = int(time.time()) + 24 * 3600 + 1
+        rows = self.st.tickets_to_purge(24 * 3600, now=later)
+        self.assertEqual([int(r["id"]) for r in rows], [tid])
+
+    def test_a_ticket_with_no_transcript_is_never_purged(self):
+        """The one rule that makes deleting both sides safe. Without it, a ticket whose
+        transcript silently failed to post would be erased from Discord entirely."""
+        self.finished(transcribed=False)
+        later = int(time.time()) + 365 * DAY
+        self.assertEqual(self.st.tickets_to_purge(24 * 3600, now=later), [])
+
+    def test_an_open_ticket_is_never_purged(self):
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.set_ticket_thread(tid, 7001)
+        self.st.mark_transcribed(tid)
+        later = int(time.time()) + 365 * DAY
+        self.assertEqual(self.st.tickets_to_purge(24 * 3600, now=later), [])
+
+    def test_a_purged_ticket_is_not_offered_twice(self):
+        tid = self.finished()
+        later = int(time.time()) + 24 * 3600 + 1
+        self.assertTrue(self.st.tickets_to_purge(24 * 3600, now=later))
+        self.st.mark_purged(tid)
+        self.assertEqual(self.st.tickets_to_purge(24 * 3600, now=later), [])
+        row = self.st.get_ticket(tid)
+        # The ids are forgotten so a retry cannot delete a channel somebody else now owns...
+        self.assertIsNone(row["thread_id"])
+        self.assertIsNone(row["queue_thread_id"])
+        # ...and when it happened is still answerable.
+        self.assertTrue(row["purged_at"])
+
+    def test_a_ticket_with_nothing_left_to_delete_is_not_offered(self):
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A, None)
+        self.st.record_decision(tid, 500, store_mod.STATUS_DECLINED, "no")
+        self.st.mark_transcribed(tid)
+        later = int(time.time()) + 365 * DAY
+        self.assertEqual(self.st.tickets_to_purge(24 * 3600, now=later), [])
+
+    def test_a_negative_grace_period_purges_nothing(self):
+        self.finished()
+        later = int(time.time()) + 365 * DAY
+        self.assertEqual(self.st.tickets_to_purge(-1, now=later), [])
+
+    def test_a_sweep_is_bounded(self):
+        """Each row costs up to two Discord deletes, so a first run against a long-neglected
+        guild must not turn into hundreds of API calls in one burst."""
+        for _ in range(8):
+            self.finished()
+        later = int(time.time()) + 24 * 3600 + 1
+        self.assertEqual(len(self.st.tickets_to_purge(24 * 3600, now=later, limit=3)), 3)
+
+    def test_the_oldest_finished_ticket_goes_first(self):
+        first = self.finished()
+        second = self.finished()
+        later = int(time.time()) + 24 * 3600 + 1
+        rows = self.st.tickets_to_purge(24 * 3600, now=later, limit=2)
+        self.assertEqual([int(r["id"]) for r in rows], [first, second])
+
+    def test_marking_transcribed_keeps_the_first_time(self):
+        """Re-posting a transcript in the grace window must not push the purge clock back."""
+        tid = self.finished(transcribed=False)
+        self.st.mark_transcribed(tid, when=1000)
+        self.st.mark_transcribed(tid, when=99999)
+        self.assertEqual(int(self.st.get_ticket(tid)["transcript_at"]), 1000)
+
+    def test_a_ticket_closed_before_transcripts_were_tracked_is_picked_up(self):
+        """Otherwise every ticket that predates this feature sits forever, which is the exact
+        thing being fixed. The sweeper writes it a transcript so the invariant is true rather
+        than assumed, and purges it on the next pass."""
+        tid = self.finished(transcribed=False)
+        later = int(time.time()) + 24 * 3600 + 1
+        need = self.st.tickets_needing_transcript(24 * 3600, now=later)
+        self.assertEqual([int(r["id"]) for r in need], [tid])
+        # ...and once it has one, it becomes purgeable.
+        self.st.mark_transcribed(tid)
+        self.assertEqual(self.st.tickets_needing_transcript(24 * 3600, now=later), [])
+        self.assertIn(tid, [int(r["id"]) for r in
+                            self.st.tickets_to_purge(24 * 3600, now=later)])
+
+    def test_the_two_purge_queries_never_overlap(self):
+        """One says 'needs a transcript', the other 'is ready to delete'. A ticket in both at
+        once would be archived and deleted in the same sweep, with nothing able to fail visibly
+        in between."""
+        self.finished(transcribed=True)
+        self.finished(transcribed=False)
+        later = int(time.time()) + 24 * 3600 + 1
+        ready = {int(r["id"]) for r in self.st.tickets_to_purge(24 * 3600, now=later)}
+        need = {int(r["id"]) for r in self.st.tickets_needing_transcript(24 * 3600, now=later)}
+        self.assertTrue(ready and need)
+        self.assertEqual(ready & need, set())
+
+    def test_a_delivered_ticket_is_purged_like_any_other(self):
+        tid = self.finished(outcome=store_mod.STATUS_APPROVED)
+        later = int(time.time()) + 24 * 3600 + 1
+        self.assertIn(tid, [int(r["id"]) for r in self.st.tickets_to_purge(24 * 3600, now=later)])
+
     # --------------------------------------------------- the kit-farm direction
 
     def test_another_discord_account_on_the_same_mc_account_is_listed(self):

@@ -115,6 +115,36 @@ button attached, the card left in place. Whoever presses Claim owns the delivery
 introduced in the applicant's thread. Marking delivered retags and archives the post —
 archived rather than locked, so a delivery that falls through afterwards can be reopened.
 
+## When a ticket is finished, its Discord footprint is deleted
+
+Both sides go — the applicant's private thread **and** the staff queue post — leaving the
+transcript in the archive channel as the record. Default is **24 hours after the ticket closes**
+(`policy.thread_purge_hours`; `0` turns it off entirely).
+
+The delay is not politeness. A runner who presses **Delivered** before actually handing the kit
+over would otherwise destroy the applicant's only way to say "you never showed", so the window
+exists to be complained in. For the same reason, on a server with `capture_thread_messages` on,
+a **final** transcript is taken at purge time — the first one was written when the ticket closed
+and cannot contain anything said since.
+
+Three rules make deleting both sides safe:
+
+- **Nothing is deleted without a transcript on record.** `_post_transcript` returns whether it
+  actually posted and stamps `tickets.transcript_at`; the purge query will not return a ticket
+  without one. A silently-failed transcript would otherwise erase the ticket from Discord
+  completely.
+- **A ticket closed before that column existed gets a fresh transcript first**, and is purged on
+  the *next* sweep. Writing the record and deleting the evidence in one pass gives nothing a
+  chance to fail visibly in between. Costs one duplicate in the archive per historical ticket,
+  once.
+- **A partial failure is retried, not marked done.** Both deletes must succeed before
+  `purged_at` is set, so a missing Manage Threads permission or a rate limit means "next sweep"
+  rather than an orphan nobody will ever look at again.
+
+It runs on a 30-minute loop plus once a minute after startup. A timer per ticket would have been
+simpler, but an in-memory timer dies with the process — so anything whose window expired during
+downtime would sit forever, which is the thing this fixes.
+
 **Approval is also when the applicant is asked where to meet.** Their thread gets a **Set
 meeting coordinates** button, and what they enter appears on the queue post and in the claim
 confirmation, so whoever picks the job up already knows where they are going. It is asked at

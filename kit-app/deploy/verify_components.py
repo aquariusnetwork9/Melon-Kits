@@ -22,6 +22,7 @@ Exits non-zero on the first failure so it can gate a deploy.
 """
 
 import asyncio
+import inspect
 import os
 import re
 import sys
@@ -106,6 +107,46 @@ def panel_embed_renders():
 
 
 check("panel_embed", panel_embed_renders)
+
+print("\n-- the purge sweeper is wired up and refuses to run without a grace period --")
+
+
+def purge_wiring():
+    for name in ("purge_finished_tickets", "_purge_loop", "_delete_thread"):
+        assert callable(getattr(bot_mod.KitBot, name, None)), "KitBot.%s is missing" % name
+    src = inspect.getsource(bot_mod.KitBot.purge_finished_tickets)
+    # The two rules that make deleting BOTH sides of a ticket safe. Asserted on the source
+    # because there is no way to exercise this without a gateway, and a silent regression here
+    # deletes the only surviving record of a ticket.
+    assert "thread_purge_hours" in src, "the sweeper does not read the grace period"
+    assert "hours <= 0" in src, "the sweeper has no off switch"
+    assert "tickets_to_purge" in src, "the sweeper does not use the guarded query"
+    ts = inspect.getsource(bot_mod.KitBot._post_transcript)
+    assert "mark_transcribed" in ts, "a posted transcript is not recorded, so nothing can purge"
+    assert ts.rstrip().endswith("return True"), "_post_transcript no longer reports success"
+    # The task must be held, or asyncio's weak reference lets it vanish at an arbitrary GC.
+    assert "_purge_task" in inspect.getsource(bot_mod.KitBot.setup_hook)
+    print("       purge_finished_tickets, _purge_loop, _delete_thread all present")
+
+
+def purge_config():
+    cfg = config_mod.load_config()
+    assert cfg["policy"]["thread_purge_hours"] == 24, cfg["policy"]["thread_purge_hours"]
+    name = config_mod.env_name("policy.thread_purge_hours")
+    try:
+        config_mod.load_config(env={name: "-1"})
+    except config_mod.ConfigError:
+        pass
+    else:
+        raise AssertionError("thread_purge_hours=-1 was accepted")
+    # 0 must be allowed: it is the off switch for an irreversible feature.
+    off = config_mod.load_config(env={name: "0"})
+    assert off["policy"]["thread_purge_hours"] == 0
+    print("       default 24h, 0 disables, negatives refused")
+
+
+check("purge sweeper wiring", purge_wiring)
+check("thread_purge_hours", purge_config)
 
 print("\n-- an applicant hears about the LONGER of the two clocks --")
 

@@ -830,6 +830,10 @@ class KitBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.store = store_mod.open_store(cfg["store"]["path"])
         self.vc = vc_mod.Client(cfg, LOG)
+        # Held so it is not garbage-collected mid-flight: asyncio keeps only a weak reference
+        # to a bare create_task, and a sweeper that vanishes at an arbitrary GC is a bug that
+        # only shows up as threads quietly never being deleted.
+        self._purge_task: Optional["asyncio.Task"] = None
         self.lex = screening.Lexicon({})
         path = cfg["screening"]["lexicon_path"]
         if path:
@@ -938,6 +942,11 @@ class KitBot(discord.Client):
         self.tree.on_error = self._on_app_command_error
         register_commands(self)
         self._adopt_legacy_config()
+
+        # Started here rather than in on_ready, which fires again on every reconnect and would
+        # accumulate a sweeper per disconnection.
+        if int(self.cfg["policy"]["thread_purge_hours"] or 0) > 0:
+            self._purge_task = asyncio.create_task(self._purge_loop())
 
         # ALWAYS sync globally: the bot has to work in servers it has not met yet, and a
         # guild-scoped sync only reaches the guilds named at startup.
@@ -1687,28 +1696,34 @@ class KitBot(discord.Client):
             return None
         return "\n".join(lines)
 
-    async def _post_transcript(self, ticket_id: int) -> None:
+    async def _post_transcript(self, ticket_id: int) -> bool:
         """One self-contained record of a finished ticket, in the staff archive.
 
         Built from the ledger rather than by scraping Discord, so it still works after the
         thread and the queue post are gone -- which is the situation it exists for.
+
+        Returns True only if a transcript actually reached the channel, and records that on the
+        ticket. The purge sweeper refuses to delete anything without it: with both the applicant
+        thread and the queue post going, a silently-failed transcript would leave no record in
+        Discord at all. Every early return here is therefore a False, not a shrug.
         """
         t0 = self.store.get_ticket(ticket_id)
         if t0 is None:
-            return
+            return False
         g = self.gcfg(t0["guild_id"])
         channel_id = int(g.get("transcript_channel_id") or 0)
         if not channel_id:
-            return
+            LOG.warning("no transcript channel configured, ticket=%d not archived", ticket_id)
+            return False
         channel = self.get_channel(channel_id)
         if channel is None:
             LOG.warning("transcript channel %d unavailable, ticket=%d not archived",
                         channel_id, ticket_id)
-            return
+            return False
 
         t = self.store.get_ticket(ticket_id)
         if t is None:
-            return
+            return False
         decisions = self.store.decisions_for(ticket_id)
         # Queried by ticket, not filtered out of kit_history: that is capped and ordered by
         # recency, so for a heavy repeat applicant this ticket's kit could fall off the end
@@ -1836,6 +1851,106 @@ class KitBot(discord.Client):
         except discord.HTTPException as exc:
             LOG.error("could not post transcript ticket=%d status=%s",
                       ticket_id, getattr(exc, "status", "?"))
+            return False
+        self.store.mark_transcribed(ticket_id)
+        return True
+
+    # ------------------------------------------------------------- purging
+
+    async def _delete_thread(self, channel_id: Any, what: str, ticket_id: int) -> bool:
+        """Delete one thread. True also when it is already gone, which is the same outcome."""
+        if not channel_id:
+            return True
+        channel = self.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(int(channel_id))
+            except discord.NotFound:
+                return True                       # somebody deleted it by hand. Fine.
+            except discord.HTTPException as exc:
+                LOG.warning("could not fetch %s for purge ticket=%d status=%s",
+                            what, ticket_id, getattr(exc, "status", "?"))
+                return False
+        try:
+            await channel.delete()
+            LOG.info("purged %s ticket=%d channel=%s", what, ticket_id, channel_id)
+            return True
+        except discord.NotFound:
+            return True
+        except discord.HTTPException as exc:
+            # Left for the next sweep rather than marked done: Manage Threads may be missing,
+            # or this may be a rate limit, and both are worth retrying.
+            LOG.warning("could not purge %s ticket=%d status=%s",
+                        what, ticket_id, getattr(exc, "status", "?"))
+            return False
+
+    async def purge_finished_tickets(self) -> int:
+        """Delete the Discord footprint of tickets whose grace period has expired.
+
+        Both sides go: the applicant thread and the staff queue post. The transcript in the
+        archive channel is what remains, which is why `tickets_to_purge` will not hand back a
+        ticket that has not got one -- see `_post_transcript`.
+
+        A ticket is only marked purged when BOTH deletes succeeded, so a partial failure is
+        retried next sweep instead of leaving an orphan nothing will ever look at again.
+        """
+        hours = int(self.cfg["policy"]["thread_purge_hours"] or 0)
+        if hours <= 0:
+            return 0
+
+        # Catch-up for tickets closed before transcript_at existed. They are not purged in the
+        # same pass: writing the transcript and deleting the evidence in one go gives nothing a
+        # chance to fail visibly in between, and there is no hurry after a month of sitting.
+        for row in self.store.tickets_needing_transcript(hours * 3600):
+            if await self._post_transcript(int(row["id"])):
+                LOG.info("backfilled transcript for pre-existing ticket=%s", row["id"])
+            else:
+                LOG.warning("cannot archive ticket=%s, so it will not be purged", row["id"])
+
+        rows = self.store.tickets_to_purge(hours * 3600)
+        done = 0
+        for row in rows:
+            # The transcript that let this ticket qualify was written when it closed, so it
+            # cannot contain anything said in the grace window since -- and the whole point of
+            # the window is to be complained in. Where a server captures thread messages, take a
+            # final copy before the thread goes. Where it does not, the first transcript is
+            # already everything there was to keep and a second would be noise in the archive.
+            g = self.gcfg(row["guild_id"])
+            if g.get("capture_thread_messages") and row["thread_id"]:
+                if not await self._post_transcript(int(row["id"])):
+                    # Deliberately not deleted anyway. Losing the conversation is the one thing
+                    # this whole path is arranged to prevent, and a broken archive channel is
+                    # worth stalling on -- visibly, in the log -- rather than deleting through.
+                    LOG.warning("final transcript failed, not purging ticket=%s this sweep",
+                                row["id"])
+                    continue
+            ok_thread = await self._delete_thread(row["thread_id"], "applicant thread",
+                                                  int(row["id"]))
+            ok_queue = await self._delete_thread(row["queue_thread_id"], "queue post",
+                                                 int(row["id"]))
+            if ok_thread and ok_queue:
+                self.store.mark_purged(int(row["id"]))
+                done += 1
+        if done:
+            LOG.info("purged %d finished ticket(s) after %dh", done, hours)
+        return done
+
+    async def _purge_loop(self) -> None:
+        """Every 30 minutes, and once shortly after startup.
+
+        The startup pass is the point of doing this on a timer rather than with a delayed task
+        per ticket: an in-memory timer dies with the process, so anything whose window expired
+        while the bot was down would sit forever -- which is the thing being fixed.
+        """
+        await self.wait_until_ready()
+        await asyncio.sleep(60)          # let the first sync and any reconnect settle
+        while not self.is_closed():
+            try:
+                await self.purge_finished_tickets()
+            except Exception:
+                # Never let a sweep kill the loop: this runs unattended for months.
+                LOG.exception("purge sweep failed")
+            await asyncio.sleep(1800)
 
     async def _notify_thread(self, ticket: Any, text: str,
                              view: Optional[discord.ui.View] = None) -> None:

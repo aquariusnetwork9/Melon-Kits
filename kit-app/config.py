@@ -79,6 +79,18 @@ DEFAULTS: Dict[str, Any] = {
         # 0 disables it.
         "request_cooldown_days": 180,
         "max_open_tickets_per_user": 1,
+        # How long a finished ticket's Discord footprint sticks around before the sweeper
+        # deletes the applicant thread AND the staff queue post. The transcript in the archive
+        # channel is the record; these two are working surfaces, and leaving them forever turns
+        # the forum into a graveyard nobody scrolls.
+        #
+        # The delay is not politeness. A runner who presses Delivered before actually handing
+        # the kit over would otherwise destroy the applicant's only way to say "you never
+        # showed", so the window is there to be complained in.
+        #
+        # 0 disables purging entirely -- the safe reading of 0 for something irreversible.
+        # Nothing is ever deleted without a transcript on record, whatever this is set to.
+        "thread_purge_hours": 24,
         # How much recent chat to put in front of a reviewer.
         "recent_chats": 100,
         # How far back the screening sweep looks, and how many 100-row pages it will spend
@@ -306,6 +318,8 @@ def _validate(cfg: Dict[str, Any]) -> None:
         raise ConfigError("policy.cooldown_days must be >= 0")
     if pol["request_cooldown_days"] < 0:
         raise ConfigError("policy.request_cooldown_days must be >= 0 (0 disables it)")
+    if pol["thread_purge_hours"] < 0:
+        raise ConfigError("policy.thread_purge_hours must be >= 0 (0 disables purging)")
     if not 1 <= pol["recent_chats"] <= 100:
         # /chats caps pageSize at 100 and page-walking a live player is not worth the
         # global rate-limit budget for a review that a human reads in one screen.

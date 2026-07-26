@@ -24,7 +24,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 STATUS_OPEN = "open"
 STATUS_APPROVED = "approved"
@@ -294,6 +294,17 @@ class Store(object):
             self._db.execute("ALTER TABLE tickets ADD COLUMN meet_coords TEXT")
         if "meet_dimension" not in cols:
             self._db.execute("ALTER TABLE tickets ADD COLUMN meet_dimension TEXT")
+        # Purging. `transcript_at` is what makes deleting a thread safe: with both the applicant
+        # thread and the queue post removed, the archive transcript is the ONLY record left in
+        # Discord, so nothing may be deleted until one has demonstrably been posted. Backfilled
+        # as NULL, which is the honest answer for tickets closed before this existed -- the
+        # sweeper will write a transcript for those before it touches anything.
+        if "transcript_at" not in cols:
+            self._db.execute("ALTER TABLE tickets ADD COLUMN transcript_at INTEGER")
+        # Kept rather than inferred from the thread ids being NULL, so "this vanished from
+        # Discord on purpose, on this date" is answerable a year later.
+        if "purged_at" not in cols:
+            self._db.execute("ALTER TABLE tickets ADD COLUMN purged_at INTEGER")
         cols = {r["name"] for r in self._db.execute("PRAGMA table_info(kits)")}
         if "kind" not in cols:
             self._db.execute("ALTER TABLE kits ADD COLUMN kind TEXT NOT NULL DEFAULT 'rescue'")
@@ -701,6 +712,72 @@ class Store(object):
                "last_ticket_id": int(row["id"]),
                "last_status": str(row["status"])}
         return out
+
+    # --------------------------------------------------------------- purging
+    #
+    # A finished ticket's Discord footprint is deleted after a grace period: the applicant's
+    # thread and the staff queue post both go, and the transcript in the archive channel becomes
+    # the only record left in Discord. That is exactly why `mark_transcribed` exists and why
+    # `tickets_to_purge` will not return a ticket without it -- deleting both sides of a ticket
+    # whose transcript never posted would leave nothing at all.
+
+    def mark_transcribed(self, ticket_id: int, when: Optional[int] = None) -> None:
+        """Record that a transcript reached the archive channel. Only ever called on success."""
+        self._db.execute("UPDATE tickets SET transcript_at=? WHERE id=? AND transcript_at IS NULL",
+                         (_now() if when is None else int(when), int(ticket_id)))
+
+    def tickets_to_purge(self, grace_seconds: int, now: Optional[int] = None,
+                         limit: int = 25) -> List[sqlite3.Row]:
+        """Closed tickets whose grace period has run out and which still have something to
+        delete. Never returns an open ticket, and never one without a transcript.
+
+        `limit` keeps one sweep bounded: each row costs up to two Discord deletes, and a first
+        run against a long-neglected guild should not turn into a few hundred API calls in a
+        burst. Whatever is left is picked up by the next sweep.
+        """
+        if grace_seconds < 0:
+            return []
+        now = _now() if now is None else int(now)
+        return list(self._db.execute(
+            "SELECT * FROM tickets "
+            " WHERE status<>? "
+            "   AND closed_at IS NOT NULL AND closed_at<=? "
+            "   AND transcript_at IS NOT NULL "
+            "   AND purged_at IS NULL "
+            "   AND (thread_id IS NOT NULL OR queue_thread_id IS NOT NULL) "
+            " ORDER BY closed_at LIMIT ?",
+            (STATUS_OPEN, now - int(grace_seconds), int(limit))))
+
+    def tickets_needing_transcript(self, grace_seconds: int, now: Optional[int] = None,
+                                   limit: int = 10) -> List[sqlite3.Row]:
+        """Closed, past the grace period, still has threads, and has NO transcript on record.
+
+        Every ticket closed before `transcript_at` existed looks like this. Their transcripts
+        very probably did post -- the code has always tried -- but "probably" is not a basis for
+        deleting both surviving copies, so the sweeper writes a fresh one and purges them on the
+        next pass. That makes the invariant true rather than assumed, at the cost of one
+        duplicate in the archive per historical ticket, once.
+        """
+        if grace_seconds < 0:
+            return []
+        now = _now() if now is None else int(now)
+        return list(self._db.execute(
+            "SELECT * FROM tickets "
+            " WHERE status<>? "
+            "   AND closed_at IS NOT NULL AND closed_at<=? "
+            "   AND transcript_at IS NULL "
+            "   AND purged_at IS NULL "
+            "   AND (thread_id IS NOT NULL OR queue_thread_id IS NOT NULL) "
+            " ORDER BY closed_at LIMIT ?",
+            (STATUS_OPEN, now - int(grace_seconds), int(limit))))
+
+    def mark_purged(self, ticket_id: int, when: Optional[int] = None) -> None:
+        """Forget the thread ids and stamp when. The ids are cleared so a failed delete is
+        retried and a successful one is never retried, and `purged_at` is kept so that "this
+        vanished from Discord on purpose, on this date" stays answerable."""
+        self._db.execute(
+            "UPDATE tickets SET thread_id=NULL, queue_thread_id=NULL, purged_at=? WHERE id=?",
+            (_now() if when is None else int(when), int(ticket_id)))
 
     def other_requesters(self, guild_id: int, mc_uuid: Optional[str] = None,
                          mc_name: Optional[str] = None,
