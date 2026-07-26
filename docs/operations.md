@@ -266,6 +266,33 @@ reviewer to press again.
 
 Combined with the race below, a second press meant a second kit. Always `defer()` first.
 
+### Every command listed twice
+
+**Symptom:** the command picker shows `/setup`, `/setup`, `/panel`, `/panel` — every command
+duplicated, in one guild only.
+
+**Cause:** syncing the same tree both globally *and* guild-scoped. Discord keeps global and
+per-guild command registrations in **separate namespaces and does not dedupe between them**, so
+a guild that has both lists both. Startup used to do `copy_global_to(guild=...)` for the home
+guild so edits appeared there without waiting on global propagation, which bought a few seconds
+and cost a doubled command list.
+
+**Fix, and the part that is easy to get wrong:** deleting the copy code is not enough. A
+guild-scoped registration lives on Discord's side until something overwrites it, so a bot that
+ever ran the old code keeps showing doubles forever, through any number of restarts and
+redeploys. What actually removes them is pushing an **empty** command list to that guild:
+
+```python
+tree.clear_commands(guild=discord.Object(id=home))
+await tree.sync(guild=discord.Object(id=home))
+```
+
+That now runs on every start rather than as a one-off, so any install that ever ran an affected
+version repairs itself. It is idempotent and costs one request.
+
+**Diagnosing it:** `GET /applications/{app}/guilds/{guild}/commands` returning a non-empty list
+is the duplicate set. The global list is `GET /applications/{app}/commands`.
+
 ### A channel-type annotation is wider than it reads
 
 `Optional[discord.TextChannel]` on a slash-command parameter makes Discord offer **text and

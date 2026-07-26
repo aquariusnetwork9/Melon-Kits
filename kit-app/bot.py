@@ -862,14 +862,29 @@ class KitBot(discord.Client):
         await self.tree.sync()
         LOG.info("commands synced globally")
 
-        # A home guild additionally gets a guild-scoped copy, purely so command edits show up
-        # instantly there instead of waiting on Discord's global propagation.
+        # And NOTHING guild-scoped. This used to additionally copy every global command into
+        # the home guild so edits appeared there instantly -- which shows **every command
+        # twice** in that guild, because Discord keeps global and guild registrations in
+        # separate namespaces and does not dedupe between them. The client lists both.
+        #
+        # Deleting that copy is not enough by itself: guild-scoped registrations persist on
+        # Discord's side until something overwrites them, so a bot that ever ran the old code
+        # keeps showing doubles forever. Pushing an empty command list to the guild is what
+        # actually removes them, and it stays here rather than being a one-off script because
+        # this bot is public -- any install that ever ran an affected version repairs itself on
+        # the next start. Syncing an empty list is idempotent and costs one request.
         home = int(self.cfg["discord"]["home_guild_id"] or 0)
         if home:
             obj = discord.Object(id=home)
-            self.tree.copy_global_to(guild=obj)
-            await self.tree.sync(guild=obj)
-            LOG.info("commands also synced to home guild=%d for instant updates", home)
+            self.tree.clear_commands(guild=obj)
+            try:
+                await self.tree.sync(guild=obj)
+                LOG.info("cleared guild-scoped commands for guild=%d (globals are the only "
+                         "copy, so nothing is listed twice)", home)
+            except discord.HTTPException as exc:
+                # Not fatal: the globals are already registered and the bot is fully usable.
+                LOG.warning("could not clear guild-scoped commands guild=%d status=%s",
+                            home, getattr(exc, "status", "?"))
 
     def _adopt_legacy_config(self) -> None:
         """Move a single-guild file config into the database, once.

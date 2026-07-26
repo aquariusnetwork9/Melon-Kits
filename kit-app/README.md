@@ -86,7 +86,7 @@ The file holds only what is the same everywhere:
 
 | key | what it is |
 |---|---|
-| `discord.home_guild_id` | optional. Your own server, which additionally gets a guild-scoped command copy so command edits appear instantly there instead of waiting on Discord's global propagation. It does **not** make the bot single-guild |
+| `discord.home_guild_id` | optional. Only the server that a pre-multi-guild config's channel and role ids get adopted into, once. It does **not** make the bot single-guild, and it has nothing to do with commands |
 | `discord.capture_thread_messages` | include the applicant conversation in transcripts. Needs no privileged intent |
 | `policy.*` | cooldown days, how much chat to show, what counts as "new" or "just wiped" |
 | `panel.rescued_count`, `panel.rescued_as_of`, `panel.response_time` | the numbers in the panel copy — edit, then `/panel` |

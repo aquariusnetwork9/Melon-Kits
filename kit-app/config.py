@@ -26,9 +26,14 @@ DEFAULTS: Dict[str, Any] = {
         # single-guild deployment -- on first start they are adopted into that guild's stored
         # config and then ignored forever. Leave them 0 on a fresh install.
         #
-        # home_guild_id additionally gets a guild-scoped command copy so command edits appear
-        # instantly there rather than waiting on Discord's global propagation. Harmless to set
-        # on any install; it does not make the bot single-guild.
+        # home_guild_id is ONLY the guild those legacy ids get adopted into. It does not make
+        # the bot single-guild and it has nothing to do with commands.
+        #
+        # It used to also receive a guild-scoped copy of every command, so edits appeared there
+        # without waiting on global propagation. That shows every command **twice** in that
+        # guild: Discord keeps global and guild registrations separately and lists both. Startup
+        # now pushes an empty guild-scoped list here instead, which is what deletes copies left
+        # behind by a version that did it.
         "home_guild_id": 0,
         # Read-only TEXT channel holding the pinned request panel. Private ticket threads
         # hang off it. It cannot be a forum: forum posts can only be public threads, so
