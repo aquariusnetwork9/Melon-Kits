@@ -37,6 +37,15 @@ lexicon.json
 # but an .env written by hand is the obvious way round that.
 .env
 
+# Bulk-dump mining. tokens.tsv and the reports are real 2b2t chat -- including
+# whatever terms you were looking for -- and *.csv covers both the dump itself and
+# anything export_csv.py writes.
+*.csv
+*.tsv
+tokens.tsv
+*-report.txt
+vcdb-*/
+
 # Python
 *.pyc
 __pycache__/
