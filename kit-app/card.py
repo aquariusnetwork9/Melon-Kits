@@ -158,11 +158,28 @@ def gather(guild_id: int, mc_name: str, mc_uuid: Optional[str], discord_user_id:
     card["deaths_total"] = (deaths_doc or {}).get("total")
     card["deaths_ok"] = deaths_doc is not None
 
-    chats_doc = attempt("chats", lambda: client.chats(
-        uuid=mc_uuid, name=mc_name, limit=pol["recent_chats"]))
+    # A dated window when one is configured, otherwise the old "most recent N lines". The
+    # window is what makes a clean result mean something: without it, 100 lines is three years
+    # for a quiet player and four days for a talkative one, so "nothing in their chat" was
+    # silently a different claim for every applicant.
+    window_days = int(pol.get("chat_window_days") or 0)
+    if window_days > 0:
+        start = (_now() - datetime.timedelta(days=window_days)).strftime("%Y-%m-%d")
+        end = (_now() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        chats_doc = attempt("chats", lambda: client.chats_window(
+            uuid=mc_uuid, name=mc_name, start=start, end=end,
+            max_pages=int(pol.get("chat_max_pages") or 5)))
+    else:
+        chats_doc = attempt("chats", lambda: client.chats(
+            uuid=mc_uuid, name=mc_name, limit=pol["recent_chats"]))
     raw_rows = (chats_doc or {}).get("chats") or []
     card["chats_total"] = (chats_doc or {}).get("total")
     card["chats_ok"] = chats_doc is not None
+    card["chat_window_days"] = window_days
+    # True only when every line in the window was read. `chats` has no cap to hit, so it is
+    # complete by definition of what it claims to be.
+    card["chat_complete"] = bool((chats_doc or {}).get("complete", True))
+    card["chat_pages_read"] = int((chats_doc or {}).get("pages_read") or 0)
 
     # Redaction happens HERE, at the boundary, so nothing downstream can skip it.
     lines: List[Dict[str, Optional[str]]] = []
@@ -294,17 +311,201 @@ def funding_section(card: Dict[str, Any]) -> Optional[Dict[str, str]]:
     return {"name": "The ask", "value": "\n".join(rows)}
 
 
+# ------------------------------------------------------------- recommendation
+#
+# What follows is deliberately **a rule trace, not a score**, and the distinction is the whole
+# design rather than a wording preference. A score is a single number standing in for a
+# judgement nobody can audit; a trace names which rule fired, on what evidence, so a reviewer
+# disagrees with a specific claim in one glance. `docs/reviewing.md` and the test asserting no
+# numeric score anywhere are both about the first thing, and neither is weakened by the second.
+#
+# Two hard limits on what this may do, both measured rather than assumed:
+#
+# 1. **Profanity and slur counts never move the call.** Run the tuned lexicon over the 2025
+#    bulk dump and 3.7% of ALL 2b2t chat still matches. Profanity is the server's ambient
+#    register, so a recommendation that moved on it would be recommending against the median
+#    player. They stay visible as counts and stay out of the arithmetic.
+# 2. **Chat can never produce a deny.** Only the two mechanical rules can -- a reviewer's own
+#    do-not-serve flag, and the cooldown, both of which are facts rather than inferences. The
+#    strongest thing chat can do is "read these lines first", because whether a matched phrase
+#    is a real threat or somebody asking for a delivery address is exactly what a keyword list
+#    cannot see. Given the kits are disposable and under-helping is the expensive direction, a
+#    false deny costs more than a false approve, so the tie goes to the applicant.
+
+CALL_APPROVE = "approve"
+CALL_LOOK = "look"
+CALL_DENY = "deny"
+
+_CALL_RANK = {CALL_APPROVE: 0, CALL_LOOK: 1, CALL_DENY: 2}
+
+# Categories that may influence the call at all, and what each one means when it fires. Any
+# category not named here is counted and displayed but never consulted -- see limit 1 above.
+_DECIDING_CATEGORIES = {
+    "off_game": ("look",
+                 "statements that leave the game -- the one category that should change a "
+                 "decision. Read the lines before deciding."),
+    "scam": ("look",
+             "scam patterns, which is a different question from swearing and is "
+             "kit-relevant in its own right."),
+}
+
+
+def recommend(card: Dict[str, Any]) -> Dict[str, Any]:
+    """``{'call': 'approve'|'look'|'deny', 'rules': [...], 'basis': str}``.
+
+    `rules` is every rule that fired, each as ``{'rule', 'says', 'because'}``. The call is the
+    most cautious thing any of them said, so a single deny outranks nine approves. An empty
+    rule list is possible and honest: it means nothing stands out, which is what `look` means.
+    """
+    rules: List[Dict[str, str]] = []
+    kind = kind_of(card)
+
+    def fires(rule: str, says: str, because: str) -> None:
+        rules.append({"rule": rule, "says": says, "because": because})
+
+    # --- the only two rules allowed to say deny, because both are facts ---------
+    deny_flags = [f for f in card["flags"] if str(f.get("kind")) == "deny"]
+    if deny_flags:
+        fires("do-not-serve flag", CALL_DENY,
+              "a reviewer has flagged this account do-not-serve%s"
+              % (" - \"%s\"" % deny_flags[0]["note"] if deny_flags[0].get("note") else ""))
+    cd = card["cooldown"]
+    if cd["blocked"]:
+        fires("cooldown", CALL_DENY,
+              "inside the %d-day cooldown for %s, %d day(s) left"
+              % (card.get("cooldown_days", 21), store_mod.KIND_LABEL[kind], cd["days_left"]))
+
+    # --- chat: may only ever ask for a closer look -----------------------------
+    scr = card["screening"]
+    if scr:
+        for category, (says, why) in sorted(_DECIDING_CATEGORIES.items()):
+            hits = scr["per_category"].get(category)
+            if not hits:
+                continue
+            where = (scr.get("category_lines") or {}).get(category) or []
+            fires("chat: %s" % category, says,
+                  "%d hit(s) on %d line(s)%s - %s"
+                  % (hits, len(where),
+                     " (lines %s)" % ", ".join(str(w) for w in where[:8]) if where else "",
+                     why))
+
+    # --- incomplete evidence is not clean evidence -----------------------------
+    if not card["deaths_ok"]:
+        fires("deaths unavailable", CALL_LOOK,
+              "the death lookup failed, so \"no recent death\" cannot be concluded")
+    if not card["chats_ok"]:
+        fires("chat unavailable", CALL_LOOK,
+              "the chat lookup failed, so nothing here says their chat is clean")
+    elif not card.get("chat_complete", True):
+        fires("chat only sampled", CALL_LOOK,
+              "%s, so a clean result covers only what was read"
+              % chat_coverage_phrase(card))
+
+    # --- the ambiguous signals the card already refuses to resolve -------------
+    if not card["tracked"]:
+        fires("no 2b2t history", CALL_LOOK,
+              "nothing under this account at all - either brand new, or the name is wrong")
+    if card["low_playtime_old_account"]:
+        fires("low playtime, old account", CALL_LOOK,
+              "identical for an alt and for a returning lapsed player - not evidence either "
+              "way, which is why it asks rather than concludes")
+    if [f for f in card["flags"] if str(f.get("kind")) == "alt"]:
+        fires("known-alt flag", CALL_LOOK, "a reviewer has flagged this account a known alt")
+    if len({str(r.get("mc_name")) for r in card["linked"] if r.get("mc_name")}) > 1:
+        fires("shared account history", CALL_LOOK,
+              "more than one Minecraft name has requested from this Discord account")
+
+    # --- what the request itself supports --------------------------------------
+    if kind == store_mod.KIND_RESCUE:
+        if card["recently_died"]:
+            fires("recent death", CALL_APPROVE,
+                  "died %s - that IS the \"lost everything\" claim, verified"
+                  % ago(card["newest_death"], card["generated_at"]))
+        elif card["is_new"]:
+            fires("new to 2b2t", CALL_APPROVE,
+                  "first seen %s, which supports \"just getting started\""
+                  % ago(card["first_seen"], card["generated_at"]))
+    else:
+        # Funding has no equivalent of the death line. Nothing here can verify that a project
+        # is real or worth materials, so the most an established account earns is "nothing
+        # against them" -- the judgement itself stays with the reviewer, deliberately.
+        if card["tracked"] and (card["playtime_s"] or 0) >= 3600:
+            fires("established account", CALL_APPROVE,
+                  "%s played, so this is not a fresh account asking for materials"
+                  % duration(card["playtime_s"]))
+
+    call = CALL_LOOK
+    if rules:
+        call = max((r["says"] for r in rules), key=lambda s: _CALL_RANK[s])
+    return {"call": call, "rules": rules, "basis": chat_coverage_phrase(card)}
+
+
+# Phrased as what to do, not as a grade. "Looks approvable" invites agreement; "Nothing against
+# them" states the finding and leaves the decision where it belongs.
+_CALL_HEADING = {
+    CALL_APPROVE: "Nothing against them",
+    CALL_LOOK: "Worth a closer look",
+    CALL_DENY: "Blocked",
+}
+
+_SAYS_MARK = {CALL_APPROVE: "✓", CALL_LOOK: "?", CALL_DENY: "✗"}
+
+
+def rules_text(rec: Dict[str, Any]) -> str:
+    """The rule trace as a reviewer reads it: one line per rule, marked with what it said."""
+    lines = []
+    for r in rec["rules"]:
+        lines.append("%s **%s** - %s" % (_SAYS_MARK[r["says"]], r["rule"], r["because"]))
+    if not lines:
+        lines.append("? Nothing fired either way. Read the card.")
+    if rec["call"] == CALL_DENY:
+        lines.append("\n*This is a recommendation, not the decision. Approve anyway if you "
+                     "disagree - the reason you type is what the ledger keeps.*")
+    else:
+        lines.append("\n*Counts of profanity and slurs are deliberately **not** part of this "
+                     "-- measured against a year of 2b2t chat they flag everybody. Chat can "
+                     "ask you to read something; it never denies anyone by itself.*")
+    return "\n".join(lines)
+
+
+def chat_coverage_phrase(card: Dict[str, Any]) -> str:
+    """How much chat this actually looked at, in words a reviewer can act on.
+
+    Stated rather than implied, for the same reason a failed section never renders as an empty
+    one: "no bad chat found" means two completely different things after reading 12 lines and
+    after reading 12 of 2,600.
+    """
+    if not card["chats_ok"]:
+        return "chat could not be retrieved"
+    read = len(card["chat_lines"])
+    days = card.get("chat_window_days") or 0
+    window = "the last %d days" % days if days else "their most recent chat"
+    if not read:
+        return "no chat on record in %s" % window
+    if card.get("chat_complete", True):
+        return "read all %d line(s) from %s" % (read, window)
+    total = card.get("chats_total")
+    return ("read the most recent %d line(s) of %s in %s - the rest was not examined"
+            % (read, "%s" % total if total else "more", window))
+
+
 def sections(card: Dict[str, Any]) -> List[Dict[str, str]]:
     """``[{'name':..., 'value':...}]``, ordered by what settles a decision fastest."""
     gen = card["generated_at"]
     out: List[Dict[str, str]] = []
 
-    # 0. For funding, what they asked for comes before any history: unlike a rescue kit, the
-    # request itself is most of the decision. A reviewer cannot judge "is this worth funding"
-    # from playtime, and reading the ask first is what stops the history being weighed against
-    # a project nobody has described yet.
+    # 0. What fired, and why. First because it is a table of contents for the rest of the card
+    # rather than a substitute for it: every line names the evidence it read, so the reviewer's
+    # next move is to go and check that evidence.
+    rec = recommend(card)
+    out.append({"name": _CALL_HEADING[rec["call"]], "value": rules_text(rec)})
+
     ask = funding_section(card)
     if ask is not None:
+        # For funding, what they asked for comes before any history: unlike a rescue kit, the
+        # request itself is most of the decision. A reviewer cannot judge "is this worth
+        # funding" from playtime, and reading the ask first is what stops the history being
+        # weighed against a project nobody has described yet.
         out.append(ask)
 
     # 1. Deaths first. This is the one that usually decides it.

@@ -285,11 +285,21 @@ hour ago is the entire case for a rescue kit and says nothing about whether to f
 a funding headline reports time on the server and past grants, and the rescue-only "claim
 verified" line is suppressed.
 
+Above all of it sits a one-line call — **Nothing against them** / **Worth a closer look** /
+**Blocked** — and every rule that fired with the evidence it read. Chat for that is swept over
+the last 365 days, page-walked to a cap; the trace states whether it read the whole year or only
+a sample, because "nothing found" in 12 lines and in 12 of 2,595 are different claims.
+
 Three things it will not do:
 
 - **No score, anywhere.** Not on chat, not on the account. A number gets read as the answer
   to a question counts cannot answer. There is a test asserting no card field is named
-  `score`, `confidence`, `risk` or `verdict`.
+  `score`, `confidence`, `risk` or `verdict`, and the call above is a **named rule trace**
+  rather than a number for exactly that reason: it names the claim so a reviewer can disagree
+  with that claim. Two limits keep it honest, both measured rather than asserted — profanity and
+  slur counts never move it (the tuned lexicon flags 3.7% of *all* 2b2t chat, so it would move
+  against the median player), and chat can never produce a **Blocked**, which only a
+  do-not-serve flag or the cooldown can.
 - **No "probable alt" badge.** Low playtime on an old account describes an alt *and* a
   returning lapsed player identically. The card says exactly that, in those words, instead of
   leaning. "Known alt" is a reviewer-maintained flag, never a computation.

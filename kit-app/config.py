@@ -69,6 +69,18 @@ DEFAULTS: Dict[str, Any] = {
         "max_open_tickets_per_user": 1,
         # How much recent chat to put in front of a reviewer.
         "recent_chats": 100,
+        # How far back the screening sweep looks, and how many 100-row pages it will spend
+        # getting there. `chat_window_days: 0` restores the old behaviour -- "the most recent
+        # `recent_chats` lines, whenever they happened to be said".
+        #
+        # Both numbers come from measuring the 2025 bulk dump rather than from taste. The median
+        # player said **12 lines in the entire year**; p90 is 244 and p95 is 574. So five pages
+        # cover ~94% of players completely, for at most five requests instead of one. The cap
+        # exists for the tail: p99 is 2,595 lines (26 requests) and the busiest account of 2025
+        # said 109,220 (1,093 requests) -- which no single ticket may spend against a bucket
+        # shared with every other caller of the API.
+        "chat_window_days": 365,
+        "chat_max_pages": 5,
         "recent_deaths": 3,
         # A death inside this window is treated as supporting "I just lost everything".
         "wipe_window_hours": 48,
@@ -279,6 +291,13 @@ def _validate(cfg: Dict[str, Any]) -> None:
         raise ConfigError("policy.recent_chats must be between 1 and 100")
     if pol["recent_deaths"] < 1:
         raise ConfigError("policy.recent_deaths must be >= 1")
+    if pol["chat_window_days"] < 0:
+        raise ConfigError("policy.chat_window_days must be >= 0 (0 disables the window)")
+    if not 1 <= pol["chat_max_pages"] <= 50:
+        # 50 pages is 5,000 lines and ~50 requests for ONE ticket. Past that the honest answer
+        # is that this API is the wrong tool -- /dump/player returns a whole history as one CSV,
+        # at a server-wide concurrency of 1.
+        raise ConfigError("policy.chat_max_pages must be between 1 and 50")
     if vc["min_interval_s"] < 0.2:
         raise ConfigError(
             "vc.min_interval_s below 0.2 -- the /chats bucket is 5 permits/second shared "

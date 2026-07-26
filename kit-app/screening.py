@@ -266,6 +266,7 @@ def summarise(lines: Sequence[str], lex: Lexicon) -> Dict[str, object]:
     reviewer's question is how much of the chat is involved.
     """
     per_category: Dict[str, int] = {}
+    category_lines: Dict[str, List[int]] = {}
     lines_flagged = 0
     spellings: Dict[str, int] = {}
     hot: List[int] = []
@@ -278,6 +279,9 @@ def summarise(lines: Sequence[str], lex: Lexicon) -> Dict[str, object]:
         hot.append(i)
         for hit in hits:
             per_category[hit.category] = per_category.get(hit.category, 0) + 1
+            where = category_lines.setdefault(hit.category, [])
+            if i not in where:
+                where.append(i)
             key = hit.spelling.casefold()
             spellings[key] = spellings.get(key, 0) + 1
 
@@ -285,6 +289,10 @@ def summarise(lines: Sequence[str], lex: Lexicon) -> Dict[str, object]:
         "lines_scanned": len(lines),
         "lines_flagged": lines_flagged,
         "per_category": per_category,
+        # Which lines each category matched, so a reviewer can be pointed at the four lines
+        # that matter instead of the four hundred that do not. This is what makes an
+        # off_game hit actionable rather than just a number next to a word.
+        "category_lines": category_lines,
         # Original spellings by frequency -- the mining output, and what tells you a term
         # needs a variant added to the lexicon.
         "spellings": sorted(spellings.items(), key=lambda kv: (-kv[1], kv[0])),

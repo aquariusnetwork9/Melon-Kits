@@ -66,6 +66,21 @@ class FakeClient(object):
             raise vc_mod.VcUnavailable("rate limited")
         return {"chats": self._chats[:limit], "total": len(self._chats)}
 
+    def chats_window(self, uuid=None, name=None, start=None, end=None, max_pages=5):
+        """Mirrors the real page-walk, cap included, so the partial-coverage path is reachable.
+
+        `pageSize` is 100 on the live API and 150 is a 400, so the cap here is pages x 100 -- a
+        fake that returned everything would make `chat_complete` untestable, which is the one
+        field a reviewer's "their chat is clean" conclusion rests on.
+        """
+        if "chats" in self._fail:
+            raise vc_mod.VcUnavailable("rate limited")
+        room = max(1, int(max_pages)) * 100
+        rows = self._chats[:room]
+        return {"chats": rows, "total": len(self._chats),
+                "complete": len(rows) >= len(self._chats),
+                "pages_read": max(1, -(-len(rows) // 100))}
+
 
 class CardCase(unittest.TestCase):
     def setUp(self):
@@ -246,6 +261,165 @@ class CardCase(unittest.TestCase):
         self.assertIsNone(card_mod.parse_ts("not a date"))
         self.assertIsNone(card_mod.parse_ts(None))
 
+    # ---------------------------------------------------------- recommendation
+    #
+    # The two limits below are what make a recommendation defensible at all in this app, and
+    # they are asserted rather than documented because both are load-bearing:
+    #   1. profanity and slur counts never move the call
+    #   2. chat can never produce a deny
+
+    def lex_with(self, **cats):
+        return screening.Lexicon(
+            {name: {"terms": terms} for name, terms in cats.items()})
+
+    def chats_saying(self, *texts):
+        return [{"time": ago_ts(days=1 + i), "chat": t} for i, t in enumerate(texts)]
+
+    def test_profanity_never_moves_the_call(self):
+        """Measured against the 2025 dump, the tuned lexicon still flags 3.7% of ALL 2b2t chat.
+        A recommendation that moved on profanity would be recommending against the median
+        player, so the counts stay visible and stay out of the arithmetic."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
+                       chats=self.chats_saying(*(["badword"] * 40)))
+        card = self.build(c, lex=self.lex_with(profanity=["badword"]))
+        rec = card_mod.recommend(card)
+        # The hits are counted...
+        self.assertEqual(card["screening"]["per_category"]["profanity"], 40)
+        # ...and changed nothing.
+        self.assertEqual(rec["call"], card_mod.CALL_APPROVE)
+        self.assertFalse([r for r in rec["rules"] if "profanity" in r["rule"]])
+
+    def test_slur_counts_never_move_the_call_either(self):
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
+                       chats=self.chats_saying("badword", "badword"))
+        card = self.build(c, lex=self.lex_with(slur=["badword"]))
+        rec = card_mod.recommend(card)
+        self.assertEqual(rec["call"], card_mod.CALL_APPROVE)
+        self.assertFalse([r for r in rec["rules"] if "slur" in r["rule"]])
+
+    def test_off_game_chat_asks_for_a_look_but_never_denies(self):
+        """The one category whose own note says it should change a decision -- and still only
+        as far as "read these lines". Whether a matched phrase is a real threat or somebody
+        asking for a delivery address is exactly what a keyword list cannot see, and a false
+        deny costs more here than a false approve."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
+                       chats=self.chats_saying("hello", "im gonna swat you", "bye"))
+        card = self.build(c, lex=self.lex_with(off_game=["swat you"]))
+        rec = card_mod.recommend(card)
+        self.assertEqual(rec["call"], card_mod.CALL_LOOK)
+        self.assertNotEqual(rec["call"], card_mod.CALL_DENY)
+        hit = [r for r in rec["rules"] if r["rule"] == "chat: off_game"]
+        self.assertTrue(hit)
+        # It has to name WHICH line, or it is just a number next to a word.
+        self.assertIn("1", hit[0]["because"])
+
+    def test_only_facts_can_deny(self):
+        """A reviewer's own do-not-serve flag, and the cooldown. Nothing inferred."""
+        self.st.set_flag(GUILD, "deny", 500, mc_uuid=UUID_A, note="known alt of someone")
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}])
+        rec = card_mod.recommend(self.build(c))
+        self.assertEqual(rec["call"], card_mod.CALL_DENY)
+        self.assertTrue([r for r in rec["rules"] if r["rule"] == "do-not-serve flag"])
+
+    def test_a_cooldown_denies_and_says_which_one(self):
+        tid = self.st.create_ticket(GUILD, 100, "Alice", UUID_A)
+        self.st.record_kit(GUILD, tid, 100, "Alice", UUID_A, kind=store_mod.KIND_RESCUE)
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800)})
+        rec = card_mod.recommend(card_mod.gather(
+            GUILD, "Alice", UUID_A, 100, self.cfg, c, self.st, screening.Lexicon({}),
+            request_type=store_mod.KIND_RESCUE))
+        self.assertEqual(rec["call"], card_mod.CALL_DENY)
+        because = [r["because"] for r in rec["rules"] if r["rule"] == "cooldown"][0]
+        self.assertIn("rescue kit", because)
+
+    def test_a_deny_outranks_an_approve(self):
+        """The call is the most cautious thing any rule said, so one blocker is enough."""
+        self.st.set_flag(GUILD, "deny", 500, mc_uuid=UUID_A)
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}])
+        rec = card_mod.recommend(self.build(c))
+        says = {r["says"] for r in rec["rules"]}
+        self.assertIn(card_mod.CALL_APPROVE, says)      # the death still fired
+        self.assertEqual(rec["call"], card_mod.CALL_DENY)
+
+    def test_a_failed_lookup_can_never_read_as_clean(self):
+        """"No recent death" and "the death lookup failed" are opposite claims, and the same
+        goes for chat. Neither may produce a confident approve."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800)}, fail=("deaths", "chats"))
+        rec = card_mod.recommend(self.build(c))
+        self.assertEqual(rec["call"], card_mod.CALL_LOOK)
+        rules = {r["rule"] for r in rec["rules"]}
+        self.assertIn("deaths unavailable", rules)
+        self.assertIn("chat unavailable", rules)
+
+    def test_a_sampled_year_says_so_rather_than_implying_a_clean_one(self):
+        """94% of players fit inside the page cap. For the rest, "nothing found" covers only
+        what was read, and the difference has to reach the reviewer."""
+        many = self.chats_saying(*(["just chatting"] * 900))
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}], chats=many)
+        card = self.build(c)
+        self.assertFalse(card["chat_complete"])
+        rec = card_mod.recommend(card)
+        self.assertEqual(rec["call"], card_mod.CALL_LOOK)
+        self.assertTrue([r for r in rec["rules"] if r["rule"] == "chat only sampled"])
+        self.assertIn("not examined", rec["basis"])
+
+    def test_a_short_year_is_reported_as_complete(self):
+        """The median player says twelve lines in a year, so this is the normal case."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}],
+                       chats=self.chats_saying(*(["hello"] * 12)))
+        card = self.build(c)
+        self.assertTrue(card["chat_complete"])
+        self.assertEqual(card["chat_window_days"], 365)
+        self.assertIn("read all 12", card_mod.chat_coverage_phrase(card))
+        self.assertEqual(card_mod.recommend(card)["call"], card_mod.CALL_APPROVE)
+
+    def test_the_trace_is_not_a_score(self):
+        """A score is one number standing in for a judgement nobody can audit. Every rule here
+        names the evidence it read, so a reviewer can disagree with a specific claim."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}])
+        rec = card_mod.recommend(self.build(c))
+        self.assertEqual(set(rec), {"call", "rules", "basis"})
+        for r in rec["rules"]:
+            self.assertEqual(set(r), {"rule", "says", "because"})
+            for value in r.values():
+                self.assertIsInstance(value, str)
+                self.assertNotIsInstance(value, (int, float))
+            # Every rule explains itself; none is a bare label.
+            self.assertGreater(len(r["because"]), 20)
+
+    def test_funding_never_gets_an_approve_from_history_alone(self):
+        """There is no equivalent of the death line for a build. Nothing available can verify a
+        project is real, so an established account earns "nothing against them" and the
+        judgement stays with the reviewer."""
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000})
+        card = card_mod.gather(GUILD, "Alice", UUID_A, 100, self.cfg, c, self.st,
+                               screening.Lexicon({}),
+                               request_type=store_mod.KIND_FUNDING,
+                               details={"project": "hub", "needs": "obsidian"})
+        rec = card_mod.recommend(card)
+        rules = {r["rule"] for r in rec["rules"]}
+        self.assertIn("established account", rules)
+        self.assertNotIn("recent death", rules)
+        self.assertNotIn("new to 2b2t", rules)
+
+    def test_the_rule_trace_leads_the_card_and_repeats_the_caveat(self):
+        c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
+                       deaths=[{"time": ago_ts(hours=1), "deathMessage": "died"}])
+        card = self.build(c)
+        first = card_mod.sections(card)[0]
+        self.assertEqual(first["name"], "Nothing against them")
+        # The caveat travels with the recommendation, because that is where it gets read.
+        self.assertIn("profanity", first["value"])
+        self.assertIn("never denies anyone", first["value"])
+
     # ------------------------------------------------------------ meeting point
 
     def test_coords_are_read_out_of_every_shape_people_type(self):
@@ -383,7 +557,11 @@ class CardCase(unittest.TestCase):
                                request_type=store_mod.KIND_FUNDING,
                                details={"project": "nether hub", "needs": "4 stacks obsidian",
                                         "scale": "a weekend"})
-        self.assertEqual(card_mod.sections(card)[0]["name"], "The ask")
+        names = [s["name"] for s in card_mod.sections(card)]
+        # The ask comes before any history. Relative order, not index 0 -- the rule trace sits
+        # above everything as a table of contents for the card.
+        self.assertLess(names.index("The ask"), names.index("Recent deaths"))
+        self.assertLess(names.index("The ask"), names.index("On 2b2t"))
         self.assertIn("nether hub", self.text_of(card, "The ask"))
         self.assertNotIn("died", card_mod.headline(card))
         # And the rescue-only "claim verified" line must not appear on a funding card.
@@ -393,7 +571,9 @@ class CardCase(unittest.TestCase):
         c = FakeClient(stats={"firstSeen": ago_ts(days=800), "playtimeSeconds": 400000},
                        deaths=[{"time": ago_ts(hours=1), "deathMessage": "Alice died"}])
         card = self.build(c)
-        self.assertEqual(card_mod.sections(card)[0]["name"], "Recent deaths")
+        names = [s["name"] for s in card_mod.sections(card)]
+        self.assertNotIn("The ask", names)
+        self.assertLess(names.index("Recent deaths"), names.index("On 2b2t"))
         self.assertIn("died", card_mod.headline(card))
         self.assertIn("verified", self.text_of(card, "Recent deaths"))
 

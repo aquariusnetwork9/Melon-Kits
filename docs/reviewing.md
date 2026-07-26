@@ -13,6 +13,46 @@ card is ambiguous, the tie goes to the applicant.
 
 ---
 
+## The line at the top of the card
+
+Every card opens with **Nothing against them**, **Worth a closer look**, or **Blocked**, and
+under it every rule that fired with the evidence it read. It is a table of contents, not a
+substitute for the card: each line tells you where to go and check.
+
+It is deliberately **not a score.** A score is one number standing in for a judgement nobody can
+audit; a trace names the claim so you can disagree with that specific claim in one glance.
+
+Two limits on it, both measured rather than assumed:
+
+- **Profanity and slur counts never move it.** Run the tuned lexicon over a year of real 2b2t
+  chat and it still matches 3.7% of *everything*. Profanity is the server's register, so a
+  recommendation that moved on it would be recommending against the median player. The counts
+  stay on the card; they stay out of the arithmetic.
+- **Chat can never say Blocked.** Only two rules can, and both are facts rather than inferences:
+  a reviewer's own do-not-serve flag, and the cooldown. The strongest thing chat does is *read
+  these lines first* — because whether a matched phrase is a real threat or somebody asking for
+  a delivery address is exactly what a keyword list cannot see. The kits are disposable, so a
+  false deny costs more than a false approve, and the tie goes to the applicant.
+
+**Blocked is a recommendation, not a decision.** Approve over it if you disagree; the reason you
+type is what the ledger keeps.
+
+The one chat category that *does* move it is `off_game` — statements that leave the game, meaning
+they target a person rather than a player. That is the category's whole purpose, and when it
+fires the trace names which line numbers to read.
+
+### How much chat it actually read
+
+The trace ends with what it looked at, and this matters more than it sounds. Chat is swept over
+the **last 365 days**, page-walked up to a cap. Most of the time it reads the whole year — the
+median 2b2t player says **twelve lines in a year**, and the cap covers ~94% of players
+completely. For the talkative minority it stops early and says so:
+
+> read the most recent 500 line(s) of 2595 in the last 365 days - the rest was not examined
+
+Treat that exactly like "could not retrieve deaths". Nothing found in a sample is not the same
+claim as nothing found in a year, and the card will not pretend otherwise.
+
 ## Two kinds of request, judged on different evidence
 
 A **rescue kit** and **project funding** arrive in the same queue and are close to opposite

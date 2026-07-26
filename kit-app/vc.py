@@ -194,6 +194,55 @@ class Client(object):
         doc = self._get("/chats", params)
         return doc or {"chats": [], "total": 0, "pageCount": 0}
 
+    def chats_window(self, uuid: Optional[str] = None, name: Optional[str] = None,
+                     start: Optional[str] = None, end: Optional[str] = None,
+                     max_pages: int = 5) -> Dict[str, Any]:
+        """Chat inside a date window, page-walked up to `max_pages`.
+
+        Returns the same shape as `chats` plus **`complete`** and **`pages_read`**, and the
+        `complete` flag is the point of this method. `pageSize` is hard-capped at 100 by the API
+        -- 150 is a 400, verified live -- so a year of a talkative player's chat is dozens of
+        requests against a bucket of 5 permits per second shared with every other caller. This
+        walks until the window runs out or the cap does, and says which happened.
+
+        Measured against the 2025 bulk dump, the cap almost never binds: the median player
+        produced **12 lines in the entire year**, p90 is 244, and 500 lines covers 94% of
+        players completely. It is the long tail that would be ruinous -- p99 is 2,595 lines and
+        the busiest account managed 109,220, which would be 1,093 requests for one ticket.
+
+        `start`/`end` are ISO dates (YYYY-MM-DD). An unparseable date makes this API answer
+        **302** with an HTML explorer page rather than a 400, so callers must format them.
+        """
+        rows: List[Dict[str, Any]] = []
+        total = None
+        pages = 0
+        complete = True
+        for page in range(max(1, int(max_pages))):
+            params = self._ident(uuid, name) + [
+                ("pageSize", 100), ("sort", "DESC"), ("page", page)]
+            if start:
+                params.append(("startDate", start))
+            if end:
+                params.append(("endDate", end))
+            doc = self._get("/chats", params)
+            pages += 1
+            if not doc:
+                break                       # 204 no content, or a failure _get already logged
+            batch = doc.get("chats") or []
+            if total is None:
+                total = doc.get("total")
+            rows.extend(batch)
+            if len(batch) < 100:
+                break                       # last page of the window
+        else:
+            # The loop ran to the cap without a short page, so there is more we did not read.
+            if total is None or len(rows) < int(total or 0):
+                complete = False
+        if total is not None and len(rows) < int(total):
+            complete = False
+        return {"chats": rows, "total": total if total is not None else len(rows),
+                "complete": complete, "pages_read": pages}
+
     def connections(self, uuid: Optional[str] = None, name: Optional[str] = None,
                     limit: int = 4) -> Dict[str, Any]:
         params = self._ident(uuid, name) + [("pageSize", max(1, min(int(limit), 100)))]
