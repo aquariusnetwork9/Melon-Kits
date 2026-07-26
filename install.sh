@@ -327,13 +327,19 @@ else
 fi
 
 echo
-if journalctl -u "$UNIT_NAME" --since "-2 min" --no-pager 2>/dev/null | grep -q "connected as"; then
-    WHO="$(journalctl -u "$UNIT_NAME" --since '-2 min' --no-pager | grep 'connected as' | tail -1 | sed 's/.*connected as //')"
+# Read the journal ONCE into a variable rather than piping it into grep -q per test. Under
+# `set -o pipefail`, a matching `grep -q` exits early, journalctl takes SIGPIPE, and the whole
+# pipeline reports failure -- so the branch that matched is the one that silently does not fire.
+# That bug hid the "Discord rejected that token" message behind the generic one.
+LOG="$(journalctl -u "$UNIT_NAME" --since "-2 min" --no-pager -o cat 2>/dev/null || true)"
+
+if printf '%s' "$LOG" | grep -q "connected as"; then
+    WHO="$(printf '%s' "$LOG" | grep 'connected as' | tail -1 | sed 's/.*connected as //')"
     say "Connected to Discord as $WHO"
-elif journalctl -u "$UNIT_NAME" --since "-2 min" --no-pager 2>/dev/null | grep -qi "rejected the token"; then
+elif printf '%s' "$LOG" | grep -qi "rejected the token"; then
     warn "Discord rejected that token."
     echo "    Reset it at https://discord.com/developers/applications -> Bot -> Reset Token,"
-    echo "    then:  sudo $0 --token <NEW_TOKEN>"
+    echo "    then re-run this installer and paste the new one."
     exit 3
 else
     warn "The bot is $STATUS and did not report a successful connection within 8 seconds."
@@ -342,7 +348,7 @@ else
     # Printed rather than pointed at. Somebody following a one-command install should not have
     # to learn journalctl to find out why that one command did not work, and the reason is
     # usually the single line above the first "Main process exited".
-    journalctl -u "$UNIT_NAME" --since "-2 min" --no-pager -o cat 2>/dev/null \
+    printf '%s\n' "$LOG" \
         | grep -v -e '^$' -e 'Scheduled restart' -e 'Stopped ' -e 'Started ' \
         | tail -12 | sed 's/^/    /'
     echo
