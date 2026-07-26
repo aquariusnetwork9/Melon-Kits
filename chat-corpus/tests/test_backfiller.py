@@ -317,7 +317,8 @@ class BackfillerTest(unittest.TestCase):
         bf, stop = self._bf(cfg, w)
         gid = w.enqueue_gap(self.base, self.base + 60_000_000)
         bf._run_gap(dict(w.claim_gap()))
-        saved = json.load(open(cfg["state_path"], encoding="utf-8"))
+        with open(cfg["state_path"], encoding="utf-8") as fh:
+            saved = json.load(fh)
         gaps = {g["gap_id"]: g for g in saved["gaps"]}
         self.assertIn(gid, gaps)
         self.assertGreaterEqual(int(gaps[gid]["cursor_us"]), t1)
