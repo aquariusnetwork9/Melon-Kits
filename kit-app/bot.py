@@ -1944,6 +1944,11 @@ class KitBot(discord.Client):
         """
         await self.wait_until_ready()
         await asyncio.sleep(60)          # let the first sync and any reconnect settle
+        # Said once, at startup. A sweep that finds nothing logs nothing -- correctly, or this
+        # would write two lines an hour forever -- which leaves "armed" and "quietly dead"
+        # looking identical in the journal. This is the line that tells them apart.
+        LOG.info("thread purge armed: finished tickets are deleted %dh after closing, "
+                 "swept every 30 min", int(self.cfg["policy"]["thread_purge_hours"]))
         while not self.is_closed():
             try:
                 await self.purge_finished_tickets()
