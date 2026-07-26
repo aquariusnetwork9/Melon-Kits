@@ -1,3 +1,6 @@
+# Template. `install.sh` substitutes @@USER@@, @@APPDIR@@, @@DATADIR@@ and @@ETCDIR@@ and writes
+# the result to /etc/systemd/system/melonkit-bot.service. Edit THIS file, never the installed
+# one -- a re-run of the installer overwrites the installed copy.
 [Unit]
 Description=Melon Men kit-request bot
 Documentation=https://github.com/aquariusnetwork9/Melon-Kits
@@ -11,12 +14,13 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/melon-kits/kit-app
+User=@@USER@@
+WorkingDirectory=@@APPDIR@@
 # Token only. Root-owned 600, so it is never readable from the repo checkout and cannot
-# be committed by accident.
-EnvironmentFile=/etc/melonkit/env
-ExecStart=/home/ubuntu/melon-kits/kit-app/.venv/bin/python bot.py --config /home/ubuntu/melon-kits/kit-app/melonkit.json
+# be committed by accident. systemd reads it as root and then drops to User= above, which is
+# what lets the service use a secret its own user cannot open.
+EnvironmentFile=@@ETCDIR@@/env
+ExecStart=@@APPDIR@@/.venv/bin/python bot.py --config @@APPDIR@@/melonkit.json
 Restart=on-failure
 RestartSec=10
 
@@ -44,7 +48,7 @@ ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 LockPersonality=yes
-ReadWritePaths=/var/lib/melonkit
+ReadWritePaths=@@DATADIR@@
 
 [Install]
 WantedBy=multi-user.target

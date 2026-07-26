@@ -1,0 +1,13 @@
+# Shell scripts and systemd units MUST be committed with LF endings.
+#
+# This repo is developed on Windows and deployed on Linux. Without this, git's autocrlf turns
+# install.sh into CRLF on checkout, and bash then fails on the shebang with
+# `/usr/bin/env: 'bash\r': No such file or directory` -- an error that names neither the file
+# nor the real cause. A systemd unit with CRLF fails more quietly still: it parses, and the
+# trailing \r ends up inside ExecStart's path.
+*.sh        text eol=lf
+*.service   text eol=lf
+*.service.in text eol=lf
+*.py        text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
