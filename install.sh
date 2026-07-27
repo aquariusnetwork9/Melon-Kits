@@ -282,10 +282,10 @@ if [ -f "$DATA_DIR/lexicon.json" ]; then
     say "Keeping the existing lexicon"
 else
     say "Installing the starter lexicon"
-    # Shipped with the off_game and scam lists filled in and the slur/profanity lists EMPTY.
-    # Those are deliberately not in a public repo; add your own with `python tools/mine.py`, or
-    # the screening simply reports nothing for them, which is a safe default rather than a
-    # broken one.
+    # All four category lists ship filled in, so screening works from the first ticket. Copied
+    # OUT of the checkout rather than read from it, so a server can tune its own copy -- its
+    # players' spellings, an exceptions entry for a place name that keeps matching -- without a
+    # later pull overwriting the edit. That is also why lexicon.json is gitignored.
     install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 640 \
         "$APP_DIR/lexicon.example.json" "$DATA_DIR/lexicon.json"
 fi
