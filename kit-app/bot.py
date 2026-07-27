@@ -799,6 +799,93 @@ class DeliveredButton(discord.ui.DynamicItem[discord.ui.Button],
         await app.handle_delivered(interaction, self.kit_id)
 
 
+class UnclaimButton(discord.ui.DynamicItem[discord.ui.Button],
+                    template=r"melonkit:unclaim:(?P<kit>\d+)"):
+    """Hand a delivery back without having to remember `/unclaim 7`.
+
+    Sits beside Mark delivered for exactly as long as somebody holds the dispatch. The
+    command stays: a reviewer prising a stale claim off someone who has gone quiet often does
+    it from somewhere other than the queue post.
+    """
+
+    def __init__(self, kit_id: int) -> None:
+        super().__init__(discord.ui.Button(
+            label="Hand back", style=discord.ButtonStyle.secondary,
+            custom_id="melonkit:unclaim:%d" % kit_id))
+        self.kit_id = kit_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction,
+                             item: discord.ui.Button,
+                             match: "re.Match[str]") -> "UnclaimButton":
+        return cls(int(match["kit"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        app: KitBot = interaction.client            # type: ignore[assignment]
+        await app.handle_unclaim(interaction, self.kit_id)
+
+
+class ViewConversationButton(discord.ui.DynamicItem[discord.ui.Button],
+                             template=r"melonkit:convo:(?P<ticket>\d+)"):
+    """Read the applicant's side of the ticket without entering it.
+
+    The default way to look, and the reason it exists rather than leaving Join to do both
+    jobs: adding somebody to a thread posts a `recipient_add` system message the applicant can
+    see, so joining is an announcement. Most reviewing is reading, and a reviewer should not
+    have to declare themselves to the person they are deciding about in order to do it.
+
+    The reply is ephemeral, so nothing about it reaches the applicant or the queue.
+    """
+
+    def __init__(self, ticket_id: int) -> None:
+        super().__init__(discord.ui.Button(
+            label="Read conversation", style=discord.ButtonStyle.secondary,
+            custom_id="melonkit:convo:%d" % ticket_id))
+        self.ticket_id = ticket_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction,
+                             item: discord.ui.Button,
+                             match: "re.Match[str]") -> "ViewConversationButton":
+        return cls(int(match["ticket"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        app: KitBot = interaction.client            # type: ignore[assignment]
+        await app.handle_view_conversation(interaction, self.ticket_id)
+
+
+class JoinThreadButton(discord.ui.DynamicItem[discord.ui.Button],
+                       template=r"melonkit:join:(?P<ticket>\d+)"):
+    """Put the reviewer pressing it into the applicant's thread.
+
+    Reviewers are *permitted* to read every ticket thread -- Manage Threads on the panel
+    channel is what grants that -- but permission is not discovery: a private thread you are
+    not a member of appears in no sidebar and no thread list, and the card's `<#id>` mention
+    does not resolve into anything clickable for someone outside it. So the conversation was
+    reachable only by hunting for it. This is the door.
+
+    Deliberately not offered to the delivery team. A runner joins by claiming, which is the
+    ticket they are actually working; letting any runner into any thread would undo the reason
+    they are not given Manage Threads in the first place.
+    """
+
+    def __init__(self, ticket_id: int) -> None:
+        super().__init__(discord.ui.Button(
+            label="Join applicant thread", style=discord.ButtonStyle.secondary,
+            custom_id="melonkit:join:%d" % ticket_id))
+        self.ticket_id = ticket_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction,
+                             item: discord.ui.Button,
+                             match: "re.Match[str]") -> "JoinThreadButton":
+        return cls(int(match["ticket"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        app: KitBot = interaction.client            # type: ignore[assignment]
+        await app.handle_join_thread(interaction, self.ticket_id)
+
+
 async def _safe_followup(interaction: discord.Interaction, text: str) -> None:
     """Reply once, whichever half of the interaction lifecycle we are in."""
     try:
@@ -937,6 +1024,7 @@ class KitBot(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(PanelView())
         for item in (ApproveButton, DeclineButton, ClaimButton, DeliveredButton,
+                     UnclaimButton, JoinThreadButton, ViewConversationButton,
                      ChatHistoryButton, ChatPageButton, ChatFileButton, CoordsButton):
             self.add_dynamic_items(item)
         self.tree.on_error = self._on_app_command_error
@@ -1232,7 +1320,8 @@ class KitBot(discord.Client):
             except discord.HTTPException:
                 LOG.warning("could not post receipt to applicant thread ticket=%d", ticket_id)
 
-        posted = await self._post_queue_card(g, ticket_id, canonical, user, built, thread)
+        posted = await self._post_queue_card(g, ticket_id, canonical, user, built,
+                                            thread, gid)
         if not posted:
             # No reviewer will ever see this ticket, and leaving it `open` would bar the
             # applicant from trying again -- the lockout, reached by a third route. Close it
@@ -1256,7 +1345,8 @@ class KitBot(discord.Client):
 
     async def _post_queue_card(self, g: Dict[str, Any], ticket_id: int, mc_name: str,
                                user: Any, built: Dict[str, Any],
-                               thread: Optional[discord.Thread]) -> bool:
+                               thread: Optional[discord.Thread],
+                               ticket_guild_id: Optional[int] = None) -> bool:
         """Put the reviewer card in the staff-only queue. Returns False if it could not."""
         channel_id = int(g.get("queue_channel_id") or 0)
         channel = self.get_channel(channel_id) if channel_id else None
@@ -1269,12 +1359,18 @@ class KitBot(discord.Client):
         view = discord.ui.View(timeout=None)
         view.add_item(ApproveButton(ticket_id))
         view.add_item(DeclineButton(ticket_id))
-        # No .txt attachment any more: the same lines are paged in Discord, and the pager
-        # offers the file on demand for anyone who wants the whole log at once. Only added when
-        # there is something to page -- an empty pager could not say whether the applicant was
-        # silent or the lookup failed, and the card's chat field already distinguishes those.
-        if built["chat_lines"]:
-            view.add_item(ChatHistoryButton(ticket_id))
+        # The trailing buttons come from `_with_extras`, the same helper every later edit of
+        # this card uses, rather than a second hand-maintained copy of the list. A card built
+        # one way and rebuilt another is precisely how a button goes missing from a single
+        # stage of the lifecycle without anything erroring.
+        #
+        # Safe here because both inputs it reads are already persisted: the thread id is
+        # written immediately after the thread is created, and the shown chat lines just
+        # before this call. It carries the chat pager (only when there is something to page --
+        # an empty pager could not say whether the applicant was silent or the lookup failed)
+        # and the two doors into the applicant's side, since the `<#id>` in the header below
+        # is a mention that does not resolve for anybody outside a private thread.
+        view = self._with_extras(view, ticket_guild_id, ticket_id) or view
 
         # Every reviewer role, not just the first. A server that configured three of them did so
         # because all three review, and pinging one would quietly make the other two optional.
@@ -1356,24 +1452,35 @@ class KitBot(discord.Client):
         """Guild-scoped, because the ticket number arrived in a custom_id a user pressed."""
         return self.store.shown_chats_for_guild(int(guild_id), int(ticket_id))
 
-    def _with_chat(self, view: Optional[discord.ui.View], guild_id: Optional[int],
-                   ticket_id: int) -> Optional[discord.ui.View]:
-        """Keep the chat-history button on a view that is replacing a queue card's.
+    def _with_extras(self, view: Optional[discord.ui.View], guild_id: Optional[int],
+                     ticket_id: int) -> Optional[discord.ui.View]:
+        """Re-add the buttons that belong on a queue card at every stage of its life.
 
         Every lifecycle step swaps the card's whole view for a new one, and components do not
         merge: anything the replacement lacks is gone. While the chat log was an attachment it
         survived those edits for free, because an edit that omits `attachments` leaves them
         alone. A button gets no such treatment, so each replacement has to re-add it -- or a
         ticket loses its chat the moment it is decided, which is exactly when a reviewer goes
-        back to check something.
+        back to check something. The same is true of the thread door, which is worth *more*
+        after the decision than before it.
 
-        Returns `view` untouched when the ticket has no chat, so a `None` stays `None` and the
-        no-chat case behaves exactly as it did before.
+        Returns `view` untouched when there is nothing to add, so a `None` stays `None` and a
+        ticket with neither chat nor thread behaves exactly as it did before.
         """
-        if guild_id is None or not self._chat_rows(guild_id, ticket_id):
+        if guild_id is None:
             return view
-        view = view or discord.ui.View(timeout=None)
-        view.add_item(ChatHistoryButton(ticket_id))
+        if self._chat_rows(guild_id, ticket_id):
+            view = view or discord.ui.View(timeout=None)
+            view.add_item(ChatHistoryButton(ticket_id))
+        # Only when there is a thread. A ticket whose thread creation failed, or whose thread
+        # has since been deleted, would otherwise carry buttons that can only apologise.
+        ticket = self.store.get_ticket(ticket_id, int(guild_id))
+        if ticket is not None and ticket["thread_id"]:
+            view = view or discord.ui.View(timeout=None)
+            # Reading first, joining second: reading is what most reviews need, and it is the
+            # one of the two the applicant cannot see happening.
+            view.add_item(ViewConversationButton(ticket_id))
+            view.add_item(JoinThreadButton(ticket_id))
         return view
 
     async def handle_chat_page(self, interaction: discord.Interaction, ticket_id: int,
@@ -1562,7 +1669,7 @@ class KitBot(discord.Client):
                     await qmsg.edit(
                         content="Ticket #%d - **declined** by %s\n> %s"
                                 % (ticket_id, interaction.user.mention, reason or ""),
-                        view=self._with_chat(None, gid, ticket_id),
+                        view=self._with_extras(None, gid, ticket_id),
                         allowed_mentions=discord.AllowedMentions.none())
                 except discord.HTTPException:
                     LOG.warning("could not update declined queue post ticket=%d", ticket_id)
@@ -1597,7 +1704,7 @@ class KitBot(discord.Client):
                 await qmsg.edit(
                     content="Ticket #%d - **approved** by %s\nDispatch #%d, unclaimed."
                             % (ticket_id, interaction.user.mention, kit_id),
-                    view=self._with_chat(claim_view, gid, ticket_id),
+                    view=self._with_extras(claim_view, gid, ticket_id),
                     allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 LOG.warning("could not attach claim button ticket=%d kit=%d",
@@ -1641,27 +1748,34 @@ class KitBot(discord.Client):
         qthread, qmsg = await self._queue_post(fresh)
         if qmsg is not None:
             try:
-                # `_with_chat`, not view=None: this is the one lifecycle path with no
+                # `_with_extras`, not view=None: this is the one lifecycle path with no
                 # interaction to take a guild id from, so it comes off the ledger row.
                 await qmsg.edit(
                     content="Ticket #%s - **closed**: the applicant thread was deleted."
                             % row["id"],
-                    view=self._with_chat(None, fresh["guild_id"], int(row["id"])))
+                    view=self._with_extras(None, fresh["guild_id"], int(row["id"])))
             except discord.HTTPException:
                 pass
         await _set_queue_state(qthread, "closed", archive=True)
         await self._post_transcript(int(row["id"]))
 
     async def _thread_conversation(self, ticket: Any) -> Optional[str]:
-        """The applicant thread's messages, oldest first. None when unavailable."""
-        if not self.gcfg(ticket["guild_id"]).get("capture_thread_messages")                 or not ticket["thread_id"]:
+        """The applicant thread's messages for the permanent archive.
+
+        Gated on `capture_thread_messages` because that setting is about what gets written
+        into a transcript that outlives the ticket. Reading the thread live is a different
+        act -- see `_read_thread_history`, which a reviewer uses to look at a conversation they
+        can already open -- so the two do not share the gate.
+        """
+        if not self.gcfg(ticket["guild_id"]).get("capture_thread_messages"):
             return None
-        ch = self.get_channel(int(ticket["thread_id"]))
-        if ch is None:
-            try:
-                ch = await self.fetch_channel(int(ticket["thread_id"]))
-            except (discord.HTTPException, discord.NotFound):
-                return None
+        return await self._read_thread_history(ticket)
+
+    async def _read_thread_history(self, ticket: Any) -> Optional[str]:
+        """The applicant thread's messages, oldest first. None when unavailable."""
+        if not ticket["thread_id"]:
+            return None
+        ch = await self._resolve_thread(ticket)
         if not isinstance(ch, discord.Thread):
             return None
         lines = []
@@ -1771,7 +1885,30 @@ class KitBot(discord.Client):
                                           else "<@%d>" % int(d["reviewer_id"])))
             if d["reason"]:
                 third.append(str(d["reason"])[:120])
-        if kits and kits[0]["claimed_by"]:
+        # Who carried it, including the ones who handed it back. `kits.claimed_by` is nulled on
+        # hand-back, so on its own it reports "never claimed" for a dispatch three people have
+        # already had -- and a kit that went through three runners and never arrived is
+        # precisely the one worth being able to read about later.
+        claims = self.store.claims_for_ticket(ticket_id, t["guild_id"])
+        # The last row is not the runner unless it is still open. A dispatch claimed once and
+        # handed straight back has exactly one row, and naming its actor would read identically
+        # to "this person delivered it" -- for a kit nobody ever carried.
+        current = [c for c in claims if not c["released_at"]]
+        delivered_by = [c for c in claims
+                        if c["outcome"] == store_mod.CLAIM_DELIVERED]
+        if delivered_by:
+            who = "runner <@%d>" % int(delivered_by[-1]["actor_id"])
+            earlier = len(claims) - 1
+            if earlier:
+                who += " (after %d handoff%s)" % (earlier, "" if earlier == 1 else "s")
+            third.append(who)
+        elif current:
+            third.append("held by <@%d>, not delivered" % int(current[-1]["actor_id"]))
+        elif claims:
+            third.append("unclaimed after %d handoff%s"
+                         % (len(claims), "" if len(claims) == 1 else "s"))
+        elif kits and kits[0]["claimed_by"]:
+            # A dispatch claimed before the claim log existed. Current state is all there is.
             third.append("runner <@%d>" % int(kits[0]["claimed_by"]))
         elif kits:
             third.append("never claimed")
@@ -1821,6 +1958,24 @@ class KitBot(discord.Client):
                             d["reviewer_id"], d["reason"] or "-"))
         if not decisions:
             parts.append("  (none)")
+
+        # Every hand this dispatch passed through, in order. The embed can only afford a
+        # count; this is where the actual chain lives, and it is the reason the claim log is
+        # append-only rather than a column that gets overwritten.
+        parts += ["", "DELIVERY CLAIMS"]
+        for c in claims:
+            ended = "held"
+            if c["released_at"]:
+                by = int(c["released_by"]) if c["released_by"] is not None else None
+                ended = "%s %s" % (c["outcome"] or "ended",
+                                   "" if by is None or by == int(c["actor_id"])
+                                   else "by %d" % by)
+            parts.append("  %s  discord %s  -> %s"
+                         % (card_mod.parse_ts_epoch(c["claimed_at"]), c["actor_id"],
+                            ended.strip()))
+        if not claims:
+            parts.append("  (never claimed)" if kits else "  (nothing to deliver)")
+
         parts += ["", "CHAT SHOWN TO THE REVIEWER (coordinate-redacted at capture)"]
         if shown:
             for r in shown:
@@ -2149,8 +2304,11 @@ class KitBot(discord.Client):
         LOG.info("dispatch claimed kit=%d by=%s", kit_id, interaction.user.id)
         view = discord.ui.View(timeout=None)
         view.add_item(DeliveredButton(kit_id))
+        # Handing back is only meaningful while somebody holds it, so the button exists for
+        # exactly that window rather than being a permanent fixture that usually refuses.
+        view.add_item(UnclaimButton(kit_id))
         if kit["ticket_id"]:
-            view = self._with_chat(view, gid, int(kit["ticket_id"]))
+            view = self._with_extras(view, gid, int(kit["ticket_id"]))
         # The interaction response has to land first -- it is on a 3-second clock. Retagging
         # is a separate call and is allowed to be slow or to fail. Only the content changes:
         # the reviewer card embed stays put, because the post is the record of the ticket.
@@ -2179,6 +2337,185 @@ class KitBot(discord.Client):
                 ticket, "%s has picked up this delivery and will sort out a meeting "
                         "point with you here." % interaction.user.mention)
 
+    async def handle_view_conversation(self, interaction: discord.Interaction,
+                                       ticket_id: int) -> None:
+        """Show a reviewer the applicant's thread, ephemerally, without joining it."""
+        gid = interaction.guild_id
+        if gid is None or not is_reviewer(interaction.user, self.gcfg(gid)):
+            await interaction.response.send_message(
+                "Only reviewers can read an applicant's conversation.", ephemeral=True)
+            return
+        ticket = self.store.get_ticket(ticket_id, gid)
+        if ticket is None:
+            await interaction.response.send_message(
+                "There's no ticket #%d in this server." % ticket_id, ephemeral=True)
+            return
+
+        # Reading up to 500 messages is well past the 3-second window on a cold cache.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        convo = await self._read_thread_history(ticket)
+        if not convo:
+            # Deliberately not "they said nothing": an unreadable thread and a silent one are
+            # different, and telling a reviewer the applicant was silent when the thread was
+            # simply deleted would be a decision made on a false premise.
+            await _safe_followup(
+                interaction,
+                "Nothing to show for ticket #%d - the thread has no messages I can read, or "
+                "it no longer exists." % ticket_id)
+            return
+
+        header = "**Ticket #%d - applicant thread**\n" % ticket_id
+        if len(header) + len(convo) + 8 <= 1900:
+            await _safe_followup(interaction, "%s```\n%s\n```" % (header, convo))
+            return
+        # Too long to inline. The file is ephemeral too, so it goes no further than the
+        # reviewer who asked for it.
+        data = (convo + "\n").encode("utf-8")
+        try:
+            await interaction.followup.send(
+                header + "Too long to show inline - attached.",
+                file=discord.File(io.BytesIO(data),
+                                  filename="ticket-%d-conversation.txt" % ticket_id),
+                ephemeral=True)
+        except discord.HTTPException:
+            # Truncate the conversation, then fence it. Trimming the finished string instead
+            # would cut the closing ``` and render the tail as formatting.
+            room = 1900 - len(header) - 40
+            await _safe_followup(
+                interaction,
+                "%s```\n%s\n```\n(truncated - the attachment failed)"
+                % (header, convo[-room:] if room > 0 else ""))
+
+    async def handle_join_thread(self, interaction: discord.Interaction,
+                                 ticket_id: int) -> None:
+        """Admit a reviewer to the applicant's thread and hand them a link to it."""
+        gid = interaction.guild_id
+        # Role before lookup, matching the chat pager: the queue is visible to the delivery
+        # role too, so a runner pressing this is an ordinary refusal rather than a hypothetical
+        # one -- and answering first keeps the refusal from doubling as a way to probe which
+        # ticket numbers exist.
+        if gid is None or not is_reviewer(interaction.user, self.gcfg(gid)):
+            await interaction.response.send_message(
+                "Only reviewers can join an applicant's thread. Claiming the delivery adds "
+                "you to it.", ephemeral=True)
+            return
+        ticket = self.store.get_ticket(ticket_id, gid)
+        if ticket is None:
+            await interaction.response.send_message(
+                "There's no ticket #%d in this server." % ticket_id, ephemeral=True)
+            return
+        if not ticket["thread_id"]:
+            await interaction.response.send_message(
+                "Ticket #%d has no applicant thread - it could not be created when the "
+                "request came in." % ticket_id, ephemeral=True)
+            return
+
+        # Defer before the round trips: resolving a cold thread is a fetch, and adding a
+        # member is another. Blowing the 3-second window shows "This interaction failed" on a
+        # press that may well have worked.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        link = "https://discord.com/channels/%d/%d" % (gid, int(ticket["thread_id"]))
+        if await self._admit_to_thread(ticket, interaction.user):
+            await _safe_followup(
+                interaction,
+                "You're in the thread for ticket #%d: %s\n"
+                "The applicant can see that you joined." % (ticket_id, link))
+            return
+        # Say which failure this was. A thread that no longer exists and a permission the bot
+        # lacks need opposite responses, and blaming Manage Threads for a deleted thread sends
+        # somebody to fix a setting that was never broken. The ledger keeps `thread_id` after a
+        # thread is deleted, so this is the ordinary state of every closed ticket.
+        if await self._resolve_thread(ticket) is None:
+            await _safe_followup(
+                interaction,
+                "Ticket #%d's thread is gone - deleted, or cleaned up after the ticket "
+                "finished. The transcript in the archive is the record now." % ticket_id)
+            return
+        await _safe_followup(
+            interaction,
+            "Couldn't add you to the thread for ticket #%d - try this link: %s\n"
+            "If it doesn't open, I'm missing **Manage Threads** in the requests channel."
+            % (ticket_id, link))
+
+    async def handle_unclaim(self, interaction: discord.Interaction, kit_id: int) -> None:
+        """Hand a delivery back to the pool, from the button or from `/unclaim`.
+
+        One implementation for both on purpose: the button and the command have to agree about
+        who may release a claim and about what the applicant is told, and two copies of that
+        would drift the first time either was touched.
+        """
+        gid = interaction.guild_id
+        # Never look a dispatch up unscoped. Row ids are globally unique, so `get_kit(id, None)`
+        # would happily return another server's kit -- the cross-tenant hole every store method
+        # takes a guild id to close.
+        if gid is None:
+            await _safe_followup(interaction, "Dispatches can only be handed back in a server.")
+            return
+        row = self.store.get_kit(kit_id, gid)
+        if row is None:
+            await _safe_followup(interaction, "There's no dispatch #%d." % kit_id)
+            return
+        if row["delivered_at"]:
+            await _safe_followup(
+                interaction, "Dispatch #%d is already marked delivered." % kit_id)
+            return
+        if row["claimed_by"] is None:
+            await _safe_followup(
+                interaction, "Dispatch #%d isn't claimed by anyone." % kit_id)
+            return
+
+        holder = int(row["claimed_by"])
+        reviewer = is_reviewer(interaction.user, self.gcfg(gid))
+        if holder == interaction.user.id:
+            ok = self.store.unclaim_kit(kit_id, interaction.user.id)
+        elif reviewer:
+            ok = self.store.release_kit(kit_id, interaction.user.id)
+        else:
+            await _safe_followup(
+                interaction,
+                "<@%d> claimed this one - they or a reviewer can hand it back." % holder)
+            return
+        if not ok:
+            await _safe_followup(
+                interaction,
+                "Couldn't release dispatch #%d - someone changed it just now." % kit_id)
+            return
+
+        LOG.info("dispatch released kit=%d by=%s was_held_by=%s",
+                 kit_id, interaction.user.id, holder)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # Put the Claim button back on the queue post and return it to `approved`.
+        ticket = (self.store.get_ticket(int(row["ticket_id"]), gid)
+                  if row["ticket_id"] else None)
+        if ticket is not None:
+            # The applicant was told by name who was coming. Say that it changed before the
+            # person quietly disappears from their thread.
+            await self._revoke_from_thread(ticket, holder)
+            await self._notify_thread(
+                ticket, "That delivery went back to the pool - someone else will pick it up. "
+                        "Your request is still approved.")
+            qthread, qmsg = await self._queue_post(ticket)
+            if qmsg is not None:
+                view = discord.ui.View(timeout=None)
+                view.add_item(ClaimButton(kit_id))
+                view = self._with_extras(view, gid, int(ticket["id"]))
+                try:
+                    await qmsg.edit(
+                        content="Dispatch #%d - back in the pool, unclaimed." % kit_id,
+                        view=view, allowed_mentions=discord.AllowedMentions.none())
+                except discord.HTTPException:
+                    LOG.warning("could not restore claim button kit=%d", kit_id)
+            if qthread is not None:
+                try:
+                    await qthread.edit(archived=False)
+                except discord.HTTPException:
+                    pass
+            await _set_queue_state(qthread, "approved")
+
+        await _safe_followup(interaction, "Dispatch #%d is claimable again." % kit_id)
+
     async def handle_delivered(self, interaction: discord.Interaction,
                                kit_id: int) -> None:
         gid = interaction.guild_id
@@ -2195,7 +2532,17 @@ class KitBot(discord.Client):
                 "<@%d> claimed this one - they or a reviewer can close it." % int(claimer),
                 ephemeral=True)
             return
-        if not self.store.mark_delivered(kit_id):
+        # Nobody holds it. That used to fall through every check, so anyone who could see the
+        # queue could mark a kit delivered -- which burns the applicant's cooldown and archives
+        # the ticket for a kit that never went out. Reachable now that Hand back exists: the
+        # card is rewritten on a hand-back, but Discord leaves stale components live on screens
+        # that have not re-rendered, so the old Mark delivered button is still pressable.
+        if not claimer and not is_reviewer(interaction.user, g):
+            await interaction.response.send_message(
+                "Nobody is holding dispatch #%d. Claim it first, or ask a reviewer to close "
+                "it." % kit_id, ephemeral=True)
+            return
+        if not self.store.mark_delivered(kit_id, interaction.user.id):
             await interaction.response.send_message(
                 "Dispatch #%d was already marked delivered." % kit_id, ephemeral=True)
             return
@@ -2203,7 +2550,7 @@ class KitBot(discord.Client):
         await interaction.response.edit_message(
             content="Dispatch #%d - delivered by %s. \U0001F348"
                     % (kit_id, interaction.user.mention),
-            view=(self._with_chat(None, gid, int(kit["ticket_id"]))
+            view=(self._with_extras(None, gid, int(kit["ticket_id"]))
                   if kit["ticket_id"] else None),
             allowed_mentions=discord.AllowedMentions.none())
         # Archived, not locked: the forum's default view stays on live work without losing
@@ -2849,7 +3196,7 @@ def register_commands(app: KitBot) -> None:
                 await qmsg.edit(
                     content="Ticket #%d - **closed** by %s (no decision)\n> %s"
                             % (ticket, interaction.user.mention, reason),
-                    view=app._with_chat(None, interaction.guild_id, ticket),
+                    view=app._with_extras(None, interaction.guild_id, ticket),
                     allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 LOG.warning("could not update closed queue post ticket=%d", ticket)
@@ -2879,72 +3226,12 @@ def register_commands(app: KitBot) -> None:
     async def unclaim(interaction: discord.Interaction, kit: int) -> None:
         """For a runner who said they'd do it and can't, or a reviewer prising a stale claim
         off someone who has gone quiet. Leaves the ticket approved -- the kit is still owed,
-        it just needs somebody else."""
-        row = app.store.get_kit(kit, interaction.guild_id)
-        if row is None:
-            await interaction.response.send_message(
-                "There's no dispatch #%d." % kit, ephemeral=True)
-            return
-        if row["delivered_at"]:
-            await interaction.response.send_message(
-                "Dispatch #%d is already marked delivered." % kit, ephemeral=True)
-            return
-        if row["claimed_by"] is None:
-            await interaction.response.send_message(
-                "Dispatch #%d isn't claimed by anyone." % kit, ephemeral=True)
-            return
+        it just needs somebody else.
 
-        holder = int(row["claimed_by"])
-        reviewer = is_reviewer(interaction.user, app.gcfg(interaction.guild_id))
-        if holder == interaction.user.id:
-            ok = app.store.unclaim_kit(kit, interaction.user.id)
-        elif reviewer:
-            ok = app.store.release_kit(kit)
-        else:
-            await interaction.response.send_message(
-                "<@%d> claimed this one - they or a reviewer can hand it back." % holder,
-                ephemeral=True)
-            return
-        if not ok:
-            await interaction.response.send_message(
-                "Couldn't release dispatch #%d - someone changed it just now." % kit,
-                ephemeral=True)
-            return
-
-        LOG.info("dispatch released kit=%d by=%s was_held_by=%s",
-                 kit, interaction.user.id, holder)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        # Put the Claim button back on the queue post and return it to `approved`.
-        ticket = (app.store.get_ticket(int(row["ticket_id"]), interaction.guild_id)
-                  if row["ticket_id"] else None)
-        if ticket is not None:
-            # The applicant was told by name who was coming. Say that it changed before the
-            # person quietly disappears from their thread.
-            await app._revoke_from_thread(ticket, holder)
-            await app._notify_thread(
-                ticket, "That delivery went back to the pool - someone else will pick it up. "
-                        "Your request is still approved.")
-            qthread, qmsg = await app._queue_post(ticket)
-            if qmsg is not None:
-                view = discord.ui.View(timeout=None)
-                view.add_item(ClaimButton(kit))
-                view = app._with_chat(view, interaction.guild_id, int(ticket["id"]))
-                try:
-                    await qmsg.edit(
-                        content="Dispatch #%d - back in the pool, unclaimed." % kit,
-                        view=view, allowed_mentions=discord.AllowedMentions.none())
-                except discord.HTTPException:
-                    LOG.warning("could not restore claim button kit=%d", kit)
-            if qthread is not None:
-                try:
-                    await qthread.edit(archived=False)
-                except discord.HTTPException:
-                    pass
-            await _set_queue_state(qthread, "approved")
-
-        await interaction.followup.send(
-            "Dispatch #%d is claimable again." % kit, ephemeral=True)
+        The Hand back button on the queue post does the same thing; this stays for the case
+        the button cannot serve, which is a reviewer releasing a claim from somewhere other
+        than the post."""
+        await app.handle_unclaim(interaction, kit)
 
     @tree.command(name="ledger", description="Kit history and flags for an account.")
     async def ledger(interaction: discord.Interaction, mc_name: str) -> None:

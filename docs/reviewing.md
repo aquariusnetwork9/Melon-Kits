@@ -181,6 +181,20 @@ memory of this ticket — "known alt of \<name\>" is useful, "no" is not.
 text is for whoever reads the ledger later, and it names criteria and sometimes other accounts.
 If you want to say something to them, type it in their thread.
 
+## Seeing the applicant's side
+
+The card shows what they wrote when they filed. The conversation that happens afterwards lives
+in their private thread, and two buttons on the queue post reach it:
+
+- **Read conversation** shows you the thread, visible only to you. Nothing is posted, and the
+  applicant is not told. This is the one to use for reviewing.
+- **Join applicant thread** puts you in it so you can talk. Adding somebody to a thread posts a
+  system message, **so the applicant can see that you joined** — which is fine when you have a
+  question for them, and needless when you only want to read.
+
+Neither is offered to the delivery team. A runner joins a thread by claiming its dispatch, which
+is the one ticket they are actually working.
+
 ## Not deciding
 
 A ticket you cannot decide should be **closed, not left**: `/close <ticket> <reason>`. The
@@ -188,8 +202,11 @@ panel's pre-check counts open tickets, so one left open forever quietly stops th
 ever asking again. "No reply in a week" is a perfectly good reason, and closing records no kit,
 so it never burns anyone's cooldown.
 
-If a delivery stalls — somebody claimed it and went quiet — `/unclaim <kit>` puts it back in the
-pool without touching the approval. The kit is still owed; it just needs another runner.
+If a delivery stalls — somebody claimed it and went quiet — the **Hand back** button on the
+queue post puts it back in the pool without touching the approval, and `/unclaim <kit>` does the
+same from anywhere else. The kit is still owed; it just needs another runner. Whoever held it
+stays in the ledger either way: hand-backs are recorded, not erased, so a transcript shows every
+pair of hands a dispatch passed through and whether each one gave it up or had it taken back.
 
 ## Where finished tickets go
 

@@ -24,7 +24,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 STATUS_OPEN = "open"
 STATUS_APPROVED = "approved"
@@ -41,6 +41,13 @@ KIND_FUNDING = "funding"
 KINDS = (KIND_RESCUE, KIND_FUNDING)
 
 KIND_LABEL = {KIND_RESCUE: "rescue kit", KIND_FUNDING: "project funding"}
+
+# How a claim ended. Recorded rather than derived: once a dispatch has been through several
+# hands, "handed back" and "taken off them" read identically from the surviving columns, and
+# the difference is the only thing that says whether a runner was unreliable or unavailable.
+CLAIM_DELIVERED = "delivered"
+CLAIM_HANDED_BACK = "handed_back"
+CLAIM_RELEASED = "released"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -114,6 +121,25 @@ CREATE TABLE IF NOT EXISTS kits (
 );
 CREATE INDEX IF NOT EXISTS ix_kits_user ON kits(discord_user_id);
 CREATE INDEX IF NOT EXISTS ix_kits_uuid ON kits(mc_uuid);
+
+-- Every claim a dispatch has ever had, including the ones handed back. `kits.claimed_by` is
+-- current state and is nulled on hand-back, so by itself it cannot answer "who has had this
+-- delivery" -- which is exactly the question worth asking when a kit passes through three
+-- runners and never arrives. Append-only: a row is closed, never deleted.
+CREATE TABLE IF NOT EXISTS kit_claims (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kit_id      INTEGER NOT NULL REFERENCES kits(id),
+    actor_id    INTEGER NOT NULL,
+    claimed_at  INTEGER NOT NULL,
+    -- NULL while the claim is live; set when it ends, however it ends.
+    released_at INTEGER,
+    -- Who ended it: the holder handing back, or a reviewer prising it off someone gone quiet.
+    -- Equal to actor_id for a hand-back and different for a release, which is the whole
+    -- distinction between the two.
+    released_by INTEGER,
+    outcome     TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_kit_claims_kit ON kit_claims(kit_id);
 
 -- Reviewer-maintained flags. 'Known alt' is a list, never a computation: nothing
 -- distinguishes an alt from a returning lapsed player, so this outlives the reviewer who
@@ -313,6 +339,19 @@ class Store(object):
             "CREATE INDEX IF NOT EXISTS ix_kits_kind ON kits(guild_id, kind, created_at)")
         self._db.execute(
             "CREATE INDEX IF NOT EXISTS ix_tickets_kind ON tickets(guild_id, request_type)")
+
+        # v6: the claim log. The table itself comes from _SCHEMA, but a dispatch claimed by an
+        # older build is IN FLIGHT right now and has no row -- so it would deliver against an
+        # empty history, and the transcript would report "never claimed" for a kit somebody is
+        # holding as the upgrade happens. Backfilling the open claims is what makes the upgrade
+        # invisible to the people mid-delivery. Idempotent via NOT EXISTS, so re-running is
+        # harmless; delivered kits are left alone because their history is already closed and
+        # inventing a claim row for them would be a guess, not a record.
+        self._db.execute(
+            "INSERT INTO kit_claims(kit_id, actor_id, claimed_at) "
+            "SELECT id, claimed_by, COALESCE(claimed_at, created_at) FROM kits "
+            "WHERE claimed_by IS NOT NULL AND delivered_at IS NULL "
+            "  AND NOT EXISTS (SELECT 1 FROM kit_claims c WHERE c.kit_id = kits.id)")
 
     def adopt_legacy_rows(self, guild_id: int) -> int:
         """Stamp pre-multi-guild rows with the guild they must have belonged to.
@@ -533,22 +572,70 @@ class Store(object):
         """Claim a dispatch. Returns False if somebody already had it.
 
         A conditional UPDATE rather than check-then-set: two runners pressing Claim at the
-        same moment is the normal case, not a rare one, and the loser has to be told.
+        same moment is the normal case, not a rare one, and the loser has to be told. The
+        `kit_claims` row is written in the same transaction, so the history can never record a
+        claim that did not win, nor miss one that did.
+        """
+        now = _now()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            # `delivered_at IS NULL` matters as much as the claim check. A delivered kit
+            # normally still carries its claimer, so it cannot be re-claimed -- but a hand-back
+            # racing a delivery leaves one delivered AND unclaimed, and without this guard the
+            # next person to press Claim takes a kit that has already gone out. Their claim row
+            # could then never be closed, because every path that closes one refuses a
+            # delivered kit, so they would hold it in the ledger forever.
+            cur = self._db.execute(
+                "UPDATE kits SET claimed_by=?, claimed_at=? "
+                "WHERE id=? AND claimed_by IS NULL AND delivered_at IS NULL",
+                (int(claimed_by), now, int(kit_id)))
+            if cur.rowcount == 0:
+                self._db.execute("ROLLBACK")
+                return False
+            self._db.execute(
+                "INSERT INTO kit_claims(kit_id, actor_id, claimed_at) VALUES(?,?,?)",
+                (int(kit_id), int(claimed_by), now))
+            self._db.execute("COMMIT")
+            return True
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def _close_claim(self, kit_id: int, released_by: Optional[int], outcome: str) -> int:
+        """Close whichever claim row is still open on this kit. Returns how many it closed.
+
+        Called inside an open transaction by every path that ends a claim. Deliberately
+        forgiving about finding nothing: kits claimed before this table existed have no open
+        row, and refusing to deliver one of those would be a migration that breaks live work.
+        The count is returned so a caller can tell "closed a claim" from "there was none",
+        which is the difference between an honest history and a silent gap in it.
         """
         cur = self._db.execute(
-            "UPDATE kits SET claimed_by=?, claimed_at=? WHERE id=? AND claimed_by IS NULL",
-            (int(claimed_by), _now(), int(kit_id)))
-        return cur.rowcount > 0
+            "UPDATE kit_claims SET released_at=?, released_by=?, outcome=? "
+            "WHERE kit_id=? AND released_at IS NULL",
+            (_now(), None if released_by is None else int(released_by),
+             outcome, int(kit_id)))
+        return cur.rowcount
 
     def unclaim_kit(self, kit_id: int, actor_id: int) -> bool:
         """Hand a delivery back, but only by whoever took it."""
-        cur = self._db.execute(
-            "UPDATE kits SET claimed_by=NULL, claimed_at=NULL "
-            "WHERE id=? AND claimed_by=? AND delivered_at IS NULL",
-            (int(kit_id), int(actor_id)))
-        return cur.rowcount > 0
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._db.execute(
+                "UPDATE kits SET claimed_by=NULL, claimed_at=NULL "
+                "WHERE id=? AND claimed_by=? AND delivered_at IS NULL",
+                (int(kit_id), int(actor_id)))
+            if cur.rowcount == 0:
+                self._db.execute("ROLLBACK")
+                return False
+            self._close_claim(kit_id, actor_id, CLAIM_HANDED_BACK)
+            self._db.execute("COMMIT")
+            return True
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
-    def release_kit(self, kit_id: int) -> bool:
+    def release_kit(self, kit_id: int, released_by: Optional[int] = None) -> bool:
         """Force a delivery back into the pool regardless of who holds it.
 
         Separate from `unclaim_kit` rather than an `actor_id=None` special case: a reviewer
@@ -556,16 +643,90 @@ class Store(object):
         handing back their own, and a flag on one function would make the two indis-
         tinguishable at the call site.
         """
-        cur = self._db.execute(
-            "UPDATE kits SET claimed_by=NULL, claimed_at=NULL "
-            "WHERE id=? AND delivered_at IS NULL", (int(kit_id),))
-        return cur.rowcount > 0
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            # `claimed_by IS NOT NULL` matters: without it the UPDATE matches a kit nobody
+            # holds -- setting NULL to NULL -- so the call reported success for releasing
+            # nothing, and now would also write a "released" outcome into the claim log for a
+            # claim that never existed. Callers guard this today; the guard belongs here.
+            cur = self._db.execute(
+                "UPDATE kits SET claimed_by=NULL, claimed_at=NULL "
+                "WHERE id=? AND claimed_by IS NOT NULL AND delivered_at IS NULL",
+                (int(kit_id),))
+            if cur.rowcount == 0:
+                self._db.execute("ROLLBACK")
+                return False
+            self._close_claim(kit_id, released_by, CLAIM_RELEASED)
+            self._db.execute("COMMIT")
+            return True
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
-    def mark_delivered(self, kit_id: int) -> bool:
-        cur = self._db.execute(
-            "UPDATE kits SET delivered_at=? WHERE id=? AND delivered_at IS NULL",
-            (_now(), int(kit_id)))
-        return cur.rowcount > 0
+    def mark_delivered(self, kit_id: int, delivered_by: Optional[int] = None) -> bool:
+        """Record a kit as gone out, and make sure somebody is named for it.
+
+        `delivered_by` is who pressed the button. It is needed because a delivery does not
+        always have an open claim to close: a kit claimed by a build older than the claim log
+        has none, and a hand-back landing in the same instant as a delivery closes the only one
+        there was. Both used to leave a delivered kit whose history said nobody ever had it,
+        which is worse than a slightly approximate row -- so one is written.
+        """
+        now = _now()
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._db.execute(
+                "SELECT claimed_by, claimed_at FROM kits WHERE id=? AND delivered_at IS NULL",
+                (int(kit_id),)).fetchone()
+            if row is None:
+                self._db.execute("ROLLBACK")
+                return False
+            self._db.execute(
+                "UPDATE kits SET delivered_at=? WHERE id=? AND delivered_at IS NULL",
+                (now, int(kit_id)))
+            if not self._close_claim(kit_id, None, CLAIM_DELIVERED):
+                # Nothing open to close. Name whoever the kit says held it, falling back to
+                # whoever pressed Delivered, rather than recording a delivery by no one.
+                actor = row["claimed_by"] if row["claimed_by"] is not None else delivered_by
+                if actor is not None:
+                    self._db.execute(
+                        "INSERT INTO kit_claims(kit_id, actor_id, claimed_at, released_at, "
+                        "outcome) VALUES(?,?,?,?,?)",
+                        (int(kit_id), int(actor),
+                         int(row["claimed_at"] or now), now, CLAIM_DELIVERED))
+            self._db.execute("COMMIT")
+            return True
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def claims_for_kit(self, kit_id: int,
+                       guild_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Everyone who has ever held this dispatch, oldest first.
+
+        Takes a guild like every other lookup a dispatch number can reach: ids are globally
+        unique, so an unscoped read of a number a user typed or pressed is a cross-tenant hole.
+        `kit_claims` has no guild of its own, so the scope comes from the kit it belongs to.
+        """
+        if guild_id is None:
+            return list(self._db.execute(
+                "SELECT * FROM kit_claims WHERE kit_id=? ORDER BY id", (int(kit_id),)))
+        return list(self._db.execute(
+            "SELECT c.* FROM kit_claims c JOIN kits k ON k.id = c.kit_id "
+            "WHERE c.kit_id=? AND k.guild_id=? ORDER BY c.id",
+            (int(kit_id), int(guild_id))))
+
+    def claims_for_ticket(self, ticket_id: int,
+                          guild_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """The same, across every dispatch on a ticket -- what the transcript reports."""
+        if guild_id is None:
+            return list(self._db.execute(
+                "SELECT c.* FROM kit_claims c JOIN kits k ON k.id = c.kit_id "
+                "WHERE k.ticket_id=? ORDER BY c.id", (int(ticket_id),)))
+        return list(self._db.execute(
+            "SELECT c.* FROM kit_claims c JOIN kits k ON k.id = c.kit_id "
+            "WHERE k.ticket_id=? AND k.guild_id=? ORDER BY c.id",
+            (int(ticket_id), int(guild_id))))
 
     def get_kit(self, kit_id: int,
                 guild_id: Optional[int] = None) -> Optional[sqlite3.Row]:

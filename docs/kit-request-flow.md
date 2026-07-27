@@ -61,7 +61,16 @@ because for evidence an attempt that never reached a reviewer still shows somebo
 
 A rescue modal collects the Minecraft username and a free-text note; the funding modal collects
 the username, what the project is, what they need and roughly how big it is. On submit, a
-**private thread** hangs off the panel channel with the applicant and the reviewer role in it.
+**private thread** hangs off the panel channel, containing the applicant and the bot.
+
+**Nobody else is added to it.** Reviewers are *permitted* to read every ticket thread — Manage
+Threads on the panel channel is what grants that, and it is why the delivery role, which does
+not have it, cannot — but permission is not discovery: a private thread you are not a member of
+appears in no sidebar and no thread list, and the `<#id>` in the queue post is a mention that
+does not resolve for anyone outside the thread. The card therefore carries two doors, described
+in [reviewing.md](reviewing.md): **Read conversation**, which shows it to you and only you, and
+**Join applicant thread**, which puts you in it. Runners get in a third way — claiming a
+dispatch adds you to that ticket's thread, and only that one.
 
 The type travels with the ticket and shows up in four places — the queue post's title, the top
 of the card, the forum tag and the transcript. The **tag is a convenience only**, and
@@ -101,7 +110,10 @@ preference.
 
 Two buttons for the reviewer role on the queue post: **Approve** and **Decline**. Decline opens
 a modal for the reason, which is required — the reason is what makes the ledger useful a year
-later, and an optional field is an empty field.
+later, and an optional field is an empty field. **Read conversation** and **Join applicant
+thread** sit alongside them and stay on the card for the whole of its life: every lifecycle edit
+replaces the card's buttons wholesale, so anything not deliberately re-added disappears, and
+those two are worth more after a decision than before one.
 
 **The applicant is told the outcome, never the internal reason.** "Known alt of \<name\>" is
 written for whoever reads the ledger in a year, not for the person it describes. A decline
@@ -111,9 +123,19 @@ isn't permanent. A reviewer who wants to say more can type it in the thread.
 ## 4. Dispatch
 
 An approval **turns the same queue post into the dispatch**: retagged `approved`, a **Claim**
-button attached, the card left in place. Whoever presses Claim owns the delivery and is
-introduced in the applicant's thread. Marking delivered retags and archives the post —
-archived rather than locked, so a delivery that falls through afterwards can be reopened.
+button attached, the card left in place. Whoever presses Claim owns the delivery, is **added to
+the applicant's thread** and is introduced there by name — that add is the only way a
+delivery-only member can reach the conversation, since the delivery role has no Manage Threads.
+While it is held the post also carries **Hand back**, which returns it to the pool, removes the
+holder from the thread again and tells the applicant the delivery changed hands. Marking
+delivered retags and archives the post — archived rather than locked, so a delivery that falls
+through afterwards can be reopened.
+
+**Claims are recorded, not overwritten.** `kits.claimed_by` is current state and goes back to
+empty on a hand-back, so the ledger keeps an append-only claim log beside it: every runner who
+ever held a dispatch, when they took it, and how it ended — delivered, handed back, or taken off
+them by a reviewer. A kit that passed through three people and never arrived is exactly the one
+worth being able to read about later, and the transcript prints the whole chain.
 
 ## When a ticket is finished, its Discord footprint is deleted
 
