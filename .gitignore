@@ -22,7 +22,12 @@ collector.json
 
 # Kit app. The ledger holds chat (redacted, but still chat) plus every decision and its
 # reason, and the config holds guild/channel/role ids. The *.example.json files are the
-# committed templates; the real ones never are.
+# committed templates.
+#
+# lexicon.json stays ignored even though lexicon.example.json now ships populated: the
+# template is a starting point, and a server that tunes its own list -- adding spellings its
+# players actually use, or an `exceptions` entry for a place name that keeps matching -- must
+# not have that quietly overwritten by a pull.
 melonkit.json
 lexicon.json
 *.sqlite3

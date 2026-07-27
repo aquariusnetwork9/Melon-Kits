@@ -556,6 +556,20 @@ class CardCase(unittest.TestCase):
         for category in card_mod.CHAT_DENY:
             self.assertIn(category, card_mod._DECIDING_CATEGORIES, category)
 
+    def test_the_shipped_lexicon_is_not_empty(self):
+        """It shipped with two of its four lists empty for a long time, which made a fresh
+        install look like it was screening chat while reporting nothing. Asserted per category
+        so silently emptying one is a test failure rather than a quiet loss of coverage."""
+        lex = screening.Lexicon.load(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "lexicon.example.json"))
+        for category in ("off_game", "scam", "slur", "profanity"):
+            self.assertIn(category, lex.categories)
+        self.assertGreater(lex.term_count, 60, "the shipped lexicon has lost terms")
+        # An ordinary line must stay clean, or the shipped list flags everybody.
+        for innocent in ("anyone got a spare elytra", "gg wp nice base", "hello there friend"):
+            self.assertFalse(screening.scan(innocent, lex), innocent)
+
     def test_discussing_doxxing_is_not_a_hit(self):
         """The bare noun is out of the shipped lexicon on purpose: with chat able to deny, a
         term that fires on talking ABOUT the act would deny people for talking about it. The

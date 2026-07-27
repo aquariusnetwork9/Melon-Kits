@@ -43,7 +43,7 @@ You will need a bot application at
 |---|---|
 | [`kit-app/`](kit-app/) — Discord ticket → review → dispatch | **v1.0.0, live and exercised end to end.** 132 tests. Multi-server: invite it anywhere and run `/setup`. Deployed on ovh-2; a full request → review → approve → claim → deliver → archive lifecycle has been run through real Discord component presses |
 | [`chat-corpus/`](chat-corpus/) — passive 2b2t chat collector | **built and tested, not yet running unattended.** 249 tests, green on Windows/3.9 and Linux/3.13, verified against the live feed, both SPEC §13 crash-safety tests in place |
-| Chat screening lexicon | **scaffolded, empty.** The mechanism works and is tested; the terms need an afternoon of mining against the 2025 bulk dump |
+| Chat screening lexicon | **populated and shipping.** 90 terms across four categories, mined from the 2025 bulk dump with `tools/mine.py` and tuned against it — `off_game` carries directed forms only, and `profanity` is counted but never allowed to move a recommendation. A fresh `install.sh` gets working screening from the first ticket |
 
 **No real applicant has used it yet** — every ticket so far has been a test on a test server.
 Two things in the panel copy are stated intent rather than enforced behaviour: the 24–48 hour
