@@ -2263,6 +2263,17 @@ def _adoption_warnings(channel: Any, me: Any, *, public: bool) -> list:
         out.append("%s lets everyone post, so the panel will get pushed up the channel as "
                    "people talk. It stays pinned, and `/panel` re-posts it whenever you want "
                    "it back at the bottom." % channel.mention)
+    # Talking inside a thread is governed by the PARENT channel. Applicants hold no special
+    # role, and the delivery team gets no overwrite here on purpose, so both of them speak in
+    # ticket threads on @everyone's permissions. Without this bit a ticket opens, the receipt
+    # posts, the runner is added on claim -- and neither of them can type a word, which reads
+    # as the bot being broken rather than as a channel setting.
+    if public and not channel.permissions_for(
+            channel.guild.default_role).send_messages_in_threads:
+        out.append("%s does not let @everyone **send messages in threads**, so applicants and "
+                   "anyone delivering to them will be unable to talk in their own ticket "
+                   "thread. Everything else works, which makes this a confusing one to "
+                   "diagnose later - worth allowing before you go live." % channel.mention)
     # An announcement channel is a TextChannel as far as the picker is concerned, but it only
     # supports announcement threads, which are public. So a ticket thread there would be
     # readable by everyone who can see the channel -- and the whole design rests on the
