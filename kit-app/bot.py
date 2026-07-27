@@ -1957,18 +1957,83 @@ class KitBot(discord.Client):
                 LOG.exception("purge sweep failed")
             await asyncio.sleep(1800)
 
-    async def _notify_thread(self, ticket: Any, text: str,
-                             view: Optional[discord.ui.View] = None) -> None:
+    async def _resolve_thread(self, ticket: Any) -> Optional[Any]:
+        """The applicant's ticket thread, from cache or failing that over REST.
+
+        `get_channel` only knows threads this process has seen. A restart between the ticket
+        opening and the button press leaves the cache without it, and an archived thread was
+        never in it -- so a cache-only lookup fails silently and at random. Everything that
+        needs the thread goes through here for that reason.
+        """
         thread_id = ticket["thread_id"]
         if not thread_id:
+            return None
+        found = self.get_channel(int(thread_id))
+        if found is None:
+            try:
+                found = await self.fetch_channel(int(thread_id))
+            except discord.HTTPException as exc:
+                LOG.warning("ticket thread=%s could not be resolved status=%s",
+                            thread_id, getattr(exc, "status", "?"))
+                return None
+        return found
+
+    async def _admit_to_thread(self, ticket: Any, member: Any) -> bool:
+        """Put whoever claimed the delivery into the applicant's thread.
+
+        Ticket threads are private and created `invitable=False`, so nobody wanders in.
+        Reviewers can already read every one of them -- not because they are added, but because
+        Manage Threads on the parent channel grants exactly that. The delivery team is not given
+        Manage Threads on purpose: a runner has no business reading tickets they are not
+        delivering. Being added on claim is therefore the *only* route a delivery-only member
+        has into the conversation, and the flow already promises them one -- the receipt tells
+        the applicant that whoever delivers will message them here, and `handle_coords_open`
+        below is written assuming the runner is in the thread.
+        """
+        thread = await self._resolve_thread(ticket)
+        if thread is None:
+            return False
+        try:
+            await thread.add_user(member)
+            LOG.info("runner %s admitted to ticket thread ticket=%s",
+                     getattr(member, "id", "?"), ticket["id"])
+            return True
+        except discord.HTTPException as exc:
+            # Wants Manage Threads on the parent channel. Never fail the claim over it: the
+            # meeting point is echoed onto the queue post as well, so the delivery still
+            # happens -- the runner just cannot talk to the applicant.
+            LOG.warning("could not admit %s to ticket thread=%s status=%s",
+                        getattr(member, "id", "?"), ticket["thread_id"],
+                        getattr(exc, "status", "?"))
+            return False
+
+    async def _revoke_from_thread(self, ticket: Any, user_id: int) -> None:
+        """Handing a delivery back takes the conversation with it."""
+        # Never the applicant. `may_claim` is open to everybody when no delivery role is
+        # configured, so the holder genuinely can be the applicant -- and removing them would
+        # evict them from their own ticket, which is the worst outcome in this whole file.
+        if int(ticket["discord_user_id"]) == int(user_id):
             return
-        channel = self.get_channel(int(thread_id))
+        thread = await self._resolve_thread(ticket)
+        if thread is None:
+            return
+        try:
+            await thread.remove_user(discord.Object(id=int(user_id)))
+        except discord.HTTPException as exc:
+            # Harmless to leave them in: they can read a ticket they were assigned. Reviewers
+            # keep access through Manage Threads regardless of this call.
+            LOG.warning("could not remove %s from ticket thread=%s status=%s",
+                        user_id, ticket["thread_id"], getattr(exc, "status", "?"))
+
+    async def _notify_thread(self, ticket: Any, text: str,
+                             view: Optional[discord.ui.View] = None) -> None:
+        channel = await self._resolve_thread(ticket)
         if channel is None:
             return
         try:
             await channel.send(text, view=view) if view else await channel.send(text)
         except discord.HTTPException:
-            LOG.warning("could not post to thread=%s", thread_id)
+            LOG.warning("could not post to thread=%s", ticket["thread_id"])
 
     # -------------------------------------------------------- the meeting point
 
@@ -2106,8 +2171,10 @@ class KitBot(discord.Client):
                     % (kit_id, interaction.user.mention, where),
             view=view, allowed_mentions=discord.AllowedMentions.none())
         await _set_queue_state(interaction.channel, "claimed")
-        # Tell the applicant who is coming, in their own thread.
+        # Tell the applicant who is coming, in their own thread -- after putting the runner in
+        # it, so the introduction lands somewhere they can actually answer.
         if ticket is not None:
+            await self._admit_to_thread(ticket, interaction.user)
             await self._notify_thread(
                 ticket, "%s has picked up this delivery and will sort out a meeting "
                         "point with you here." % interaction.user.mention)
@@ -2841,6 +2908,12 @@ def register_commands(app: KitBot) -> None:
         ticket = (app.store.get_ticket(int(row["ticket_id"]), interaction.guild_id)
                   if row["ticket_id"] else None)
         if ticket is not None:
+            # The applicant was told by name who was coming. Say that it changed before the
+            # person quietly disappears from their thread.
+            await app._revoke_from_thread(ticket, holder)
+            await app._notify_thread(
+                ticket, "That delivery went back to the pool - someone else will pick it up. "
+                        "Your request is still approved.")
             qthread, qmsg = await app._queue_post(ticket)
             if qmsg is not None:
                 view = discord.ui.View(timeout=None)
