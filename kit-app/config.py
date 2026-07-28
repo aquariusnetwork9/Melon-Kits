@@ -202,7 +202,12 @@ def _read_json(path: str) -> Dict[str, Any]:
     if not raw.strip():
         return {}
     try:
-        doc = json.loads(raw.decode("utf-8"))
+        # utf-8-sig, not utf-8: it strips a leading byte-order mark if there is one and is
+        # identical otherwise. Windows puts them everywhere -- Notepad's "UTF-8 with BOM",
+        # and PowerShell 5.1's `Set-Content -Encoding UTF8`, which writes one where
+        # PowerShell 7 does not. Rejecting the file for three invisible bytes means an editor
+        # nobody thought about breaks the bot with an error about column 1.
+        doc = json.loads(raw.decode("utf-8-sig"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ConfigError("config %s is not valid UTF-8 JSON: %s" % (path, exc))
     if not isinstance(doc, dict):
