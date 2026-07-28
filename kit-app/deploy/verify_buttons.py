@@ -82,7 +82,6 @@ async def drive(cfg, token):
             awaiting = discord.ui.View(timeout=None)
             awaiting.add_item(bot_mod.ApproveButton(tid))
             awaiting.add_item(bot_mod.DeclineButton(tid))
-            awaiting.add_item(bot_mod.ViewConversationButton(tid))
             awaiting.add_item(bot_mod.JoinThreadButton(tid))
 
             approved = discord.ui.View(timeout=None)
@@ -99,19 +98,19 @@ async def drive(cfg, token):
             msg = await post.fetch_message(post.id)
             got = labels(msg)
             check("awaiting review card",
-                  {"Approve", "Decline", "Read conversation", "Join applicant thread"} <= set(got), str(got))
+                  {"Approve", "Decline", "Join applicant thread"} <= set(got), str(got))
 
             partial = post.get_partial_message(post.id)
 
             await partial.edit(content="approved", view=staged(approved))
             got = labels(await post.fetch_message(post.id))
             check("approved card keeps Claim + Join",
-                  {"Claim this delivery", "Read conversation", "Join applicant thread"} <= set(got), str(got))
+                  {"Claim this delivery", "Join applicant thread"} <= set(got), str(got))
 
             await partial.edit(content="claimed", view=staged(claimed))
             got = labels(await post.fetch_message(post.id))
             check("claimed card has Delivered + Hand back + Join",
-                  {"Mark delivered", "Hand back", "Read conversation", "Join applicant thread"} <= set(got),
+                  {"Mark delivered", "Hand back", "Join applicant thread"} <= set(got),
                   str(got))
 
             back = discord.ui.View(timeout=None)
@@ -123,8 +122,7 @@ async def drive(cfg, token):
 
             await partial.edit(content="delivered", view=staged(None))
             got = labels(await post.fetch_message(post.id))
-            check("finished card still offers Read + Join",
-                  {"Read conversation", "Join applicant thread"} <= set(got), str(got))
+            check("finished card still offers Join", "Join applicant thread" in got, str(got))
 
             # `_post_queue_card` no longer hand-maintains its own copy of the trailing
             # buttons; it calls `_with_extras` like every later edit does. That substitution
@@ -136,9 +134,8 @@ async def drive(cfg, token):
                                            "flagged": False}])
             at_post = shim._with_extras(None, gid, fresh)
             got = [type(i).__name__ for i in (at_post.children if at_post else [])]
-            check("card-post state yields chat + both doors",
-                  {"ChatHistoryButton", "ViewConversationButton",
-                   "JoinThreadButton"} == set(got), str(got))
+            check("card-post state yields chat + the thread door",
+                  {"ChatHistoryButton", "JoinThreadButton"} == set(got), str(got))
             st._db.execute("DELETE FROM shown_chats WHERE ticket_id=?", (fresh,))
             st._db.execute("DELETE FROM tickets WHERE id=?", (fresh,))
 
@@ -148,8 +145,7 @@ async def drive(cfg, token):
             got_view = shim._with_extras(None, gid, tid)
             check("no thread -> no thread buttons",
                   got_view is None or not any(
-                      isinstance(i, (bot_mod.JoinThreadButton,
-                                     bot_mod.ViewConversationButton))
+                      isinstance(i, bot_mod.JoinThreadButton)
                       for i in got_view.children))
         except Exception as exc:  # noqa: BLE001
             check("run completed", False, "%s: %s" % (type(exc).__name__, exc))

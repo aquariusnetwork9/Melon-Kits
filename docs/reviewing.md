@@ -186,11 +186,14 @@ If you want to say something to them, type it in their thread.
 The card shows what they wrote when they filed. The conversation that happens afterwards lives
 in their private thread, and two buttons on the queue post reach it:
 
-- **Read conversation** shows you the thread, visible only to you. Nothing is posted, and the
-  applicant is not told. This is the one to use for reviewing.
-- **Join applicant thread** puts you in it so you can talk. Adding somebody to a thread posts a
-  system message, **so the applicant can see that you joined** — which is fine when you have a
-  question for them, and needless when you only want to read.
+When a ticket opens, the bot **pings the reviewer role inside the applicant's thread**. That
+notification opens the thread for you — Manage Threads on the parent channel is what lets you
+in — and opening it makes you a member, so you are in every ticket from the start without
+anyone having to add you.
+
+- **Join applicant thread**, on the queue card, is the way in if you dismissed the ping or came
+  to the ticket late. Adding somebody to a thread posts a system message, so the applicant can
+  see that you joined.
 
 Neither is offered to the delivery team. A runner joins a thread by claiming its dispatch, which
 is the one ticket they are actually working.

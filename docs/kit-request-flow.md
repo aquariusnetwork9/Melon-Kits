@@ -69,19 +69,31 @@ means hanging them off a channel that lives in one. `/ticketchannel #public-tick
 Server) does that, leaving the panel wherever people find it. The command refuses rather than
 half-applying if the channel would not work, and the check that matters most is the least
 obvious: **reviewers read ticket threads through Manage Threads on the parent channel**, not by
-being added, so a new parent without that permission silently breaks *Read conversation* and
-*Join applicant thread*. It also verifies `@everyone` can view the channel and send in threads —
+being added, so a new parent without that permission silently breaks *Join applicant thread*
+and the reviewer ping's click-through. It also verifies `@everyone` can view the channel and
+send in threads —
 an applicant has no special role, and a thread is only visible to somebody who can see the
 channel it hangs off, so a locked-down channel hides people's own tickets from them.
 
 **Nobody else is added to it.** Reviewers are *permitted* to read every ticket thread — Manage
-Threads on the panel channel is what grants that, and it is why the delivery role, which does
+Threads on the parent channel is what grants that, and it is why the delivery role, which does
 not have it, cannot — but permission is not discovery: a private thread you are not a member of
 appears in no sidebar and no thread list, and the `<#id>` in the queue post is a mention that
-does not resolve for anyone outside the thread. The card therefore carries two doors, described
-in [reviewing.md](reviewing.md): **Read conversation**, which shows it to you and only you, and
-**Join applicant thread**, which puts you in it. Runners get in a third way — claiming a
-dispatch adds you to that ticket's thread, and only that one.
+does not resolve for anyone outside the thread.
+
+So the bot **pings the reviewer role inside the thread**, once, straight after the receipt. That
+notification opens the thread for anyone holding Manage Threads, and opening it makes them a
+member — which is why reviewers are effectively in every ticket from the start without being
+added to it.
+
+Adding them for real was considered and rejected. Every `add_user` posts a visible
+`recipient_add` system message, so somebody who has just been bedtrapped would open their ticket
+to a roll-call of staff names before a single human said hello; and enumerating a role's members
+needs the privileged members intent, which would let a dashboard toggle stop the bot booting.
+
+The card also carries **Join applicant thread**, for a reviewer who dismissed the ping or comes
+to the ticket late. Runners get in a third way — claiming a dispatch adds them to that ticket's
+thread, and only that one.
 
 The type travels with the ticket and shows up in four places — the queue post's title, the top
 of the card, the forum tag and the transcript. The **tag is a convenience only**, and
@@ -121,8 +133,8 @@ preference.
 
 Two buttons for the reviewer role on the queue post: **Approve** and **Decline**. Decline opens
 a modal for the reason, which is required — the reason is what makes the ledger useful a year
-later, and an optional field is an empty field. **Read conversation** and **Join applicant
-thread** sit alongside them and stay on the card for the whole of its life: every lifecycle edit
+later, and an optional field is an empty field. **Join applicant thread** sits alongside them
+and stays on the card for the whole of its life: every lifecycle edit
 replaces the card's buttons wholesale, so anything not deliberately re-added disappears, and
 those two are worth more after a decision than before one.
 

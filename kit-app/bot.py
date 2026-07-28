@@ -830,10 +830,13 @@ class ViewConversationButton(discord.ui.DynamicItem[discord.ui.Button],
                              template=r"melonkit:convo:(?P<ticket>\d+)"):
     """Read the applicant's side of the ticket without entering it.
 
-    The default way to look, and the reason it exists rather than leaving Join to do both
-    jobs: adding somebody to a thread posts a `recipient_add` system message the applicant can
-    see, so joining is an announcement. Most reviewing is reading, and a reviewer should not
-    have to declare themselves to the person they are deciding about in order to do it.
+    RETIRED -- no new card carries this button. It existed because reviewers had no route into
+    a thread they were never added to; the reviewer ping posted at ticket creation now puts
+    them in it, and reading the conversation in place beats an ephemeral dump of it.
+
+    Kept, and still registered, purely so the button on cards posted BEFORE the change keeps
+    working. Deleting the class would turn every one of those into an interaction that fails in
+    front of a reviewer for no reason. Safe to remove once no open ticket predates it.
 
     The reply is ephemeral, so nothing about it reaches the applicant or the queue.
     """
@@ -1074,7 +1077,11 @@ class KitBot(discord.Client):
     async def setup_hook(self) -> None:
         self.add_view(PanelView())
         for item in (ApproveButton, DeclineButton, ClaimButton, DeliveredButton,
-                     UnclaimButton, JoinThreadButton, ViewConversationButton,
+                     UnclaimButton, JoinThreadButton,
+                     # Retired, still registered: cards posted before it was dropped still
+                     # carry the button, and an unregistered custom_id fails in the reviewer's
+                     # face rather than doing nothing.
+                     ViewConversationButton,
                      ChatHistoryButton, ChatPageButton, ChatFileButton, CoordsButton):
             self.add_dynamic_items(item)
         self.tree.on_error = self._on_app_command_error
@@ -1369,6 +1376,7 @@ class KitBot(discord.Client):
                     embed=help_embed)
             except discord.HTTPException:
                 LOG.warning("could not post receipt to applicant thread ticket=%d", ticket_id)
+            await self._summon_reviewers(g, thread, ticket_id)
 
         posted = await self._post_queue_card(g, ticket_id, canonical, user, built,
                                             thread, gid)
@@ -1527,9 +1535,11 @@ class KitBot(discord.Client):
         ticket = self.store.get_ticket(ticket_id, int(guild_id))
         if ticket is not None and ticket["thread_id"]:
             view = view or discord.ui.View(timeout=None)
-            # Reading first, joining second: reading is what most reviews need, and it is the
-            # one of the two the applicant cannot see happening.
-            view.add_item(ViewConversationButton(ticket_id))
+            # No Read-conversation button any more. It existed because reviewers had no route
+            # into a thread they were never added to -- but the reviewer ping posted at ticket
+            # creation now puts them there, and reading the conversation in place beats an
+            # ephemeral dump of it. Its other purpose, reading without announcing yourself, is
+            # moot once the role is pinged in every thread from the start.
             view.add_item(JoinThreadButton(ticket_id))
         return view
 
@@ -2168,6 +2178,38 @@ class KitBot(discord.Client):
                 # Never let a sweep kill the loop: this runs unattended for months.
                 LOG.exception("purge sweep failed")
             await asyncio.sleep(1800)
+
+    async def _summon_reviewers(self, g: Dict[str, Any], thread: Any,
+                                ticket_id: int) -> None:
+        """Ping the reviewer role inside the applicant's thread.
+
+        This is what puts reviewers *in* the ticket from the start without adding them to it.
+        The alternative -- enumerating the role and calling `add_user` for each holder -- looks
+        equivalent and is not, for two reasons. Every add posts a visible `recipient_add`
+        system message, so somebody who has just been bedtrapped would open their ticket to a
+        roll-call of eight staff names before a single human said hello. And enumerating a
+        role's members needs the privileged members intent, which would mean a dashboard toggle
+        could stop the bot booting.
+
+        A ping costs one message, needs no intent, and lands in the same place: reviewers hold
+        Manage Threads on the parent channel, so the notification opens the thread for them and
+        opening it makes them a member anyway.
+
+        Deliberately after the receipt, so the applicant's first view of their ticket is the
+        thing written for them rather than a mention aimed at somebody else.
+        """
+        ping = " ".join("<@&%d>" % rid for rid in role_ids(g, "reviewer_role_id"))
+        if not ping or thread is None:
+            return                       # no reviewer role configured: nobody to summon
+        try:
+            await thread.send(
+                "%s - request **#%d** is open for review." % (ping, ticket_id),
+                allowed_mentions=discord.AllowedMentions(roles=True))
+        except discord.HTTPException as exc:
+            # Never fail a ticket over a notification. The queue card pings the same role and
+            # is the surface decisions are actually made on, so the request still gets seen.
+            LOG.warning("could not summon reviewers into thread ticket=%d status=%s",
+                        ticket_id, getattr(exc, "status", "?"))
 
     async def _resolve_thread(self, ticket: Any) -> Optional[Any]:
         """The applicant's ticket thread, from cache or failing that over REST.
