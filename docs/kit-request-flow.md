@@ -81,7 +81,10 @@ not have it, cannot — but permission is not discovery: a private thread you ar
 appears in no sidebar and no thread list, and the `<#id>` in the queue post is a mention that
 does not resolve for anyone outside the thread.
 
-So the bot **pings the reviewer role inside the thread**, once, straight after the receipt. That
+So the bot **pings the reviewer role inside the thread**, once, straight after the receipt.
+That ping is the *only* one a ticket fires — the queue card deliberately does not ping, because
+two notifications for the same event is how a notification stops being read. The card lives in a
+staff-only channel, so its own unread marker is the discovery mechanism there. That
 notification opens the thread for anyone holding Manage Threads, and opening it makes them a
 member — which is why reviewers are effectively in every ticket from the start without being
 added to it.

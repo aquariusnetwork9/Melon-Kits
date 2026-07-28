@@ -1430,14 +1430,18 @@ class KitBot(discord.Client):
         # is a mention that does not resolve for anybody outside a private thread.
         view = self._with_extras(view, ticket_guild_id, ticket_id) or view
 
-        # Every reviewer role, not just the first. A server that configured three of them did so
-        # because all three review, and pinging one would quietly make the other two optional.
-        ping = " ".join("<@&%d>" % rid for rid in role_ids(g, "reviewer_role_id"))
-        header = "%sTicket #%d - **%s** requested by %s%s" % (
-            ping + " " if ping else "", ticket_id,
-            store_mod.KIND_LABEL[kind], user.mention,
+        # No reviewer ping here. It used to be the only notification, but the thread summon
+        # covers that now, and firing both meant two pings per ticket for the same event --
+        # which is how a notification stops being read. This card lives in a staff-only
+        # channel, so its own unread marker is the discovery mechanism.
+        #
+        # `roles=False` on purpose rather than just dropping the text: it makes a role mention
+        # in anything interpolated below -- a name, a note somebody typed -- incapable of
+        # pinging the whole team from a card.
+        header = "Ticket #%d - **%s** requested by %s%s" % (
+            ticket_id, store_mod.KIND_LABEL[kind], user.mention,
             "\nApplicant thread: <#%d>" % thread.id if thread is not None else "")
-        mentions = discord.AllowedMentions(roles=True, users=True)
+        mentions = discord.AllowedMentions(roles=False, users=True)
 
         try:
             if isinstance(channel, discord.ForumChannel):
