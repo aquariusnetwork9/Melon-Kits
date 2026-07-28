@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import sys
+import time
 import traceback
 from typing import Any, Dict, Optional, Union
 
@@ -884,6 +885,50 @@ class JoinThreadButton(discord.ui.DynamicItem[discord.ui.Button],
     async def callback(self, interaction: discord.Interaction) -> None:
         app: KitBot = interaction.client            # type: ignore[assignment]
         await app.handle_join_thread(interaction, self.ticket_id)
+
+
+def build_info() -> Dict[str, str]:
+    """Which commit is actually running, read straight from .git.
+
+    The question this answers is "did my update take effect", and the honest answer has to come
+    from the process rather than from whatever the checkout says now -- those two differ for
+    exactly as long as somebody has pulled and not restarted, which is the window in which
+    people get confused. Captured at import, so it reports the code that was LOADED.
+
+    Plain file reads rather than shelling out to git: a subprocess at startup depends on git
+    being installed and on the working directory, and neither is guaranteed on a Windows host
+    running this from a console.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    git = os.path.join(root, ".git")
+    out = {"commit": "unknown", "branch": "unknown"}
+    try:
+        with open(os.path.join(git, "HEAD"), "r", encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if not head.startswith("ref:"):
+            return {"commit": head[:12], "branch": "detached"}
+        ref = head[4:].strip()
+        out["branch"] = ref.rsplit("/", 1)[-1]
+        loose = os.path.join(git, *ref.split("/"))
+        if os.path.exists(loose):
+            with open(loose, "r", encoding="utf-8") as fh:
+                out["commit"] = fh.read().strip()[:12]
+        else:
+            # A freshly cloned or gc'd repo keeps refs in packed-refs, not as loose files.
+            packed = os.path.join(git, "packed-refs")
+            if os.path.exists(packed):
+                with open(packed, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.rstrip().endswith(" " + ref):
+                            out["commit"] = line.split()[0][:12]
+                            break
+    except OSError:
+        pass
+    return out
+
+
+BUILD = build_info()
+STARTED_AT = time.time()
 
 
 async def _safe_followup(interaction: discord.Interaction, text: str) -> None:
@@ -3232,6 +3277,33 @@ def register_commands(app: KitBot) -> None:
         the button cannot serve, which is a reviewer releasing a claim from somewhere other
         than the post."""
         await app.handle_unclaim(interaction, kit)
+
+    @tree.command(name="version",
+                  description="What code is running, and is the checkout ahead of it?")
+    async def version(interaction: discord.Interaction) -> None:
+        """Answers "did my update actually take effect".
+
+        A pull changes the checkout; only a restart changes what is running. Those two differ
+        for exactly as long as somebody has done the first and not the second, and nothing in
+        Discord otherwise shows that gap -- so this compares the commit the PROCESS loaded
+        against the commit on disk right now, and says plainly when a restart is owed.
+        """
+        if not is_reviewer(interaction.user, app.gcfg(interaction.guild_id)):
+            await interaction.response.send_message(
+                "Only reviewers can check the build.", ephemeral=True)
+            return
+        on_disk = build_info()
+        lines = [
+            "**Running** `%s` on `%s`" % (BUILD["commit"], BUILD["branch"]),
+            "**Uptime** %s" % card_mod.duration(int(time.time() - STARTED_AT)),
+            "**Ledger schema** %d" % store_mod.SCHEMA_VERSION,
+        ]
+        if on_disk["commit"] not in (BUILD["commit"], "unknown"):
+            lines += ["", ":warning: The checkout is at `%s` - **restart to pick it up**."
+                      % on_disk["commit"]]
+        else:
+            lines.append("The checkout matches - nothing pending.")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @tree.command(name="ledger", description="Kit history and flags for an account.")
     async def ledger(interaction: discord.Interaction, mc_name: str) -> None:
