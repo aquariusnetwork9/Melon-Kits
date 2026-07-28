@@ -989,6 +989,11 @@ class KitBot(discord.Client):
         """
         merged: Dict[str, Any] = {
             "panel_channel_id": 0,
+            # Where applicant threads are created. Threads attach to a CHANNEL, never to a
+            # category, so "put the tickets in the help category" means "hang them off a
+            # channel that lives in it". Defaults to 0 = the panel channel, which is what
+            # every existing install has been doing, so this changes nothing until it is set.
+            "thread_channel_id": 0,
             "queue_channel_id": 0,
             "transcript_channel_id": 0,
             "reviewer_role_id": 0,
@@ -1641,11 +1646,18 @@ class KitBot(discord.Client):
                            ticket_id: int,
                            mc_name: str) -> Optional[discord.Thread]:
         channel = interaction.channel
-        panel_id = int(g.get("panel_channel_id") or 0)
-        if panel_id:
-            found = self.get_channel(panel_id)
+        # A dedicated tickets channel if one is configured, else the panel channel. Threads
+        # hang off whichever channel makes them, so this is the only way to have the panel
+        # live in a welcome area while the tickets themselves sit in a support category --
+        # a category cannot own a thread.
+        for key in ("thread_channel_id", "panel_channel_id"):
+            cid = int(g.get(key) or 0)
+            if not cid:
+                continue
+            found = self.get_channel(cid)
             if isinstance(found, discord.TextChannel):
                 channel = found
+                break
         if not isinstance(channel, discord.TextChannel):
             return None
         try:
@@ -3090,6 +3102,98 @@ def register_commands(app: KitBot) -> None:
             "Panel posted - pin it. The button keeps working indefinitely, so it only needs "
             "posting once; running /panel again edits it in place rather than adding another.",
             ephemeral=True)
+
+    @tree.command(name="ticketchannel",
+                  description="Where new ticket threads are created (default: the panel "
+                              "channel).")
+    @app_commands.describe(
+        channel="Text channel to hang ticket threads off - put it in whatever category you "
+                "like. Leave empty to go back to the panel channel.")
+    async def ticketchannel(interaction: discord.Interaction,
+                            channel: Optional[discord.TextChannel] = None) -> None:
+        """Separate where people ASK from where their ticket LIVES.
+
+        A thread belongs to a channel; Discord has no such thing as a thread in a category. So
+        moving tickets into a support category means pointing them at a channel that sits in
+        one, while the panel stays wherever people find it.
+        """
+        gid = interaction.guild_id
+        if gid is None:
+            await interaction.response.send_message(
+                "Run this in the server you're configuring.", ephemeral=True)
+            return
+        # Manage Server, same gate as /setup: this is server layout, not a review decision.
+        if not is_admin(interaction.user):
+            await interaction.response.send_message(
+                "You need **Manage Server** to change where tickets are created.",
+                ephemeral=True)
+            return
+        if channel is None:
+            app.store.set_guild_config(gid, {"thread_channel_id": 0})
+            await interaction.response.send_message(
+                "Ticket threads will be created in the panel channel again. Existing threads "
+                "stay where they are.", ephemeral=True)
+            return
+
+        g = app.gcfg(gid)
+        me = interaction.guild.me
+        mine = channel.permissions_for(me)
+        everyone = channel.permissions_for(interaction.guild.default_role)
+        problems, notes = [], []
+
+        # An announcement channel only supports announcement threads, which are public -- and
+        # the whole design rests on the applicant's thread being private.
+        if getattr(channel, "is_news", None) and channel.is_news():
+            problems.append("%s is an **announcement** channel, which cannot have private "
+                            "threads." % channel.mention)
+        for bit, why in (("view_channel", "I can't see it"),
+                         ("create_private_threads", "I can't open a ticket thread there"),
+                         ("send_messages_in_threads", "I can't post the receipt"),
+                         ("manage_threads", "I can't add runners or archive finished tickets")):
+            if not getattr(mine, bit, False):
+                problems.append("I'm missing `%s` in %s - %s"
+                                % (bit.replace("_", " "), channel.mention, why))
+        # The applicant has no special role, so they see and speak on @everyone's permissions.
+        # A thread is only visible to someone who can see its PARENT, so a locked-down channel
+        # hides people's own tickets from them.
+        if not everyone.view_channel:
+            problems.append("@everyone can't **view** %s, so applicants won't be able to see "
+                            "their own ticket thread - a thread is only visible to someone who "
+                            "can see the channel it hangs off." % channel.mention)
+        if not everyone.send_messages_in_threads:
+            problems.append("@everyone can't **send messages in threads** in %s, so applicants "
+                            "won't be able to reply in their own ticket." % channel.mention)
+
+        # The one that silently breaks reviewing: reviewers read ticket threads through Manage
+        # Threads on the PARENT channel, not by being added. Move the parent without moving
+        # that, and Read conversation and Join stop working with nothing in the log.
+        blind = [interaction.guild.get_role(int(rid)) for rid in role_ids(g, "reviewer_role_id")]
+        blind = [r for r in blind if r and not channel.permissions_for(r).manage_threads]
+        if blind:
+            problems.append(
+                "%s can't **Manage Threads** in %s. Reviewers see ticket threads through that "
+                "permission on the channel the threads hang off - without it, **Read "
+                "conversation** and **Join applicant thread** will stop working."
+                % (", ".join(r.mention for r in blind), channel.mention))
+        if everyone.send_messages:
+            notes.append("@everyone can post directly in %s. Harmless, but a quiet channel "
+                         "makes people's tickets easier to find." % channel.mention)
+
+        if problems:
+            await interaction.response.send_message(
+                "**Not changing anything yet** - fix these first, then run this again:\n%s"
+                % "\n".join("- " + p for p in problems),
+                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+            return
+
+        app.store.set_guild_config(gid, {"thread_channel_id": channel.id})
+        LOG.info("thread channel set guild=%s channel=%s", gid, channel.id)
+        msg = ("New ticket threads will be created in %s. The panel stays where it is, and "
+               "existing threads don't move." % channel.mention)
+        if notes:
+            msg += "\n\n" + "\n".join("- " + n for n in notes)
+        await interaction.response.send_message(
+            msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     @tree.command(name="flag", description="Flag an account for future reviewers.")
     @app_commands.describe(mc_name="Minecraft username",

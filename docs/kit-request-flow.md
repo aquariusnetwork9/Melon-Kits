@@ -63,6 +63,17 @@ A rescue modal collects the Minecraft username and a free-text note; the funding
 the username, what the project is, what they need and roughly how big it is. On submit, a
 **private thread** hangs off the panel channel, containing the applicant and the bot.
 
+**Putting tickets somewhere other than the panel channel.** A thread belongs to a *channel* —
+Discord has no such thing as a thread in a category — so "keep tickets in the support category"
+means hanging them off a channel that lives in one. `/ticketchannel #public-tickets` (Manage
+Server) does that, leaving the panel wherever people find it. The command refuses rather than
+half-applying if the channel would not work, and the check that matters most is the least
+obvious: **reviewers read ticket threads through Manage Threads on the parent channel**, not by
+being added, so a new parent without that permission silently breaks *Read conversation* and
+*Join applicant thread*. It also verifies `@everyone` can view the channel and send in threads —
+an applicant has no special role, and a thread is only visible to somebody who can see the
+channel it hangs off, so a locked-down channel hides people's own tickets from them.
+
 **Nobody else is added to it.** Reviewers are *permitted* to read every ticket thread — Manage
 Threads on the panel channel is what grants that, and it is why the delivery role, which does
 not have it, cannot — but permission is not discovery: a private thread you are not a member of
