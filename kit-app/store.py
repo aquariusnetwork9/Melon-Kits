@@ -24,7 +24,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 STATUS_OPEN = "open"
 STATUS_APPROVED = "approved"
@@ -140,6 +140,22 @@ CREATE TABLE IF NOT EXISTS kit_claims (
     outcome     TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_kit_claims_kit ON kit_claims(kit_id);
+
+-- Provenance for history imported from somewhere other than this bot -- the Ticket Tool
+-- transcripts that predate it. Keyed on the SOURCE message id, which is what makes the
+-- importer safe to re-run: a second pass finds the row and skips it. Without this a re-run
+-- would double every historical grant, and a double-counted kit is a real person wrongly
+-- refused for having "already had two".
+CREATE TABLE IF NOT EXISTS imported_tickets (
+    source_message_id INTEGER PRIMARY KEY,
+    guild_id          INTEGER NOT NULL,
+    source            TEXT    NOT NULL,     -- 'tickettool' | 'role'
+    ticket_id         INTEGER REFERENCES tickets(id),
+    kit_id            INTEGER REFERENCES kits(id),
+    mc_name           TEXT,
+    imported_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_imported_guild ON imported_tickets(guild_id, source);
 
 -- Reviewer-maintained flags. 'Known alt' is a list, never a computation: nothing
 -- distinguishes an alt from a returning lapsed player, so this outlives the reviewer who
@@ -715,6 +731,56 @@ class Store(object):
             "SELECT c.* FROM kit_claims c JOIN kits k ON k.id = c.kit_id "
             "WHERE c.kit_id=? AND k.guild_id=? ORDER BY c.id",
             (int(kit_id), int(guild_id))))
+
+    # ------------------------------------------------------------------ imports
+
+    def already_imported(self, source_message_id: int) -> Optional[sqlite3.Row]:
+        return self._db.execute(
+            "SELECT * FROM imported_tickets WHERE source_message_id=?",
+            (int(source_message_id),)).fetchone()
+
+    def record_import(self, source_message_id: int, guild_id: int, source: str,
+                      ticket_id: Optional[int], kit_id: Optional[int],
+                      mc_name: Optional[str]) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO imported_tickets(source_message_id, guild_id, source, "
+            "ticket_id, kit_id, mc_name, imported_at) VALUES(?,?,?,?,?,?,?)",
+            (int(source_message_id), int(guild_id), source, ticket_id, kit_id,
+             mc_name, _now()))
+
+    def import_summary(self, guild_id: int) -> Dict[str, int]:
+        row = self._db.execute(
+            "SELECT COUNT(*) AS n, COUNT(mc_name) AS named, COUNT(kit_id) AS kits "
+            "FROM imported_tickets WHERE guild_id=?", (int(guild_id),)).fetchone()
+        return {"rows": row["n"], "with_mc_name": row["named"], "with_kit": row["kits"]}
+
+    def create_historical_ticket(self, guild_id: int, discord_user_id: int, mc_name: str,
+                                 mc_uuid: Optional[str], created_at: int,
+                                 note: Optional[str] = None,
+                                 kind: str = KIND_RESCUE) -> int:
+        """A closed ticket that happened before this bot existed.
+
+        Written with its ORIGINAL timestamps rather than now(): the cooldown is computed from
+        dates, so importing a year of history with today's date would put the entire community
+        on cooldown the day the bot goes live.
+        """
+        cur = self._db.execute(
+            "INSERT INTO tickets(guild_id, discord_user_id, mc_name, mc_uuid, status, note, "
+            "request_type, created_at, closed_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (int(guild_id), int(discord_user_id), mc_name, mc_uuid, STATUS_CANCELLED,
+             note, kind, int(created_at), int(created_at)))
+        return int(cur.lastrowid)
+
+    def record_historical_kit(self, guild_id: int, ticket_id: Optional[int],
+                              discord_user_id: int, mc_name: str, mc_uuid: Optional[str],
+                              created_at: int, kind: str = KIND_RESCUE) -> int:
+        """The same, for the grant. Delivered at its original date, so it reads as finished."""
+        cur = self._db.execute(
+            "INSERT INTO kits(guild_id, ticket_id, discord_user_id, mc_uuid, mc_name, kind, "
+            "created_at, delivered_at) VALUES(?,?,?,?,?,?,?,?)",
+            (int(guild_id), ticket_id, int(discord_user_id), mc_uuid, mc_name, kind,
+             int(created_at), int(created_at)))
+        return int(cur.lastrowid)
 
     def claims_for_ticket(self, ticket_id: int,
                           guild_id: Optional[int] = None) -> List[sqlite3.Row]:
