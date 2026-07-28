@@ -31,7 +31,31 @@ NAME_PATTERNS = [
     re.compile(r"\bigt\s*(?:is|:|=)?\s*[\"'`]?([\w.]{3,16})", re.I),
     re.compile(r"\busername\s*(?:is|:|=)\s*[\"'`]?([\w.]{3,16})", re.I),
     re.compile(r"\bmy\s+name\s+(?:is|:)\s*[\"'`]?([\w.]{3,16})", re.I),
+    re.compile(r"\bnick(?:name)?\s*(?:is|:|=)\s*[\"'`]?([\w.]{3,16})", re.I),
 ]
+
+# "Hey, I'm Ex0ticTimez" is a real and common way to give a name, but the same shape matches
+# "I'm new", "I'm outside spawn", "I'm waiting". Mojang cannot save us here -- plenty of
+# dictionary words are real accounts -- so this pattern only counts when the token also LOOKS
+# like a username. Kept separate from NAME_PATTERNS so the distinction is visible.
+WEAK_PATTERNS = [
+    re.compile(r"\b(?:i\s*['’]?\s*m|i\s+am)\s+[\"'`]?([\w.]{3,16})", re.I),
+]
+
+
+def looks_like_username(token: str) -> bool:
+    """Does this read as an account rather than an English word?
+
+    A digit, an underscore, a full stop or an internal capital all say "handle". Failing all
+    of those, only a long token is accepted -- short lowercase words are exactly the false
+    positives this exists to stop, and binding one to somebody's Discord id is the worst
+    outcome the importer has.
+    """
+    if any(c.isdigit() or c in "_." for c in token):
+        return True
+    if any(c.isupper() for c in token[1:]):
+        return True
+    return len(token) >= 8
 
 # Shapes that match but are never an account. Kept deliberately small: the Mojang check is the
 # real filter, and a long stopword list would start rejecting genuine names -- people are
@@ -109,6 +133,14 @@ def candidate_names(entries: List[dict], owner_id: Optional[int],
             for hit in pat.findall(body):
                 hit = hit.strip(" .,:;!?'\"`")
                 if len(hit) < 3 or hit.lower() in STOPWORDS:
+                    continue
+                (own if is_owner else other).append(hit)
+        for pat in WEAK_PATTERNS:
+            for hit in pat.findall(body):
+                hit = hit.strip(" .,:;!?'\"`")
+                if len(hit) < 3 or hit.lower() in STOPWORDS:
+                    continue
+                if not looks_like_username(hit):
                     continue
                 (own if is_owner else other).append(hit)
     seen: set = set()

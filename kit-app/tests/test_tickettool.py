@@ -117,6 +117,27 @@ class ExtractionCase(unittest.TestCase):
         """17+ characters cannot be a Minecraft account, so it is prose."""
         self.assertNotIn("averyveryverylongname", names([msg("my ign is averyveryverylongname")]))
 
+    def test_the_weak_pattern_only_fires_on_username_shaped_tokens(self):
+        """"I'm X" is how plenty of people give their name, and also how everyone says
+        "I'm new". Mojang cannot arbitrate -- dictionary words are real accounts -- so the
+        shape of the token has to."""
+        self.assertEqual(names([msg("Hey, I'm Ex0ticTimez. I just joined")]), ["Ex0ticTimez"])
+        self.assertEqual(names([msg("I am xX_Dragon_Xx here")]), ["xX_Dragon_Xx"])
+        for prose in ("Hello im new player on 2b2t im family friendly",
+                      "i am waiting in queue right now",
+                      "im looking to escape spawn tbh",
+                      "I am Steve"):
+            self.assertEqual(names([msg(prose)]), [], prose)
+
+    def test_nick_label_is_recovered(self):
+        self.assertEqual(names([msg("Nick: klcenka")]), ["klcenka"])
+
+    def test_looks_like_username(self):
+        for yes in ("Ex0ticTimez", "xX_Dragon_Xx", "a.b.c", "ComicSquid", "longenoughname"):
+            self.assertTrue(tickettool.looks_like_username(yes), yes)
+        for no in ("new", "family", "waiting", "Steve", "spawn"):
+            self.assertFalse(tickettool.looks_like_username(no), no)
+
     def test_participants_lists_humans_only(self):
         got = tickettool.participants([
             msg("hi", username="applicant"),
