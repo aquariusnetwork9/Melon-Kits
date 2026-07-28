@@ -66,7 +66,7 @@ DEFAULTS: Dict[str, Any] = {
     # place rather than posting a second one.
     "panel": {
         "rescued_count": "15.1k",
-        "rescued_as_of": "7/20/25",
+        "rescued_as_of": "07/25/2026",
         "response_time": "24-48 hours",
     },
     "policy": {
